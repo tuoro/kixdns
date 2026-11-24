@@ -158,6 +158,18 @@ impl ZeroRtt {
     fn address_down(&self, address: SocketAddr) {
         self.reached.lock().take_if(|(at, _)| *at == address);
     }
+
+    /// `pooled` 用了 0-RTT 而上游没回它的握手（见 [`DoqConn::unanswered`]）时忘掉它连的地址（见 [`Self::address_down`]），
+    /// 给出是不是这样
+    /// Forgets the address `pooled` dialled (see [`Self::address_down`]) when it used 0-RTT and
+    /// the upstream never answered its handshake (see [`DoqConn::unanswered`]), telling whether so
+    fn forget_if_unanswered(&self, pooled: &DoqConn) -> bool {
+        let unanswered = pooled.unanswered();
+        if unanswered {
+            self.address_down(pooled.conn.remote_address());
+        }
+        unanswered
+    }
 }
 
 /// 用了 0-RTT 的连接，上游最晚多久要回握手：两个 [`ATTEMPT_DELAY`]，上一次完整握手往返时间（`rtt`）的三倍更长时照它，
@@ -180,7 +192,6 @@ struct NewDoqConn {
 /// 发查询用的连接，和它是怎么来的 / The connection to send on, and how it came
 struct DoqConnected {
     pooled: Arc<DoqConn>,
-    used_0rtt: bool,
     /// 取自池里，而不是为这次查询新建的 / Taken from the pool rather than made for this query
     reused: bool,
 }
@@ -200,27 +211,43 @@ struct DoqConn {
 }
 
 impl DoqConn {
-    /// 用了 0-RTT，上游却什么都还没回：握手没回，也没关掉它 / Made with 0-RTT, and nothing from the
-    /// upstream yet: no answer to its handshake, nor a close
+    /// 用了 0-RTT，上游却没回握手：连接还开着，或者没等回就关了（到期关的、QUIC 的空闲超时先到、上游没回握手就关掉，比如
+    /// 拒绝新连接）。都是这个地址的事，和 0-RTT 无关：上游不收早期数据时照样回握手（见 [`DoqMuxClient::early_data_refused`]）
+    /// Made with 0-RTT, and the handshake unanswered by the upstream: the connection still open,
+    /// or closed before any answer (at the deadline, by QUIC's idle timeout coming first, by the
+    /// upstream closing it unanswered, refusing new connections say). All of it is the address's
+    /// matter and says nothing about 0-RTT: an upstream taking no early data answers the handshake
+    /// all the same (see [`DoqMuxClient::early_data_refused`])
     fn unanswered(&self) -> bool {
-        self.used_0rtt
-            && self.conn.handshake_data().is_none()
-            && !self
-                .conn
-                .close_reason()
-                .as_ref()
-                .is_some_and(closed_by_peer)
+        self.used_0rtt && self.conn.handshake_data().is_none()
     }
-}
 
-/// 连接是被对端关闭、重置的 / The connection was closed or reset by the peer
-fn closed_by_peer(err: &quinn::ConnectionError) -> bool {
-    matches!(
-        err,
-        quinn::ConnectionError::ApplicationClosed(_)
-            | quinn::ConnectionError::ConnectionClosed(_)
-            | quinn::ConnectionError::Reset
-    )
+    /// 握手没回的这条连接上查询为什么失败：连的哪个地址；上游没回握手就关掉了连接的，带上上游给的原因
+    /// Why a query failed on this connection with its handshake unanswered: the address dialled,
+    /// and the upstream's own reason when it closed the connection without answering
+    fn unanswered_error(&self) -> anyhow::Error {
+        let address = self.conn.remote_address();
+        match self.conn.close_reason() {
+            None
+            | Some(quinn::ConnectionError::LocallyClosed | quinn::ConnectionError::TimedOut) => {
+                anyhow::anyhow!("doq 0-RTT handshake to {address} unanswered")
+            }
+            Some(reason) => {
+                anyhow::Error::new(reason).context(format!("doq 0-RTT handshake to {address}"))
+            }
+        }
+    }
+
+    /// 关掉这条连接，已经关了的不动：quinn 的 close 一律把关闭原因改写成 LocallyClosed，已经关了的也是，上游给的原因、超时
+    /// 就看不到了
+    /// Closes the connection, leaving one closed already alone: quinn's close rewrites the reason
+    /// to LocallyClosed whatever it was, a connection closed already too, and the upstream's own
+    /// reason or the timeout would be lost
+    fn close(&self) {
+        if self.conn.close_reason().is_none() {
+            self.conn.close(DOQ_NO_ERROR, b"");
+        }
+    }
 }
 
 /// DoQ 连接的传输参数。查询都是我们开的流，一个流问一个（RFC 9250 第 4.2 节），所以：
@@ -431,16 +458,13 @@ impl DoqMuxClient {
             // 等别的查询连好、解析上游名字、握手和等回答共用这一份预算
             // Waiting for another query's connect, resolving the upstream name, the handshake and
             // the answer share this one budget
-            let DoqConnected {
-                pooled,
-                used_0rtt,
-                reused,
-            } = match timeout(timeout_dur, self.get_or_connect(target)).await {
-                Ok(connected) => connected?,
-                Err(_) => {
-                    anyhow::bail!("doq connect timeout after {}ms", timeout_dur.as_millis())
-                }
-            };
+            let DoqConnected { pooled, reused } =
+                match timeout(timeout_dur, self.get_or_connect(target)).await {
+                    Ok(connected) => connected?,
+                    Err(_) => {
+                        anyhow::bail!("doq connect timeout after {}ms", timeout_dur.as_millis())
+                    }
+                };
             let query_budget = timeout_dur.saturating_sub(start.elapsed());
             if query_budget.is_zero() {
                 anyhow::bail!("doq timeout before sending the query");
@@ -454,14 +478,13 @@ impl DoqMuxClient {
                     return Ok(bytes);
                 }
                 Ok(Err(failure)) => {
-                    // 0-RTT 的握手上游一直没回、连接就没了（握手到期或者别的查询超时关掉的，见 `watch`）：地址不通，
-                    // 和 0-RTT 无关。quinn 在握手完成前没了的连接上照样报 `ZeroRttRejected`，所以先看这个
-                    // The 0-RTT handshake never answered by the upstream and the connection gone
-                    // (closed at the handshake's deadline or by another query timing out, see
-                    // `watch`): the address is down, which says nothing about 0-RTT. quinn says
-                    // `ZeroRttRejected` on a connection gone before its handshake completed as
-                    // well, so this is looked at first
-                    let unanswered = pooled.unanswered();
+                    // 0-RTT 的握手上游没回、连接就没了（见 [`DoqConn::unanswered`]）：地址不通，和 0-RTT 无关，
+                    // 忘掉这个地址。quinn 在 0-RTT 被接受以前没了的连接上一律报 `ZeroRttRejected`，所以先看这个
+                    // The 0-RTT handshake unanswered by the upstream and the connection gone (see
+                    // [`DoqConn::unanswered`]): the address is down, which says nothing about
+                    // 0-RTT, and it is forgotten. quinn says `ZeroRttRejected` on any connection
+                    // gone before its 0-RTT was accepted, so this is looked at first
+                    let unanswered = self.zero_rtt.forget_if_unanswered(&pooled);
                     // 连接没了才换；流被重置、回答不合协议是这一个查询的事，连接照用
                     // Only a connection that is gone is replaced; a stream reset or a malformed
                     // answer is this one query's matter, and the connection stays in use
@@ -472,25 +495,21 @@ impl DoqMuxClient {
                     let retry = if !allow_retry {
                         false
                     } else if unanswered {
-                        // 没回握手的那个地址已经忘掉，新连接完整握手、在几个地址上错开着连
-                        // The silent address forgotten, the fresh connection shakes hands in
-                        // full staggered over the addresses
+                        // 那个地址忘掉了，新连接完整握手、在几个地址上错开着连
+                        // The address forgotten, the fresh connection shakes hands in full
+                        // staggered over the addresses
                         debug!(
                             upstream = %self.upstream,
-                            error = %failure,
+                            error = %format_args!("{:#}", pooled.unanswered_error()),
                             "DoQ 0-RTT handshake unanswered, retrying with a full handshake"
                         );
                         true
-                    } else if Self::early_data_refused(&failure)
-                        || (used_0rtt
-                            && self.zero_rtt_retry_allowed(target)
-                            && Self::zero_rtt_likely_rejected(&failure))
-                    {
+                    } else if Self::early_data_refused(&failure) {
                         self.disable_zero_rtt();
                         debug!(
                             upstream = %self.upstream,
                             error = %failure,
-                            "DoQ 0-RTT likely rejected, retrying without 0-RTT"
+                            "DoQ 0-RTT rejected, retrying without 0-RTT"
                         );
                         true
                     } else if reused && gone {
@@ -513,19 +532,22 @@ impl DoqMuxClient {
                         timeout_dur = remaining;
                         continue;
                     }
-                    return Err(anyhow::Error::new(failure));
+                    return Err(if unanswered {
+                        pooled.unanswered_error()
+                    } else {
+                        anyhow::Error::new(failure)
+                    });
                 }
                 Err(_) => {
-                    // 超时而上游连 0-RTT 的握手都没回：是这个地址不通（见 [`ZeroRtt::address_down`]）。别的超时只是这次
-                    // 回答慢，和 0-RTT 无关：0-RTT 被拒绝时 quinn 报的是 `ZeroRttRejected`，由上面那一支处理。预算
-                    // 已经用完，不再重试
+                    // 超时而上游连 0-RTT 的握手都没回：是这个地址不通，忘掉它（见 [`ZeroRtt::address_down`]）。别的超时
+                    // 只是这次回答慢，和 0-RTT 无关：0-RTT 被拒绝时 quinn 报的是 `ZeroRttRejected`，由上面那一支处理。
+                    // 预算已经用完，不再重试
                     // A timeout with the 0-RTT handshake never answered by the upstream: the
-                    // address is down (see [`ZeroRtt::address_down`]). Any other timeout is just
-                    // a slow answer, which says nothing about 0-RTT: 0-RTT refused, quinn says
-                    // `ZeroRttRejected`, handled above. The budget is spent, so there is no retry
-                    if pooled.unanswered() {
-                        self.zero_rtt.address_down(pooled.conn.remote_address());
-                    }
+                    // address is down and forgotten (see [`ZeroRtt::address_down`]). Any other
+                    // timeout is just a slow answer, which says nothing about 0-RTT: 0-RTT
+                    // refused, quinn says `ZeroRttRejected`, handled above. The budget is spent,
+                    // so there is no retry
+                    let unanswered = self.zero_rtt.forget_if_unanswered(&pooled);
                     // 这期间连接上没读到过别的回答（多半死了或者卡住了）才换：从池里拿掉、关掉它，和 TCP、DoT 复位连接
                     // 一样。它上面别的查询马上失败，取自池里的按连接没了换一条新连接重发，不用干等到各自的期限
                     // Replaced only when no other answer was read on it meanwhile (it is most likely
@@ -535,9 +557,13 @@ impl DoqMuxClient {
                     // out their deadlines
                     if pooled.answers.load(Ordering::Acquire) == answers_before {
                         forget(&self.pooled, &pooled);
-                        pooled.conn.close(DOQ_NO_ERROR, b"");
+                        pooled.close();
                     }
-                    return Err(anyhow::anyhow!("doq timeout"));
+                    return Err(if unanswered {
+                        pooled.unanswered_error()
+                    } else {
+                        anyhow::anyhow!("doq timeout")
+                    });
                 }
             }
         }
@@ -668,15 +694,13 @@ impl DoqMuxClient {
     }
 
     /// 发查询用的连接：池里的能用就用，不能用就等一条新的（见 [`Connect::get_or_make`]）：建连的任务建好了放进池里，这个
-    /// 查询再取用。等来的连接在取用之前就没了时不再等下一条。等来的连接不算取自池里，用没用 0-RTT 照建它时的
+    /// 查询再取用。等来的连接在取用之前就没了时不再等下一条。等来的连接不算取自池里
     /// The connection to send on: the pooled one when usable, otherwise a new one waited for (see
     /// [`Connect::get_or_make`]): the connecting task pools it once made, and this query takes it
     /// from there. A connection waited for and gone before it could be taken is not followed by a
-    /// wait for another. A connection waited for does not count as taken from the pool, and used
-    /// 0-RTT as it was made
+    /// wait for another. A connection waited for does not count as taken from the pool
     async fn get_or_connect(&self, target: &DoqTarget) -> anyhow::Result<DoqConnected> {
         let connected = |pooled: Arc<DoqConn>, waited: bool| DoqConnected {
-            used_0rtt: waited && pooled.used_0rtt,
             reused: !waited,
             pooled,
         };
@@ -730,18 +754,19 @@ impl DoqMuxClient {
         Ok(connected(pooled, waited))
     }
 
-    /// 看着池里的一条连接直到它走：关了（上游关的，或者查询判它卡住了关的）就从池里拿掉；用旧了（见 [`Aging`]）也拿掉，
-    /// 接着来的查询另建一条，它上面的查询都过了期限再关；客户端被丢掉时马上关；用了 0-RTT 而到 `answer_by` 上游还没回
-    /// 握手时，忘掉这个地址（见 [`ZeroRtt::address_down`]）、马上关，它上面的查询换一条新连接重发。keepalive 让上游看它一直
-    /// 在用，不由这里关的话，没人用的连接会一直开着
+    /// 看着池里的一条连接直到它走：关了（上游关的，或者查询判它卡住了关的）就从池里拿掉，用了 0-RTT 而上游没回握手就关了的，
+    /// 还忘掉这个地址（见 [`ZeroRtt::forget_if_unanswered`]）；用旧了（见 [`Aging`]）也拿掉，接着来的查询另建一条，它上面的
+    /// 查询都过了期限再关；客户端被丢掉时马上关；用了 0-RTT 而到 `answer_by` 上游还没回握手时，忘掉这个地址、马上关，它上面的
+    /// 查询换一条新连接重发。keepalive 让上游看它一直在用，不由这里关的话，没人用的连接会一直开着
     /// Watches a pooled connection until it goes: closed (by the upstream, or by a query that
-    /// found it stalled), it is taken out of the pool; worn (see [`Aging`]), it is taken out too,
-    /// queries coming next make another, and it closes once the queries on it are past their
-    /// deadlines; with the client dropped it closes at once; made with 0-RTT and its handshake
-    /// unanswered by the upstream at `answer_by`, its address is forgotten (see
-    /// [`ZeroRtt::address_down`]) and it closes at once, the queries on it sent again on a fresh
-    /// one. Its keepalive has the upstream see it in use all along, so a connection nobody uses
-    /// would stay open were it not closed here
+    /// found it stalled), it is taken out of the pool, its address forgotten too when it used
+    /// 0-RTT and closed with its handshake unanswered (see [`ZeroRtt::forget_if_unanswered`]);
+    /// worn (see [`Aging`]), it is taken out too, queries coming next make another, and it closes
+    /// once the queries on it are past their deadlines; with the client dropped it closes at once;
+    /// made with 0-RTT and its handshake unanswered by the upstream at `answer_by`, its address is
+    /// forgotten and it closes at once, the queries on it sent again on a fresh one. Its keepalive
+    /// has the upstream see it in use all along, so a connection nobody uses would stay open were
+    /// it not closed here
     async fn watch(
         pooled: Arc<DoqConn>,
         pool: Arc<ArcSwapOption<DoqConn>>,
@@ -762,7 +787,17 @@ impl DoqMuxClient {
         };
         let worn = tokio::select! {
             () = stop.cancelled() => None,
-            _ = pooled.conn.closed() => None,
+            reason = pooled.conn.closed() => {
+                // 0-RTT 的握手没回就关了（比如 QUIC 的空闲超时先于 `answer_by` 到）：等在上面的查询自己忘掉这个地址，
+                // 没有查询等着时由这里忘掉，下一次建连不再把 0-RTT 发往它
+                // Closed with its 0-RTT handshake unanswered (QUIC's idle timeout coming before
+                // `answer_by`, say): the queries waiting on it forget the address themselves, and
+                // with none waiting it is forgotten here, the next connect sending it no 0-RTT
+                if zero_rtt.forget_if_unanswered(&pooled) {
+                    debug!(upstream = %upstream, address = %pooled.conn.remote_address(), %reason, "DoQ 0-RTT connection closed with its handshake unanswered");
+                }
+                None
+            }
             why = aging.worn(&pooled.wear) => Some(why),
             () = unanswered => {
                 let address = pooled.conn.remote_address();
@@ -780,47 +815,18 @@ impl DoqMuxClient {
                 () = pooled.wear.settled() => {}
             }
         }
-        pooled.conn.close(DOQ_NO_ERROR, b"");
+        pooled.close();
     }
 
-    /// 这次失败是否像 0-RTT 被拒绝，值得关掉 0-RTT 再试一次
-    /// Whether this failure looks like a rejected 0-RTT attempt and is worth one
-    /// retry with 0-RTT off
-    ///
-    /// 两类算数：quinn 明确报告 `ZeroRttRejected`；或者连接被对端关闭、重置、
-    /// 丢失——服务器拒绝 0-RTT 数据时常常直接关连接，而不是报那个专门的错误。
-    /// 本地关闭、超时、协议层面的问题都不算，它们和 0-RTT 无关。
-    ///
-    /// 纯函数，不吃 `&self`，所以测试可以直接拿 quinn 的错误值驱动它。
-    /// Two things count: quinn saying `ZeroRttRejected` outright, and the
-    /// connection being closed, reset or lost by the peer, since a server that
-    /// refuses 0-RTT data often just closes instead of raising that specific
-    /// error. A local close, a timeout and any protocol-level problem do not,
-    /// having nothing to do with 0-RTT. It takes no `&self`, so a test can drive
-    /// it with real quinn error values.
-    fn zero_rtt_likely_rejected(failure: &DoqFailure) -> bool {
-        match failure {
-            DoqFailure::OpenStream(err) => closed_by_peer(err),
-            DoqFailure::Write(quinn::WriteError::ZeroRttRejected) => true,
-            DoqFailure::Write(quinn::WriteError::ConnectionLost(err)) => closed_by_peer(err),
-            DoqFailure::Read(quinn::ReadToEndError::Read(err)) => match err {
-                quinn::ReadError::ZeroRttRejected => true,
-                quinn::ReadError::ConnectionLost(err) => closed_by_peer(err),
-                _ => false,
-            },
-            _ => false,
-        }
-    }
-
-    /// quinn 明说这个查询发出去的是早期数据、被上游拒收了。只有 0-RTT 期间开的流才会报这个，所以不管这条连接是不是
-    /// 这个查询自己建的，它都该换一条不带 0-RTT 的连接再发一次，搭在别的查询建的连接上的也一样。握手完成以前就没了的
-    /// 连接上 quinn 也这么报，上游没回握手的由调用方先挑出来（见 [`DoqConn::unanswered`]）
-    /// quinn says outright that what this query sent was early data the upstream refused. Only
-    /// a stream opened during 0-RTT is told so, and whether or not this query made the
-    /// connection it is to be sent again on one without 0-RTT, one riding a connection another
-    /// query made included. quinn says so too on a connection gone before its handshake
-    /// completed, those the upstream never answered being told apart first by the caller (see
-    /// [`DoqConn::unanswered`])
+    /// 上游回了握手、却不收这个查询发出去的早期数据：quinn 明说 `ZeroRttRejected`。只有 0-RTT 期间开的流才会报这个，所以
+    /// 不管这条连接是不是这个查询自己建的，它都该换一条不带 0-RTT 的连接再发一次，搭在别的查询建的连接上的也一样。0-RTT 被
+    /// 接受以前就没了的连接上 quinn 也这么报，上游没回握手的由调用方先挑出来（见 [`DoqConn::unanswered`]）
+    /// The upstream answered the handshake but took no early data this query sent: quinn says
+    /// `ZeroRttRejected` outright. Only a stream opened during 0-RTT is told so, and whether or
+    /// not this query made the connection it is to be sent again on one without 0-RTT, one
+    /// riding a connection another query made included. quinn says so too on a connection gone
+    /// before its 0-RTT was accepted, those whose handshake the upstream never answered being
+    /// told apart first by the caller (see [`DoqConn::unanswered`])
     fn early_data_refused(failure: &DoqFailure) -> bool {
         matches!(
             failure,
@@ -866,7 +872,7 @@ impl DoqMuxClient {
         if !self.zero_rtt.rejected.swap(true, Ordering::Relaxed) {
             warn!(
                 upstream = %self.upstream,
-                "DoQ 0-RTT rejected or unstable, disabling 0-RTT for this upstream until restart"
+                "DoQ 0-RTT rejected, disabling 0-RTT for this upstream until restart"
             );
         }
     }
