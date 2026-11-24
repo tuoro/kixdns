@@ -3,13 +3,11 @@
 use super::*;
 use crate::engine::bootstrap::Bootstrap;
 use crate::engine::test_support::{DohReply, http_ok, spawn_doh_upstream};
-use crate::engine::transport::connect::{CONNECT_BUDGET, KEEPALIVE_INTERVAL, KEEPALIVE_TIME};
+use crate::engine::transport::connect::CONNECT_BUDGET;
 use crate::engine::transport::test_support::*;
 use bytes::Bytes;
 use reqwest::Client as DohHttpClient;
 use reqwest::header::HeaderValue;
-use socket2::SockRef;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -415,14 +413,15 @@ async fn a_doh_handshake_left_unanswered_is_not_counted() {
     assert_eq!(accepted.load(Ordering::Relaxed), 2, "connected once each");
 }
 
-/// 经 reqwest 的 DoH 连接和别的 TCP 连接一样保活（见 [`KEEPALIVE_TIME`]）：连上以后到这个进程里找出那条连接的
+/// 经 reqwest 的 DoH 连接和别的 TCP 连接一样保活（见 `connect::KEEPALIVE_TIME`）：连上以后到这个进程里找出那条连接的
 /// socket，读它的保活设置
 /// A DoH connection through reqwest keeps alive as every other TCP connection does (see
-/// [`KEEPALIVE_TIME`]): once it is made, its socket is found in this process and its keepalive
-/// read
+/// `connect::KEEPALIVE_TIME`): once it is made, its socket is found in this process and its
+/// keepalive read
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[tokio::test]
 async fn a_reqwest_connection_keeps_alive_as_the_others_do() {
+    use crate::engine::transport::connect::{KEEPALIVE_INTERVAL, KEEPALIVE_TIME};
     let (addr, _) = spawn_doh_upstream(|_, query| {
         DohReply::Raw(http_ok(Some(DOH_MEDIA_TYPE), &echo_answer(query)))
     })
@@ -444,7 +443,8 @@ async fn a_reqwest_connection_keeps_alive_as_the_others_do() {
 /// this process's TCP connection to `peer`: how long without traffic before probing, and how far
 /// apart the probes are
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn tcp_keepalive_towards(peer: SocketAddr) -> Option<(Duration, Duration)> {
+fn tcp_keepalive_towards(peer: std::net::SocketAddr) -> Option<(Duration, Duration)> {
+    use socket2::SockRef;
     use std::os::fd::{AsRawFd, BorrowedFd};
     #[cfg(target_os = "macos")]
     const IDLE: libc::c_int = libc::TCP_KEEPALIVE;

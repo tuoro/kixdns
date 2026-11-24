@@ -1330,13 +1330,9 @@ impl Engine {
         if let Some(mut guard) = route.held_inflight.take()
             && let Ok(bytes) = &result
         {
-            guard.hand_over(|| {
-                phases::for_waiters(bytes, &request.requester, &route.trail, route.echo_floor)
-            });
+            guard.hand_over(|| phases::for_waiters(bytes, &request.requester, &route.trail));
         }
-        let echo_scope = route
-            .echo_floor
-            .max(route.trail.echo_scope(&request.requester.ecs_view()));
+        let echo_scope = route.trail.echo_scope(&request.requester.ecs_view());
         Answered {
             result,
             echo_scope,
@@ -1501,25 +1497,23 @@ impl Engine {
                     if let Some((observer, ctx)) = request.observed {
                         observer.pipeline_selected(ctx, &p.id);
                     }
-                    // 跳转后按目标 pipeline 的键再查一次响应缓存。转发回来的应答存在这个键下，而入口
-                    // 那次查找用的是入口 pipeline 的键，所以以前跳转过的请求永远查不到它，每次都去问
-                    // 上游。后台刷新照请求原样重放（同一个地址，带不带 EDNS、类别都一样，见 refresh.rs），
-                    // 走的是同一条路线、写回同一个键。键里带着目标按自己的规则（连同它跳得到的 pipeline）
-                    // 分辨请求方的结果，和直接选进目标的请求查的是同一套键，所以目标按「谁在问」给不同
-                    // 应答时也照查；continue 之后跳过来的请求也一样：留着复用的应答在跳转时已经丢掉，
-                    // 目标里的处理和第一轮没有分别。以前这两种都不查，经过它们的请求每次都问上游
-                    // After a jump, look in the response cache again under the target pipeline's
-                    // key. A forwarded answer is stored under that key, while the entry lookup used
-                    // the entry pipeline's, so a request that jumped never found it and went
-                    // upstream every time. A background refresh replays the request as it came
-                    // (from the same address, with or without EDNS, in the same class, see
-                    // refresh.rs), taking the same route and writing back under the same key. The
-                    // key carries how the target's rules (with the pipelines it can jump to) tell
-                    // requesters apart, the same keys a request selected into the target looks up,
-                    // so a target answering by who is asking is looked up as well; so is a request
-                    // jumping in after a continue: the answer kept for reuse is dropped at the
-                    // jump, and the target handles it as on a first pass. Neither used to look,
-                    // every request through them asking upstream
+                    // 跳转换了键（见 `Route::enter`）就按目标 pipeline 的键再查一次响应缓存。转发回来的应答存在这个键下，
+                    // 而入口那次查找用的是入口 pipeline 的键，所以以前跳转过的请求永远查不到它，每次都去问上游。后台刷新照
+                    // 请求原样重放（同一个地址，带不带 EDNS、类别都一样，见 refresh.rs），走的是同一条路线、写回同一个键。
+                    // 键里带着目标按自己的规则（连同它跳得到的 pipeline）分辨请求方的结果，和直接选进目标的请求查的是同一套
+                    // 键，所以目标按「谁在问」给不同应答时也照查。回答检查据过上游的回答以后（continue 之后的跳转）键不换，
+                    // 照这套键查过的那一次已经没查到
+                    // When the jump changed the keys (see `Route::enter`), look in the response cache
+                    // again under the target pipeline's key. A forwarded answer is stored under that
+                    // key, while the entry lookup used the entry pipeline's, so a request that jumped
+                    // used to never find it and go upstream every time. A background refresh replays
+                    // the request as it came (from the same address, with or without EDNS, in the
+                    // same class, see refresh.rs), taking the same route and writing back under the
+                    // same key. The key carries how the target's rules (with the pipelines it can
+                    // jump to) tell requesters apart, the same keys a request selected into the
+                    // target looks up, so a target answering by who is asking is looked up as well.
+                    // Once an answer check has gone by an upstream's answer (a jump after a continue)
+                    // the keys stay, and the lookup under them has missed already
                     if route.enter(self, request, p)
                         && !background_refresh
                         && let Some(answer) = self
@@ -2022,11 +2016,13 @@ fn renewing(answer: Bytes) -> anyhow::Result<Bytes> {
 pub(crate) struct Route {
     /// 现在所在的 pipeline / The pipeline it is in now
     pub(crate) pipeline: Arc<str>,
-    /// 应答缓存在哪个 pipeline 的键下：请求阶段的跳转换成目标的；响应阶段跳转以后不再换，跳过去拿到的应答照旧缓存在
-    /// 跳转前那个 pipeline 的键下（见 `phases::ForwardResult::Jump`）
-    /// The pipeline whose key answers are cached under: a request-phase jump changes it to the
-    /// target's; after a response-phase jump it changes no more, the answers got over there
-    /// cached under the key of the pipeline jumped from (see `phases::ForwardResult::Jump`)
+    /// 应答缓存在哪个 pipeline 的键下：回答检查据过上游的回答或失败之前，请求阶段的跳转换成目标的；据过以后不再换（见
+    /// [`Self::enter`]），回答检查跳过去的、continue 以后的规则跳过去的，拿到的应答都缓存在据那份回答的 pipeline 的键下
+    /// The pipeline whose key answers are cached under: until an answer check has gone by an
+    /// upstream's answer or failure, a request-phase jump changes it to the target's; after
+    /// that it changes no more (see [`Self::enter`]), what is got over there, by an answer
+    /// check's jump or by a jump of the rules after a continue, being cached under the key of
+    /// the pipeline that went by that answer
     pub(crate) key_pipeline: Arc<str>,
     pub(crate) keys: CacheKeys,
     /// 在当前 pipeline 里从第几条规则（从 0 起）接着求值：规则 continue 以后是它的下一条，它和它之前的规则都已经求值过、
@@ -2051,41 +2047,37 @@ pub(crate) struct Route {
     /// 接下来的应答所依据的上游应答的 TTL：在这些键下回答检查做决定时据的每一份上游应答里最短的那个，每份都和记录的 TTL
     /// 一样收进 min_ttl..=cache_max_ttl（见 `Route::went_by`），还没据过哪份应答时为 None。此后缓存的应答都不比它留得久，
     /// 交出去的每条记录 TTL 也不比它长（见 `Route::cache`），规则给出的静态应答、转发拿到的应答都一样：哪一份到期了，上游都
-    /// 可能答得不一样，回答检查也就可能走另一条路，给出别的应答。请求阶段跳进别的 pipeline、换了键，又从 None 开始：那里
-    /// 给出的，直接进那里的请求也照样拿到
+    /// 可能答得不一样，回答检查也就可能走另一条路，给出别的应答。请求阶段的跳转只在它为 None、`fell_back` 也没置上时换键（见
+    /// [`Self::enter`]）：那时跳过去给出的，直接进那里的请求也照样拿到
     /// The TTL of the upstream answers what answers next goes by: the least of every upstream
     /// answer an answer check decided on under these keys, each brought into
     /// min_ttl..=cache_max_ttl as a record's TTL is (see `Route::went_by`), None while none has
     /// been gone by. No answer cached from here on stays longer, nor does any record TTL going
     /// out run longer (see `Route::cache`), be it a static answer the rules give or one a
     /// forward fetches: once any of them expires the upstream may answer otherwise, and the
-    /// checks may take another way to another answer. A request-phase jump into another
-    /// pipeline, changing the keys, starts again from None: what is given there is given to the
-    /// requests entering there directly too
+    /// checks may take another way to another answer. A request-phase jump changes the keys only
+    /// while it is None and `fell_back` unset (see [`Self::enter`]): what is given over there
+    /// then is given to the requests entering there directly too
     answer_ttl: Option<u32>,
     /// 回答检查据上游失败做了决定（见 `Route::went_by`）：上游没有回答、miss 动作接手了，或者回答检查看到的是失败应答（见
     /// `upstream::is_failure_reply`）。此后规则给出的静态应答只是这一次请求的兜底，不是这个问题的应答，不缓存（见
-    /// `Route::static_ttl`）。转发拿到的应答照常缓存：故障期间备用上游的回答也是这个问题的回答。请求阶段跳进别的 pipeline
-    /// 以后和 `answer_ttl` 一样从头记
+    /// `Route::static_ttl`）。转发拿到的应答照常缓存：故障期间备用上游的回答也是这个问题的回答
     /// An answer check decided on an upstream failure (see `Route::went_by`): the upstream gave
     /// no answer and the miss actions took over, or the check saw a failure reply (see
     /// `upstream::is_failure_reply`). A static answer the rules give from here on is a fallback
     /// for this request, not the answer to the question, and is not cached (see
     /// `Route::static_ttl`). An answer a forward fetches is cached as usual: a backup upstream's
-    /// answer during the failure answers the question all the same. A request-phase jump into
-    /// another pipeline starts it afresh, as `answer_ttl`
+    /// answer during the failure answers the question all the same
     fell_back: bool,
-    /// The forwards the request passed in the current pipeline, each with the ECS it sent
-    /// and whom its reply applies to; every answer the request caches applies to the
-    /// requesters all of them admit (see `CacheEntry::reach`). A forward adds its own here.
-    /// After the request, what its last answer was cached with
-    /// 请求在当前 pipeline 里经过的转发，每次都记着它发出的 ECS 和应答适用于谁；请求缓存的每份应答适用于它们全都接受的
-    /// 请求方（见 `CacheEntry::reach`）。转发把自己的这一次记在这里。请求结束后就是它最后一份应答缓存时带的那份
+    /// The forwards the request passed, each with the ECS it sent and whom its reply applies
+    /// to; every answer the request caches applies to the requesters all of them admit (see
+    /// `CacheEntry::reach`). A forward adds its own here. None is passed before the keys change
+    /// at a request-phase jump: a forward either answers or goes on through an answer check
+    /// (see [`Self::enter`]). After the request, what its last answer was cached with
+    /// 请求经过的转发，每次都记着它发出的 ECS 和应答适用于谁；请求缓存的每份应答适用于它们全都接受的请求方（见
+    /// `CacheEntry::reach`）。转发把自己的这一次记在这里。请求阶段跳转换键之前一个也没有：转发要么就此作答，要么经回答检查
+    /// 往下走（见 [`Self::enter`]）。请求结束后就是它最后一份应答缓存时带的那份
     pub(crate) trail: EcsReach,
-    /// 经由请求跳离的 pipeline（它们的 trail 已经清掉）应答依赖客户端 ECS 的多少位（见 `phases::client_reply`）
-    /// How many bits of the client's ECS the answer depends on through the pipelines the request
-    /// left by a jump, whose trails are gone (see `phases::client_reply`)
-    pub(crate) echo_floor: u8,
     /// The inflight entry this request registered and still holds after a rule
     /// continued. The request keeps it for the rest of the decision loop, so its
     /// waiters get the final answer rather than one a rule continued past; a
@@ -2125,16 +2117,29 @@ impl Route {
             answer_ttl: None,
             fell_back: false,
             trail: EcsReach::default(),
-            echo_floor: 0,
             held_inflight: None,
         }
     }
 
-    /// 请求阶段跳进 `p`，给出缓存键换没换（换了就该按新键再查一次缓存）。响应阶段跳转以后键和 trail 都留着：应答照旧
-    /// 缓存在跳转前那个 pipeline 的键下（见 `key_pipeline`）
+    /// 请求阶段跳进 `p`，给出缓存键换没换（换了就该按新键再查一次缓存）。回答检查据过上游的回答或失败以后（`answer_ttl`
+    /// 有值或 `fell_back`）键和 trail 都留着，和响应阶段跳转一样：跳过去得出的应答取决于据过的那份回答，缓存在据它的
+    /// pipeline 的键下，带着 `answer_ttl` 的上限；上游故障时那里也就有过期应答可交（RFC 8767）。换到目标的键下的话，入口这条
+    /// 路线从不缓存，每个请求都要先问一遍据的那个上游，客户端拿到的 TTL 也不受那份回答约束。键里早已带着 continue 以后跳得到的
+    /// pipeline 怎样分辨请求方，它们的配置也算进这个 pipeline 的缓存命名空间（见 `RuntimePipeline::answered_through`）。
+    /// 据过之前不曾有转发作完（转发要么就此作答，要么经回答检查往下走），换键时也就没有 trail、上限要清
     /// Jump into `p` in the request phase, telling whether the keys changed (and the cache is to
-    /// be looked up again under them). After a response-phase jump the keys and the trail stay:
-    /// answers are still cached under the key of the pipeline jumped from (see `key_pipeline`)
+    /// be looked up again under them). Once an answer check has gone by an upstream's answer or
+    /// failure (`answer_ttl` set or `fell_back`), the keys and the trail stay, as after a
+    /// response-phase jump: the answer reached over there depends on the answer gone by, and is
+    /// cached under the key of the pipeline that went by it, within `answer_ttl`, so a stale
+    /// answer is there to give when that upstream fails (RFC 8767). Moved to the target's keys,
+    /// the entry's route would never be cached, every request asking the upstream gone by first,
+    /// and the TTL a client gets would not be bounded by that answer. The keys carry already how
+    /// the pipelines a jump after a continue reaches tell requesters apart, and their
+    /// configuration goes into this pipeline's cache namespace (see
+    /// `RuntimePipeline::answered_through`). No forward is done before any answer has been gone
+    /// by (a forward either answers or goes on through an answer check), so a change of keys
+    /// finds no trail or bound to clear
     fn enter(
         &mut self,
         engine: &Engine,
@@ -2143,27 +2148,13 @@ impl Route {
     ) -> bool {
         self.pipeline = p.id.clone();
         self.resume_at = 0;
-        // 留着复用的应答属于取到它的那个 pipeline：那边的转发、按那边的 ECS 拿到的。
-        // 带过来交给这里的 allow，就会写进这个 pipeline 的键，之后直接进入这里的请求
-        // 也会拿到它。
-        // An answer kept for reuse belongs to the pipeline that fetched it, through
-        // its forward and with its ECS. Handed to an allow here, it would be cached
-        // under this pipeline's key and served to requests that come here directly.
+        // 留着复用的应答属于取到它的那个 pipeline：那边的转发、按那边的 ECS 拿到的，这里的 allow 不拿它
+        // An answer kept for reuse belongs to the pipeline that fetched it, through its forward
+        // and with its ECS, and an allow here does not take it
         self.reused_response = None;
-        if self.jumped.is_some() {
+        if self.answer_ttl.is_some() || self.fell_back {
             return false;
         }
-        // So do the forwards behind it: this pipeline's answers depend on its
-        // own forwards only. What they made the answer depend on still counts
-        // for the echo.
-        // 它之前的转发也一样：这个 pipeline 的应答只取决于它自己的转发。它们让
-        // 应答依赖的部分，回显时仍要算上。
-        self.echo_floor = self
-            .echo_floor
-            .max(self.trail.echo_scope(&request.requester.ecs_view()));
-        self.trail = EcsReach::default();
-        self.answer_ttl = None;
-        self.fell_back = false;
         self.key_pipeline = p.id.clone();
         // The keys follow the pipeline / 键随 pipeline 改变
         self.keys = request.keys(
@@ -7292,17 +7283,18 @@ mod jump_response_cache_tests {
         assert_eq!(second_upstream.queries(), 1);
     }
 
-    /// continue 之后才遇到的跳转也查目标的缓存：越过的那份应答在跳转时已经丢掉，目标的应答和第一轮跳过来的
-    /// 一样。以前只有第一轮才查，经过 continue 的请求每次都问目标的上游。两次查询来自两个客户端：入口按客户端
-    /// 地址判断，规则缓存因此按客户端分开，两次都重新走 `try-first`
-    /// A jump reached only after a continue looks up the target's cache too: the answer
-    /// passed over is dropped at the jump, and the target's answer is the one a first-pass
-    /// jump gets. Only the first pass used to look up, every request through a continue
-    /// asking the target's upstream. The two queries come from two clients: the entry
-    /// matches on client address, so the rule cache keeps them apart and both run
-    /// `try-first` again
+    /// continue 之后才遇到的跳转：路线据过 `try-first` 问来的回答，跳过去拿到的应答缓存在入口的键下（见
+    /// `Route::enter`），和回答检查跳转一样。两次查询来自两个客户端，入口按客户端地址判断，两个都在网段里、判定一样，第二个
+    /// 从入口的缓存拿到，两个上游都不再问。以前跳转换成目标的键，入口这条路线从不缓存，每个请求都先问 `try-first`
+    /// A jump reached only after a continue: the route has gone by the answer `try-first`
+    /// fetched, and the answer got over there is cached under the entry's key (see
+    /// `Route::enter`), as an answer check's jump is. The two queries come from two clients the
+    /// entry judges by address, both in its network and so judged alike, and the second gets the
+    /// answer from the entry's cache, neither upstream asked again. The jump used to move to the
+    /// target's keys, the entry's route was never cached, and every request asked `try-first`
+    /// first
     #[tokio::test]
-    async fn a_jump_reached_after_a_continue_is_answered_from_the_target_cache() {
+    async fn a_jump_reached_after_a_continue_is_answered_from_the_entry_cache() {
         let first_upstream = answering_upstream(Ipv4Addr::new(192, 0, 2, 1), 300).await;
         let group_upstream = answering_upstream(Ipv4Addr::new(192, 0, 2, 2), 300).await;
         let engine = engine_from(serde_json::json!({
@@ -7335,35 +7327,33 @@ mod jump_response_cache_tests {
                 Ipv4Addr::new(192, 0, 2, 2)
             );
         }
-        assert_eq!(first_upstream.queries(), 2);
         assert_eq!(
-            group_upstream.queries(),
+            first_upstream.queries(),
             1,
-            "the second from the target's cache"
+            "the second from the entry's cache"
         );
+        assert_eq!(group_upstream.queries(), 1);
     }
 
-    /// 同一个客户端重复查询也一样：continue 之后得出的决策不进规则缓存（olicesx/kixdns#70），
-    /// 每次都从 `try-first` 开始，跳转发生在第二轮，目标的应答从缓存给出
-    /// The same holds for one client asking again: a decision reached after a continue
-    /// is not rule-cached (olicesx/kixdns#70), so every request starts at `try-first`,
-    /// jumps on its second pass and gets the target's answer from the cache
-    #[tokio::test]
-    async fn a_repeated_request_that_continues_is_answered_from_the_target_cache() {
-        let first_upstream = answering_upstream(Ipv4Addr::new(192, 0, 2, 1), 300).await;
-        let group_upstream = answering_upstream(Ipv4Addr::new(192, 0, 2, 2), 300).await;
-        let engine = engine_from(serde_json::json!({
-            "settings": { "default_upstream": "127.0.0.1:9", "min_ttl": 0 },
+    /// 入口规则问 `first`（回答检查 continue），后面的规则跳到 `group` 问 `second`
+    /// The entry's rule asks `first` (its answer check continuing), and a later rule jumps to
+    /// `group`, which asks `second`
+    fn continue_then_jump(first: &str, second: &str, settings: serde_json::Value) -> Engine {
+        let mut all = serde_json::json!({ "default_upstream": "127.0.0.1:9", "min_ttl": 0 });
+        for (key, value) in settings.as_object().unwrap() {
+            all[key] = value.clone();
+        }
+        engine_from(serde_json::json!({
+            "settings": all,
             "pipelines": [
                 {
                     "id": "main",
                     "rules": [
                         {
-                            "name": "try-first",
+                            "name": "check",
                             "matchers": [{ "type": "any" }],
-                            "actions": [{ "type": "forward", "upstream": first_upstream.address, "transport": "udp" }],
-                            "response_matchers": [{ "type": "response_rcode", "value": "NXDOMAIN" }],
-                            "response_actions_on_miss": [{ "type": "continue" }]
+                            "actions": [{ "type": "forward", "upstream": first }],
+                            "response_actions_on_match": [{ "type": "continue" }]
                         },
                         {
                             "name": "to-group",
@@ -7372,22 +7362,57 @@ mod jump_response_cache_tests {
                         }
                     ]
                 },
-                { "id": "group", "rules": [forward_rule("fwd", &group_upstream.address)] }
+                { "id": "group", "rules": [forward_rule("fwd", second)] }
             ]
-        }));
+        }))
+    }
 
-        for _ in 0..2 {
-            assert_eq!(
-                answer(&engine, "continued.example", "192.0.2.10").await,
-                Ipv4Addr::new(192, 0, 2, 2)
-            );
+    /// 同一个客户端重复查询：continue 之后得出的决策不进规则缓存（olicesx/kixdns#70），每次都从入口查起，应答从入口的缓存
+    /// 给出，入口据的上游只问一次；客户端拿到的 TTL 也不比它的回答长：60 秒的回答之后 3600 秒的那份交出 60。以前每次都问
+    /// `first`，客户端拿 3600，`first` 早该答别的了还在用
+    /// One client asking again: a decision reached after a continue is not rule-cached
+    /// (olicesx/kixdns#70), every request starts at the entry, and the answer comes from the
+    /// entry's cache, the upstream the entry went by asked once; nor does the client get a TTL
+    /// longer than that upstream's answer: the one of 3600 seconds after one of 60 goes out with
+    /// 60. `first` used to be asked every time and the client got 3600, kept on long after
+    /// `first` would have answered otherwise
+    #[tokio::test]
+    async fn a_repeated_request_that_continues_is_answered_from_the_entry_cache() {
+        let first = answering_upstream(Ipv4Addr::new(192, 0, 2, 1), 60).await;
+        let second = answering_upstream(Ipv4Addr::new(192, 0, 2, 2), 3600).await;
+        let engine = continue_then_jump(&first.address, &second.address, serde_json::json!({}));
+        for round in 0..5 {
+            let (address, ttl) =
+                ask(&engine, "continued.example", "192.0.2.10", DNSClass::IN).await;
+            assert_eq!(address, Ipv4Addr::new(192, 0, 2, 2), "round {round}");
+            assert!((59..=60).contains(&ttl), "round {round}: TTL {ttl}");
         }
-        assert_eq!(first_upstream.queries(), 2);
-        assert_eq!(
-            group_upstream.queries(),
-            1,
-            "the second from the target's cache"
+        assert_eq!(first.queries(), 1);
+        assert_eq!(second.queries(), 1);
+    }
+
+    /// continue 之后跳过去拿到的应答过期以后，入口据的上游没有回答时照 serve_stale 交出这份过期应答（RFC 8767）。以前入口
+    /// 这条路线从不缓存，入口键下什么也没有，上游失败就是 SERVFAIL
+    /// Once the answer got through a jump after a continue has expired, with the upstream the
+    /// entry goes by not answering, serve_stale gives that expired answer (RFC 8767). The entry's
+    /// route used to be never cached, nothing under the entry's key, and the upstream failing
+    /// meant SERVFAIL
+    #[tokio::test]
+    async fn a_jump_after_a_continue_serves_stale_when_the_checked_upstream_fails() {
+        let first = answering_upstream(Ipv4Addr::new(192, 0, 2, 1), 1).await;
+        let second = answering_upstream(Ipv4Addr::new(192, 0, 2, 2), 1).await;
+        let engine = continue_then_jump(
+            &first.address,
+            &second.address,
+            serde_json::json!({ "serve_stale": true, "upstream_timeout_ms": 200 }),
         );
+        answer(&engine, "continued.example", "192.0.2.10").await;
+        // TTL 按整秒算：过了 1 秒就过期 / TTLs go by whole seconds: past 1 second it has expired
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        first.silence(true);
+        let (address, ttl) = ask(&engine, "continued.example", "192.0.2.10", DNSClass::IN).await;
+        assert_eq!(address, Ipv4Addr::new(192, 0, 2, 2));
+        assert_eq!(ttl, 30, "serve_stale_ttl");
     }
 
     /// 目标 pipeline 按客户端判断时，跳转后按它的键查缓存：键分辨请求方，被拦下的客户端拿不到另一个客户端转发回来的
@@ -8165,9 +8190,15 @@ mod requester_scope_tests {
         );
     }
 
-    /// 回答检查 continue 之后再跳转：请求仍持有条目，等待者拿到跳转之后的最终应答。
-    /// A jump after an answer check continues: the request still holds its entry,
-    /// and its waiters take the final answer from after the jump.
+    /// 回答检查 continue 之后再跳转：请求仍持有条目，等待者拿到跳转之后的最终应答，应答也缓存在这个 pipeline 的键下（见
+    /// `Route::enter`）。continue 那条规则之前的跳转不算：跳过去时还没据过上游的回答，换成目标的键，目标自己的键分辨请求方。
+    /// 以前只要有回答检查会 continue，所有请求阶段跳转的目标都算
+    /// A jump after an answer check continues: the request still holds its entry, its
+    /// waiters take the final answer from after the jump, and the answer is cached under this
+    /// pipeline's key too (see `Route::enter`). A jump before the rule that continues does not
+    /// count: made before any upstream's answer was gone by, it moves to the target's keys, which
+    /// tell requesters apart by the target's own. With any answer check that continues, every
+    /// request-phase jump's target used to count
     #[test]
     fn a_scope_takes_in_request_jumps_after_a_continue() {
         let jump =
@@ -8188,12 +8219,17 @@ mod requester_scope_tests {
                 { "id": "continue-to-client", "rules": [continues(), rule("all", any(), jump("client"))] },
                 { "id": "to-client", "rules": [rule("all", any(), jump("client"))] },
                 // 那里的 ECS 键带不过来 / Its ECS key does not carry over
-                { "id": "continue-to-ecs", "rules": [continues(), rule("all", any(), jump("ecs-keyed"))] }
+                { "id": "continue-to-ecs", "rules": [continues(), rule("all", any(), jump("ecs-keyed"))] },
+                { "id": "client-then-continue", "rules": [
+                    rule("some", serde_json::json!([{ "type": "domain_suffix", "value": "jump.test" }]), jump("client")),
+                    continues()
+                ] }
             ]),
         );
         for (pipeline, expected) in [
             ("continue-to-client", vec!["net 10.0.0.1/32"]),
             ("to-client", vec![]),
+            ("client-then-continue", vec![]),
             ("continue-to-ecs", vec!["subnet 24/56"]),
             // As in `a_scope_has_the_tests_the_rules_tell_requesters_apart_by`
             // 同 `a_scope_has_the_tests_the_rules_tell_requesters_apart_by`
