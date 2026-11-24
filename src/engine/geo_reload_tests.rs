@@ -1071,3 +1071,104 @@ async fn missing_and_unreadable_geo_files_are_logged_as_errors() {
         );
     }
 }
+
+/// 像 Kubernetes 的卷那样换上一版数据：这一版写进它自己的目录 `version`，`..data` 改指到这个目录；头一回还建好
+/// `..data` 和经它指到文件 `name` 的链接
+/// Puts in a version of the data as a Kubernetes volume does: the version is written to a
+/// directory of its own, `version`, and `..data` is pointed at that directory; the first time
+/// also sets up `..data` and the link to file `name` through it
+#[cfg(unix)]
+fn kubernetes_volume(volume: &Path, name: &str, version: &str, content: &[u8]) {
+    use std::os::unix::fs::symlink;
+    std::fs::create_dir(volume.join(version)).unwrap();
+    std::fs::write(volume.join(version).join(name), content).unwrap();
+    let data = volume.join("..data");
+    if data.symlink_metadata().is_ok() {
+        symlink(version, volume.join("..data_tmp")).unwrap();
+        std::fs::rename(volume.join("..data_tmp"), &data).unwrap();
+    } else {
+        symlink(version, &data).unwrap();
+        symlink(Path::new("..data").join(name), volume.join(name)).unwrap();
+    }
+}
+
+/// Kubernetes 卷换了 `..data` 以后，卷里的数据文件还排在配置写的位置：[卷里的 first.dat, last.dat] 都写着 shared 时
+/// last.dat 说了算，first.dat 换了一版也一样
+/// Once a Kubernetes volume swaps `..data`, the data file in it keeps the place the
+/// configuration writes: with [first.dat in the volume, last.dat] both writing shared,
+/// last.dat decides, and still does once first.dat has a new version
+#[cfg(unix)]
+#[tokio::test]
+async fn a_kubernetes_volume_swap_keeps_the_file_in_its_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let volume = dir.path().join("volume");
+    std::fs::create_dir(&volume).unwrap();
+    let version = |shared: &str, only: &str| geosite_dat(&[("shared", shared), ("only", only)]);
+    kubernetes_volume(
+        &volume,
+        "first.dat",
+        "..v1",
+        &version("first1.test", "only1.test"),
+    );
+    let (first, last) = (volume.join("first.dat"), dir.path().join("last.dat"));
+    std::fs::write(&last, geosite_dat(&[("shared", "last.test")])).unwrap();
+    let engine = engine(geosite_config_any_of(&[&first, &last], &["shared", "only"]));
+    let manager = engine.geo().geosite;
+    assert!(manager.matches("shared", "x.last.test"), "last.dat decides");
+    assert!(!manager.matches("shared", "x.first1.test"));
+
+    kubernetes_volume(
+        &volume,
+        "first.dat",
+        "..v2",
+        &version("first2.test", "only2.test"),
+    );
+    wait_for("the new version is read in", || {
+        engine.geo().geosite.matches("only", "x.only2.test")
+    })
+    .await;
+    let manager = engine.geo().geosite;
+    assert!(
+        manager.matches("shared", "x.last.test"),
+        "last.dat still comes after first.dat and decides shared"
+    );
+    assert!(!manager.matches("shared", "x.first2.test"));
+}
+
+/// Kubernetes 卷换上的一版不再写着某个标签时，这个标签和改写一个普通文件一样随之去掉，Geo 数据的问题里说一句它没有
+/// 数据了
+/// When the version a Kubernetes volume swaps in no longer writes some tag, the tag goes, as
+/// when a plain file is written over, and the Geo data's problems say it has no data
+#[cfg(unix)]
+#[tokio::test]
+async fn a_tag_a_kubernetes_volume_swap_removes_goes() {
+    let dir = tempfile::tempdir().unwrap();
+    let volume = dir.path();
+    kubernetes_volume(
+        volume,
+        "site.dat",
+        "..v1",
+        &geosite_dat(&[("ads", "ads1.test"), ("cn", "cn.test")]),
+    );
+    let site = volume.join("site.dat");
+    let engine = engine(geosite_config_any_of(&[&site], &["ads", "cn"]));
+    assert!(engine.geo().geosite.matches("cn", "x.cn.test"));
+    assert_eq!(engine.geo_data_warnings(), Vec::<String>::new());
+
+    kubernetes_volume(
+        volume,
+        "site.dat",
+        "..v2",
+        &geosite_dat(&[("ads", "ads2.test")]),
+    );
+    let unprovided = [
+        "GeoSite tags cn are in no data file: geo_site never matches them and geo_site_not always does",
+    ];
+    wait_for("the status says cn has no data", || {
+        engine.geo_data_warnings() == unprovided
+    })
+    .await;
+    let manager = engine.geo().geosite;
+    assert!(manager.matches("ads", "x.ads2.test"));
+    assert!(!manager.has_tag("cn"), "cn went with the old version");
+}
