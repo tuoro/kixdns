@@ -1,5 +1,3 @@
-use std::fs::File;
-use std::io::{BufReader, Read};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -9,6 +7,8 @@ use anyhow::Context;
 use prost::Message;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Deserialize;
+
+use super::dat_reader::DatReader;
 
 /// MaxMind GeoLite2-Country 数据库结构，字符串直接借用数据库里的字节
 /// MaxMind GeoLite2-Country database structure, its strings borrowed from the database's bytes
@@ -426,9 +426,7 @@ impl GeoIpManager {
         path: &Path,
         wanted: &dyn Fn(&str) -> bool,
     ) -> anyhow::Result<ParsedGeoIp> {
-        let file = File::open(path)?;
-        let mut remaining = file.metadata()?.len();
-        let mut file = BufReader::with_capacity(64 * 1024, file);
+        let mut file = DatReader::open(path)?;
         // 一个条目的内容，各条目轮流使用 / One entry's bytes, reused for every entry
         let mut entry = Vec::new();
         let mut tag_indexes: FxHashMap<Arc<str>, GeoIpTagIndex> = FxHashMap::default();
@@ -436,37 +434,13 @@ impl GeoIpManager {
         let mut ipv4_count = 0;
         let mut ipv6_count = 0;
 
-        // GeoIPList 顶层只有 `repeated GeoIP entry = 1`，别的字段跳过
-        // GeoIPList holds only `repeated GeoIP entry = 1` at the top; other fields are skipped
-        while remaining > 0 {
-            let key = read_varint(&mut file, &mut remaining)?;
-            let (field, wire_type) = (key >> 3, key & 0x7);
-            let len = match wire_type {
-                0 => {
-                    read_varint(&mut file, &mut remaining)?;
-                    continue;
-                }
-                1 => 8,
-                2 => read_varint(&mut file, &mut remaining)?,
-                5 => 4,
-                other => anyhow::bail!("invalid wire type {other} in .dat file"),
-            };
-            anyhow::ensure!(
-                field != 1 || wire_type == 2,
-                "invalid wire type {wire_type} for a GeoIP entry"
-            );
-            anyhow::ensure!(
-                len <= remaining,
-                "truncated .dat file: a field needs {len} bytes, {remaining} left"
-            );
-            remaining -= len;
-            if field != 1 {
-                file.seek_relative(i64::try_from(len)?)?;
-                continue;
-            }
-            entry.clear();
-            entry.resize(usize::try_from(len)?, 0);
-            file.read_exact(&mut entry)?;
+        // GeoIPList 顶层只有 `repeated GeoIP entry = 1`，别的字段跳过。条目越出文件时整份文件拒绝（见
+        // `DatReader::next_field`）
+        // GeoIPList holds only `repeated GeoIP entry = 1` at the top; other fields are skipped.
+        // An entry running past the file gets the whole file rejected (see
+        // `DatReader::next_field`)
+        while let Some(len) = file.next_field(1, file.end())? {
+            file.read(&mut entry, len)?;
 
             // 先只解国家代码（其余字段跳过不解），要的条目才整个解
             // Decode the country code alone first (other fields are skipped undecoded), and
@@ -712,26 +686,6 @@ fn json_network(text: &str) -> Option<ipnet::IpNet> {
     text.parse()
         .ok()
         .or_else(|| text.parse::<IpAddr>().ok().map(ipnet::IpNet::from))
-}
-
-/// 从 `file` 读一个 protobuf 变长整数，`remaining` 是文件里还剩的字节数
-/// Reads a protobuf varint from `file`, `remaining` being the bytes left in the file
-fn read_varint(file: &mut impl Read, remaining: &mut u64) -> anyhow::Result<u64> {
-    let mut value = 0u64;
-    for shift in (0..64).step_by(7) {
-        anyhow::ensure!(
-            *remaining > 0,
-            "truncated .dat file: a varint runs past the end"
-        );
-        let mut byte = [0u8];
-        file.read_exact(&mut byte)?;
-        *remaining -= 1;
-        value |= u64::from(byte[0] & 0x7F) << shift;
-        if byte[0] & 0x80 == 0 {
-            return Ok(value);
-        }
-    }
-    anyhow::bail!("invalid varint in .dat file")
 }
 
 fn get_or_insert_tag_index<'a>(
