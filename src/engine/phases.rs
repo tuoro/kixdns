@@ -1059,6 +1059,7 @@ impl<'a> Forwarding<'a> {
                     );
                 } else {
                     crate::warn_sparse!(
+                        per decision.upstream;
                         event = "cached_answer_on_upstream_failure",
                         upstream = %decision.upstream,
                         qname = %request.qname,
@@ -1083,6 +1084,7 @@ impl<'a> Forwarding<'a> {
                     );
                 } else {
                     crate::warn_sparse!(
+                       per decision.upstream;
                        event = "upstream_failure",
                        upstream = %decision.upstream,
                        qname = %request.qname,
