@@ -1,9 +1,11 @@
-//! 「是不是内网地址」只有一份，`geoip_private` 和 ECS 都用它（见 `geoip::is_private_ip`；ECS 另外再算本地用的转换前缀，
-//! 见 `ecs_scope_tests`）。这里固定 `geoip_private` 这边的两条路：客户端的来源地址，和应答里的地址。
+//! 「是不是内网地址」只有一份，`geoip_private` 和 ECS 都用它（见 `geoip::is_private_ip`；ECS 另外再算本地用的转换前缀
+//! 64:ff9b:1::/48 和基准测试的 198.18.0.0/15，见 `ecs_scope_tests` 和 `ecs` 的测试）。这里固定 `geoip_private` 这边的
+//! 两条路：客户端的来源地址，和应答里的地址。
 //! Whether an address is on a local network is one list, which `geoip_private` and ECS both
-//! use (see `geoip::is_private_ip`; ECS counts the local-use translation prefix more, see
-//! `ecs_scope_tests`). This pins the two paths of `geoip_private`: the client's source address
-//! and the addresses in an answer.
+//! use (see `geoip::is_private_ip`; ECS counts the local-use translation prefix
+//! 64:ff9b:1::/48 and benchmarking's 198.18.0.0/15 more, see `ecs_scope_tests` and the tests
+//! of `ecs`). This pins the two paths of `geoip_private`: the client's source address and the
+//! addresses in an answer.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::str::FromStr;
