@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
-use crate::config::{Action, Transport};
+use crate::config::{Action, Transport, run_until};
 use crate::engine::rules::{Decision, ResponseActionResult, RuleCacheRecord};
 use crate::observe::{
     DecisionDetail, DecisionKind, DecisionMade, EngineObserver, RequestContext, RequestOutcome,
@@ -241,25 +241,28 @@ fn answer_count(message: &[u8]) -> usize {
     })
 }
 
-/// Kind of decision a response-phase action list leads to. An empty list (or
-/// log-only) keeps the upstream response, which counts as `Forward`.
-/// 响应阶段动作列表导致的决策类型。空列表（或仅日志）表示沿用上游响应，计为 Forward。
+/// 回答阶段一串动作作出的决定的种类，按作决定的那个动作分：执行到它这串就到此为止（见 [`Action::ends_response`]），
+/// 和执行时一样。一个都没有（空的，只有 log、forward 的）时沿用手上的应答，算 Forward
+/// The kind of decision a response-phase action list makes, by the action deciding it: the
+/// list ends once that one runs (see [`Action::ends_response`]), as when it runs. With none
+/// (an empty list, or only logs and forwards) the answer in hand stays, which counts as
+/// `Forward`
 pub(crate) fn response_decision_kind(actions: &[Action]) -> DecisionKind {
-    for action in actions {
-        match action {
-            Action::Log { .. } => continue,
-            Action::Continue => return DecisionKind::Continue,
-            Action::JumpToPipeline { .. } => return DecisionKind::Jump,
-            Action::Forward { .. } | Action::Allow => return DecisionKind::Forward,
+    match run_until(actions, Action::ends_response).last() {
+        Some(Action::Continue) => DecisionKind::Continue,
+        Some(Action::JumpToPipeline { .. }) => DecisionKind::Jump,
+        Some(
             Action::StaticResponse { .. }
             | Action::StaticIpResponse { .. }
             | Action::StaticCnameResponse { .. }
             | Action::StaticTxtResponse { .. }
             | Action::Deny
-            | Action::ReplaceTxtResponse { .. } => return DecisionKind::Static,
+            | Action::ReplaceTxtResponse { .. },
+        ) => DecisionKind::Static,
+        None | Some(Action::Log { .. } | Action::Forward { .. } | Action::Allow) => {
+            DecisionKind::Forward
         }
     }
-    DecisionKind::Forward
 }
 
 /// Report request-phase rule matches in evaluation order. Every rule but the
@@ -337,7 +340,48 @@ pub(crate) fn report_rule_cache_hit(
 
 #[cfg(test)]
 mod tests {
-    use super::cached_source;
+    use super::{DecisionKind, cached_source, response_decision_kind};
+
+    /// 回答阶段的一串动作按作决定的那个分类，前面有几个 forward、log 都一样：[forward, continue] 是 continue，
+    /// [forward, jump] 是跳转，[forward, deny] 是静态应答；没有作决定的沿用手上的应答。以前碰到第一个 forward 就算
+    /// Forward，查询日志里这样的规则停在 Forward，看不到它其实 continue 了
+    /// A response-phase action list is classed by the action deciding it, whatever forwards and
+    /// logs come before: [forward, continue] is a continue, [forward, jump] a jump, [forward,
+    /// deny] a static answer; with none deciding, the answer in hand stays. The first forward
+    /// used to count as Forward, so the query log left such a rule at Forward, never showing it
+    /// continued
+    #[test]
+    fn a_response_list_is_classed_by_the_action_deciding_it() {
+        let kind = |actions: serde_json::Value| {
+            let actions: Vec<crate::config::Action> =
+                serde_json::from_value(actions).expect("actions");
+            response_decision_kind(&actions)
+        };
+        let forward = serde_json::json!({ "type": "forward", "upstream": "192.0.2.1:53" });
+        let log = serde_json::json!({ "type": "log" });
+        for (actions, decided) in [
+            (
+                serde_json::json!([forward, { "type": "continue" }]),
+                DecisionKind::Continue,
+            ),
+            (
+                serde_json::json!([log, forward, { "type": "jump_to_pipeline", "pipeline": "next" }]),
+                DecisionKind::Jump,
+            ),
+            (
+                serde_json::json!([forward, { "type": "deny" }]),
+                DecisionKind::Static,
+            ),
+            (
+                serde_json::json!([{ "type": "allow" }, { "type": "continue" }]),
+                DecisionKind::Forward,
+            ),
+            (serde_json::json!([forward, log]), DecisionKind::Forward),
+            (serde_json::json!([]), DecisionKind::Forward),
+        ] {
+            assert_eq!(kind(actions.clone()), decided, "{actions}");
+        }
+    }
 
     #[test]
     fn cached_source_drops_only_the_transport_label() {

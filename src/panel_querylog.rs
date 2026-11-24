@@ -4448,9 +4448,9 @@ mod tests {
             Some(&servfail),
         );
 
-        // 回答阶段的动作也没拿到应答（比如转发次数到了上限）：失败，不算规则回应
-        // The response actions found no answer either (a forward limit reached, say): failed, not a
-        // rule's answer
+        // 回答阶段的动作也没拿到应答（比如里面的 forward 也没问到）：失败，不算规则回应
+        // The response actions found no answer either (the forward among them getting none too,
+        // say): failed, not a rule's answer
         let gave_up = start(18);
         decide(
             &log,
