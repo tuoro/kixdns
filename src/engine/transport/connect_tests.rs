@@ -10,7 +10,7 @@ use tokio::time::timeout;
 /// paused clock moved past it, the next connect is made
 #[tokio::test(start_paused = true)]
 async fn backing_off_runs_on_tokio_clock() {
-    let refused = || async { Err::<(), _>(anyhow::anyhow!("refused")) };
+    let refused = |_| async { Err::<(), _>(anyhow::anyhow!("refused")) };
     let mut connect = Connect::default();
     let attempt = connect.attempt(refused).expect("the first connect is made");
     assert!(attempt.await.is_err());
@@ -100,8 +100,9 @@ async fn attempts_are_staggered_and_a_failure_moves_on_at_once() {
         "192.0.2.1:53".parse().unwrap(),
         "[2001:db8::1]:53".parse().unwrap(),
     );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     let started = tokio::time::Instant::now();
-    let connected = staggered(vec![a, b], |address| async move {
+    let connected = staggered(vec![a, b], deadline, |address| async move {
         if address == a {
             std::future::pending::<anyhow::Result<SocketAddr>>().await
         } else {
@@ -113,7 +114,7 @@ async fn attempts_are_staggered_and_a_failure_moves_on_at_once() {
     assert_eq!((connected, started.elapsed()), (b, ATTEMPT_DELAY));
 
     let started = tokio::time::Instant::now();
-    let connected = staggered(vec![a, b], |address| async move {
+    let connected = staggered(vec![a, b], deadline, |address| async move {
         anyhow::ensure!(address != a, "{address} refused");
         Ok(address)
     })
@@ -121,7 +122,7 @@ async fn attempts_are_staggered_and_a_failure_moves_on_at_once() {
     .expect("the second connects");
     assert_eq!((connected, started.elapsed()), (b, Duration::ZERO));
 
-    let failed = staggered(vec![a, b], |_| async move {
+    let failed = staggered(vec![a, b], deadline, |_| async move {
         Err::<SocketAddr, _>(anyhow::anyhow!("refused"))
     })
     .await
@@ -129,5 +130,34 @@ async fn attempts_are_staggered_and_a_failure_moves_on_at_once() {
     assert_eq!(
         failed.to_string(),
         format!("connect {a}: refused; connect {b}: refused")
+    );
+}
+
+/// 到了建连的期限还没连上：已经失败的照列，还在连的记成多久没回应，看得出是哪些地址。以前外层的时限先到，连过的地址和
+/// 攒下的失败一起丢掉，只剩「connect timeout after 5000ms」（DoQ 握手不回的那种见 doq 的测试
+/// `a_doq_handshake_left_unanswered_names_the_address`）
+/// Not through by the connect's deadline: those failed are reported as ever and those still
+/// connecting as unanswered for so long, showing which addresses they were. The outer time limit
+/// used to come first, dropping the addresses dialled along with the failures gathered, leaving
+/// "connect timeout after 5000ms" alone (see the DoQ test
+/// `a_doq_handshake_left_unanswered_names_the_address` for a DoQ handshake never answered)
+#[tokio::test(start_paused = true)]
+async fn attempts_still_connecting_at_the_deadline_are_named() {
+    let [a, b, c]: [SocketAddr; 3] =
+        ["192.0.2.1:53", "192.0.2.2:53", "192.0.2.3:53"].map(|address| address.parse().unwrap());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    let failed = staggered(vec![a, b, c], deadline, |address| async move {
+        anyhow::ensure!(address != b, "refused");
+        std::future::pending::<anyhow::Result<()>>().await
+    })
+    .await
+    .expect_err("none connects");
+    // a 一开始就连，b 过了 ATTEMPT_DELAY 才连、马上失败，c 紧跟着连 / a is dialled at once, b after
+    // ATTEMPT_DELAY failing at once, and c straight after
+    assert_eq!(
+        failed.to_string(),
+        format!(
+            "connect {b}: refused; connect {a}: no answer in 1000ms; connect {c}: no answer in 750ms"
+        )
     );
 }
