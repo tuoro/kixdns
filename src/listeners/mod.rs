@@ -502,11 +502,11 @@ struct UdpAnswering<'a> {
 /// running empty the drops are read, sparing the usual path that system call
 const BEHIND_AFTER_CHECKS: u32 = 10;
 
-/// 一个小查询在接收缓冲里算多少字节：内核给每个小报文记 960 字节，再把 `SO_RCVBUF` 的值翻倍当上限。网卡收进来的报文记得
-/// 更多，放得下的少，排队只会更短
-/// What a small query counts for in the receive buffer: the kernel charges a small datagram 960 bytes and doubles
-/// the `SO_RCVBUF` value for its limit. A datagram from a network card is charged more, so fewer fit and the wait
-/// only gets shorter
+/// 一个小查询在接收缓冲里算多少字节：Linux 的内核给每个小报文记 960 字节，再把 `SO_RCVBUF` 的值翻倍当上限。网卡收进来的
+/// 报文记得更多，放得下的少，排队只会更短。别的系统也按它算（见 `recv_buffer_holds`）
+/// What a small query counts for in the receive buffer: the Linux kernel charges a small datagram 960 bytes and
+/// doubles the `SO_RCVBUF` value for its limit. A datagram from a network card is charged more, so fewer fit and
+/// the wait only gets shorter. Other systems are reckoned by it too (see `recv_buffer_holds`)
 const RECV_BUFFER_PER_QUERY: usize = 480;
 
 /// 大接收缓冲放得下多少个小查询，读不到实际大小时按这个算 / How many small queries the large receive
@@ -514,14 +514,25 @@ const RECV_BUFFER_PER_QUERY: usize = 480;
 const QUERIES_IN_RECV_BUFFER: usize = UDP_BUFFER_SIZE / RECV_BUFFER_PER_QUERY;
 
 /// 这个 socket 的接收缓冲放得下多少个小查询，两种接收循环开始轮流时都先这么算。`net.core.rmem_max` 比 4 MiB 小时，
-/// 设下去的大小会被 Linux 截短；Linux 报的是翻过倍的大小，一个小查询按 `2 * RECV_BUFFER_PER_QUERY` 算，别的系统报的就是
-/// 设下的大小。读不到时按大缓冲算。网卡收的包内核记得更多，批量收的循环边读边量（见 `TakingTurns::read`）
+/// 设下去的大小会被 Linux 截短；Linux 报的是翻过倍的大小，一个小查询按 `2 * RECV_BUFFER_PER_QUERY` 算。网卡收的包内核记得
+/// 更多，批量收的循环边读边量（见 `TakingTurns::read`）。别的系统报的就是设下的大小，一个小查询按 `RECV_BUFFER_PER_QUERY`
+/// 算，往少里估：macOS 在回环上量过，150 字节以内的报文每个记 192 字节，4 MiB 放得下 21846 个，这里算 8738 个；放进 2 KiB
+/// 簇的（回环上 300 字节的）每个记 448 字节，放得下 9363 个。这些系统读不出缓冲实际记了多少，没法边读边量；FreeBSD、
+/// Windows 没量过。算少了只是轮流结束得晚些；算多了，轮流在不轮流照样会丢包时就结束，丢包一来又马上轮流（见
+/// `QUIET_BEFORE_A_NEW_SPELL`）。读不到大小时按大缓冲算
 /// How many small queries this socket's receive buffer holds, as both receive loops reckon when
 /// turns begin. With `net.core.rmem_max` below 4 MiB Linux cuts the size that was set; it reports
-/// the doubled size, a small query reckoned at `2 * RECV_BUFFER_PER_QUERY`, while other systems
-/// report the size that was set. When it cannot be read the large buffer is reckoned. The kernel
-/// charges datagrams from a network card more, so the batched loop measures it as it reads (see
-/// `TakingTurns::read`)
+/// the doubled size, a small query reckoned at `2 * RECV_BUFFER_PER_QUERY`. The kernel charges
+/// datagrams from a network card more, so the batched loop measures it as it reads (see
+/// `TakingTurns::read`). Other systems report the size that was set, a small query reckoned at
+/// `RECV_BUFFER_PER_QUERY`, which errs low: measured on loopback, macOS charges a datagram of up
+/// to 150 bytes 192 bytes, 21846 of them fitting in 4 MiB where 8738 are reckoned, and one put in
+/// a 2 KiB cluster (a 300-byte one on loopback) 448 bytes, 9363 fitting. These systems give no
+/// way to read what the buffer is actually charged, so nothing is measured as it reads; FreeBSD
+/// and Windows have not been measured. Reckoning low only makes turns end somewhat later;
+/// reckoning high would end them while there would still be drops without turns, and the drops
+/// would bring turns straight back (see `QUIET_BEFORE_A_NEW_SPELL`). When the size cannot be
+/// read the large buffer is reckoned
 fn recv_buffer_holds(socket: &UdpSocket) -> usize {
     let reported_per_query = if cfg!(target_os = "linux") {
         2 * RECV_BUFFER_PER_QUERY
