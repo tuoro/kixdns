@@ -126,15 +126,17 @@ async fn a_refreshed_entry_still_answers_in_the_class_asked() {
     let refreshes_started = std::time::Instant::now();
     support::ask(&engine, &chaos_query(), peer()).await;
     until_queries(&up, 2).await;
-    let slot = Engine::cache_slot(
-        engine.state.load().cache_namespace("main"),
-        "main",
-        b"version.test",
-        RecordType::TXT,
-        DNSClass::CH,
-        crate::proto_utils::QueryFlags::RECURSIVE,
-        &crate::matcher::RequesterKey::NONE,
-    );
+    let slot = crate::engine::types::KeyedQuestion {
+        namespace: engine.state.load().cache_namespace("main"),
+        pipeline_id: "main",
+        qname: b"version.test",
+        qtype: RecordType::TXT,
+        qclass: DNSClass::CH,
+        flags: crate::proto_utils::QueryFlags::RECURSIVE,
+        requester: crate::matcher::RequesterKey::NONE,
+        client_ecs: None,
+    }
+    .slot();
     tokio::time::timeout(Duration::from_secs(5), async {
         while !engine
             .cached_entries(slot)

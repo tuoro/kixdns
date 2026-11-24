@@ -735,7 +735,6 @@ mod tests {
     /// every shard, about evenly: the store, using a key's own bits, relies on this
     #[test]
     fn the_engines_keys_spread_over_every_shard() {
-        use crate::engine::Engine;
         use crate::engine::rules::calculate_rule_hash;
         use crate::matcher::RequesterKey;
         use crate::proto_utils::QueryFlags;
@@ -745,15 +744,17 @@ mod tests {
         let names: Vec<String> = (0..64 * 64).map(|n| format!("n{n}.example")).collect();
         let keys: [fn(&str) -> u64; 2] = [
             |name| {
-                Engine::cache_slot(
-                    0,
-                    "main",
-                    name.as_bytes(),
-                    RecordType::A,
-                    DNSClass::IN,
-                    QueryFlags::RECURSIVE,
-                    &RequesterKey::NONE,
-                )
+                crate::engine::types::KeyedQuestion {
+                    namespace: 0,
+                    pipeline_id: "main",
+                    qname: name.as_bytes(),
+                    qtype: RecordType::A,
+                    qclass: DNSClass::IN,
+                    flags: QueryFlags::RECURSIVE,
+                    requester: RequesterKey::NONE,
+                    client_ecs: None,
+                }
+                .slot()
             },
             |name| {
                 calculate_rule_hash(

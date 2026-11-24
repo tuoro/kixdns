@@ -1,15 +1,15 @@
 use super::Engine;
-use crate::cache::{CacheEntry, CachedQuestion};
+use crate::cache::CacheEntry;
 use crate::config::GlobalSettings;
 use crate::config::{Action, Transport};
 use crate::ecs_scope::{EcsReach, EcsView, ForwardEcs};
 use crate::engine::execution::{Request, Route};
-use crate::engine::observation::{Observed, cached_source, report_response_rule};
+use crate::engine::observation::{cached_source, report_response_rule};
 use crate::engine::refresh::RefreshTarget;
 use crate::engine::response::extract_ttl;
 use crate::engine::response_log::{ResponseInfo, Source};
 use crate::engine::rules::{self, ResponseActionResult, ResponseContext};
-use crate::engine::types::{EngineInner, InflightEntry, InflightQuestion};
+use crate::engine::types::InflightEntry;
 use crate::engine::upstream::{UpstreamFailure, is_failure_reply, reject_failure_reply_on_refresh};
 use crate::engine::utils::{InflightCleanupGuard, set_id};
 use crate::matcher::{Requester, RuntimeResponseMatcherWithOp};
@@ -17,7 +17,7 @@ use crate::observe::{CacheHit, CacheHitKind};
 use crate::proto_utils;
 use bytes::{Bytes, BytesMut};
 use hickory_proto::op::{Message, ResponseCode};
-use hickory_proto::rr::{DNSClass, Record, RecordType};
+use hickory_proto::rr::Record;
 use hickory_proto::serialize::binary::BinDecodable;
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -51,40 +51,18 @@ pub enum ForwardResult {
     },
 }
 
-/// Immutable cache lookup data shared by normal and refresh-wait paths.
+/// 在 `pipeline_id` 的槽位 `slot` 里查 `request` 的应答：查缓存、等刷新以后再查、上游失败以后再查、交出过期应答都照它；
+/// 槽位里按谁在问挑应答，后台刷新也照这个请求重放（地址、EDNS、客户端自己的 ECS），命中经它的观察者上报
+/// Looking up `request`'s answer in slot `slot` of `pipeline_id`: the cache lookup, the
+/// lookups after waiting for a refresh and after an upstream failure, and serving a stale
+/// answer all go by it; the answer in the slot is picked by who is asking, a background refresh
+/// replays this request (address, EDNS, the client's own ECS), and hits are reported through
+/// its observer
 pub struct CacheLookupContext<'a> {
-    pub state: &'a Arc<EngineInner>,
-    pub qname: &'a str,
-    pub qtype: RecordType,
-    pub qclass: DNSClass,
-    /// The query bits (see `QueryFlags`) / 查询位（见 `QueryFlags`）
-    pub flags: proto_utils::QueryFlags,
-    pub pipeline_id: &'a str,
+    pub(crate) request: &'a Request<'a>,
+    pub(crate) pipeline_id: &'a str,
     /// Response cache slot / 响应缓存槽位
-    pub slot: u64,
-    pub tx_id: u16,
-    pub start: Instant,
-    pub peer: &'a std::net::SocketAddr,
-    /// Who is asking: picks the answer in the slot, and a background refresh replays
-    /// the request the same way (address, EDNS, the client's own ECS).
-    /// 谁在问：据此在槽位里挑应答，后台刷新也照此重放请求（地址、EDNS、客户端自己的 ECS）。
-    pub requester: Requester,
-    /// Observer context of the request; cache hits are reported through it.
-    /// 所属请求的观察者上下文；缓存命中通过它上报。
-    pub observed: Observed<'a>,
-}
-
-impl CacheLookupContext<'_> {
-    /// 槽位里的应答要回答的问题 / The question the answers in the slot must answer
-    fn question(&self) -> CachedQuestion<'_> {
-        CachedQuestion {
-            qname: self.qname,
-            pipeline_id: self.pipeline_id,
-            qtype: u16::from(self.qtype),
-            qclass: u16::from(self.qclass),
-            flags: self.flags,
-        }
-    }
+    pub(crate) slot: u64,
 }
 
 /// 缓存里的一份应答现在算什么 / What a cached answer counts as now
@@ -208,13 +186,14 @@ fn usable_hit(
     context: &CacheLookupContext<'_>,
 ) -> Option<(Arc<CacheEntry>, u64, Age)> {
     let now = Instant::now();
+    let request = context.request;
     let hit = engine.cache_get(
         context.slot,
-        &context.requester.ecs_view(),
-        &context.question(),
+        &request.requester.ecs_view(),
+        &request.cached_question(context.pipeline_id),
     )?;
     let elapsed_secs = now.saturating_duration_since(hit.inserted_at).as_secs();
-    let age = age_of(&hit, elapsed_secs, &context.state.pipeline.settings);
+    let age = age_of(&hit, elapsed_secs, &request.state.pipeline.settings);
     (age != Age::Spent).then_some((hit, elapsed_secs, age))
 }
 
@@ -234,14 +213,15 @@ pub(crate) fn check_cache(
     if age == Age::Fresh {
         return Looked::Answered(serve_fresh(engine, context, &hit, elapsed_secs, response));
     }
-    let view = context.requester.ecs_view();
-    match stale_at_once(engine, &context.state.pipeline.settings, context.slot, &hit) {
+    let request = context.request;
+    let view = request.requester.ecs_view();
+    match stale_at_once(engine, &request.state.pipeline.settings, context.slot, &hit) {
         Some(kind) => Looked::Answered(serve_stale(engine, context, &hit, &view, kind, response)),
         // 先等上游：条目留着，等待到头时交出；刷新现在就发起，等的就是它
         // The upstream comes first: the entry stays to go out when the wait runs out,
         // and its refresh, which is what is waited for, starts now
         None => {
-            engine.spawn_background_refresh(context.state, &hit, context.slot, context.requester);
+            engine.spawn_background_refresh(request.state, &hit, context.slot, request.requester);
             Looked::Waiting(hit)
         }
     }
@@ -272,7 +252,7 @@ pub(crate) fn check_cache_after_wait(
     } else {
         CacheHitKind::Stale
     };
-    let view = context.requester.ecs_view();
+    let view = context.request.requester.ecs_view();
     Some(serve_stale(engine, context, &hit, &view, kind, response))
 }
 
@@ -294,7 +274,7 @@ pub(crate) fn check_cache_after_failure(
     if age == Age::Fresh {
         return Some(serve_fresh(engine, context, &hit, elapsed_secs, response));
     }
-    let view = context.requester.ecs_view();
+    let view = context.request.requester.ecs_view();
     Some(serve_stale(
         engine,
         context,
@@ -315,14 +295,15 @@ fn serve_fresh(
     elapsed_secs: u64,
     response: &mut ResponseInfo,
 ) -> Bytes {
-    let view = context.requester.ecs_view();
+    let request = context.request;
+    let view = request.requester.ecs_view();
     let elapsed = crate::proto_utils::saturating_u64_to_u32(elapsed_secs);
-    let resp_bytes = served_from_cache(hit, context.tx_id, &view, ServedTtl::Elapsed(elapsed));
+    let resp_bytes = served_from_cache(hit, request.tx_id, &view, ServedTtl::Elapsed(elapsed));
 
-    engine.refresh_if_due(context.state, hit, elapsed, context.slot, context.requester);
+    engine.refresh_if_due(request.state, hit, elapsed, context.slot, request.requester);
 
     response.served_from_cache(hit);
-    if let Some((observer, ctx)) = context.observed {
+    if let Some((observer, ctx)) = request.observed {
         observer.cache_hit(ctx, &cache_hit_of(hit, CacheHitKind::Fresh, elapsed));
     }
     resp_bytes
@@ -411,12 +392,13 @@ pub(crate) fn serve_stale(
     kind: CacheHitKind,
     response: &mut ResponseInfo,
 ) -> Bytes {
-    let settings = &context.state.pipeline.settings;
+    let request = context.request;
+    let settings = &request.state.pipeline.settings;
     debug!(
         event = "serve_stale",
         kind = ?kind,
-        qname = %context.qname,
-        qtype = ?context.qtype,
+        qname = %request.qname,
+        qtype = ?request.qtype,
         rcode = %crate::observe::rcode_name(hit.rcode.into()),
         original_ttl = hit.original_ttl,
         stale_for_secs = hit
@@ -424,14 +406,14 @@ pub(crate) fn serve_stale(
             .elapsed()
             .as_secs()
             .saturating_sub(u64::from(hit.original_ttl)),
-        request_ms = context.start.elapsed().as_millis() as u64,
-        client_ip = %context.peer.ip(),
+        request_ms = request.start.elapsed().as_millis() as u64,
+        client_ip = %request.peer.ip(),
         pipeline = %context.pipeline_id,
         "RFC 8767: serving a stale answer"
     );
     let resp_bytes = served_from_cache(
         hit,
-        context.tx_id,
+        request.tx_id,
         view,
         ServedTtl::Stale(settings.serve_stale_ttl),
     );
@@ -440,8 +422,8 @@ pub(crate) fn serve_stale(
     // Start a background refresh to decide again. An answer the rules gave by an upstream's
     // answer (one with no upstream) is no different: it is what the check of that one reply
     // came to, and once expired it is to be checked again on what the upstream answers now
-    engine.spawn_background_refresh(context.state, hit, context.slot, context.requester);
-    if let Some((observer, ctx)) = context.observed {
+    engine.spawn_background_refresh(request.state, hit, context.slot, request.requester);
+    if let Some((observer, ctx)) = request.observed {
         observer.cache_hit(ctx, &cache_hit_of(hit, kind, 0));
     }
     response.served_from_cache(hit);
@@ -668,24 +650,11 @@ impl<'a> Forwarding<'a> {
         if request.refresh.is_some() {
             return None;
         }
-        let (keys, key_pipeline) = (self.route.keys, &self.route.key_pipeline);
+        let route = &*self.route;
+        let (inflight, key_pipeline) = (route.keys.inflight, &route.key_pipeline);
         // What this forward registers or waits under in the inflight map
         // 这次转发在 inflight 表里登记或等待的问题
-        let question = InflightQuestion {
-            namespace: request.state.cache_namespace(key_pipeline),
-            pipeline_id: key_pipeline,
-            qname: request.qname.as_bytes(),
-            qtype: request.qtype,
-            qclass: request.qclass,
-            flags: keys.flags,
-            requester: keys.requester,
-            client_ecs: request.requester.ecs,
-        };
-        debug_assert_eq!(
-            question.key(),
-            keys.inflight,
-            "the inflight question is what the inflight key was computed from"
-        );
+        let question = route.question(request);
         // 等的那个请求没交出结果就走了（被取消、超时）：重新排一次，空着就自己登记、去问，已经有人重新登记了就等它。
         // 以前直接各自去问，一个领头的带着几个等待者走掉，上游就要被多问几遍。每一圈都有一个领头的走掉，圈数不会多过
         // 同时在等的请求
@@ -696,7 +665,7 @@ impl<'a> Forwarding<'a> {
         // more rounds than requests waiting at once
         loop {
             use dashmap::mapref::entry::Entry;
-            let mut rx = match engine.inflight.entry(keys.inflight) {
+            let mut rx = match engine.inflight.entry(inflight) {
                 // 进不了缓存的也不交给别人（流控拦过这个请求、它发出的 ECS 说不准适用于谁）：它不领头，自己转发。以前
                 // 流控拦下以后 continue 到下一条规则，那里的转发照样登记条目，把这台设备拿到的兜底交给同时来问的别的设备
                 // What may not go into the cache is not handed to others either (flow control
@@ -704,17 +673,15 @@ impl<'a> Forwarding<'a> {
                 // leads no entry and forwards itself. With flow control having kept it back,
                 // continuing to the next rule used to register an entry there all the same,
                 // handing this device's fallback to the other devices asking meanwhile
-                Entry::Vacant(_) if self.route.trail.is_uncacheable() => return None,
+                Entry::Vacant(_) if route.trail.is_uncacheable() => return None,
                 Entry::Vacant(entry) => {
                     entry.insert(InflightEntry::sharing(
                         &question,
                         key_pipeline,
                         Arc::<[u8]>::from(Arc::clone(request.qname)),
                     ));
-                    self.registered = Some(InflightCleanupGuard::new(
-                        engine.inflight.clone(),
-                        keys.inflight,
-                    ));
+                    self.registered =
+                        Some(InflightCleanupGuard::new(engine.inflight.clone(), inflight));
                     return None;
                 }
                 // A request holding an entry (see `Route::held_inflight`) never waits
@@ -726,11 +693,11 @@ impl<'a> Forwarding<'a> {
                 // 自己的（continue 后下一条规则以相同 hash 转发），也可能是另一个
                 // 反过来在等它的请求的（continue 后互相跳进对方的 pipeline）。它
                 // 自己转发。
-                Entry::Occupied(_) if self.route.held_inflight.is_some() => return None,
+                Entry::Occupied(_) if route.held_inflight.is_some() => return None,
                 // Another question's entry under the same key: the key is only a hash (see
-                // `InflightQuestion`), and waiting on it would hand this request another
+                // `KeyedQuestion`), and waiting on it would hand this request another
                 // question's answer. It forwards itself instead.
-                // 同一个键下别的问题的条目：键只是哈希（见 `InflightQuestion`），等它就会把
+                // 同一个键下别的问题的条目：键只是哈希（见 `KeyedQuestion`），等它就会把
                 // 别的问题的应答交给这个请求。它自己转发。
                 Entry::Occupied(entry) if !entry.get().asks(&question) => return None,
                 Entry::Occupied(mut entry) => entry.get_mut().subscribe(),
@@ -1525,17 +1492,17 @@ mod refresh_response_rule_tests {
     /// [`query`] 在 `pipeline` 里的缓存槽位 / The cache slot of [`query`] in `pipeline`
     fn slot_of(engine: &Engine, pipeline: &str) -> u64 {
         let state = engine.state.load_full();
-        Engine::cache_keys(
-            state.cache_namespace(pipeline),
-            pipeline,
-            b"example.com",
-            RecordType::A,
-            DNSClass::IN,
-            crate::proto_utils::QueryFlags::RECURSIVE,
-            &crate::matcher::RequesterKey::NONE,
-            None,
-        )
-        .slot
+        crate::engine::types::KeyedQuestion {
+            namespace: state.cache_namespace(pipeline),
+            pipeline_id: pipeline,
+            qname: b"example.com",
+            qtype: RecordType::A,
+            qclass: DNSClass::IN,
+            flags: crate::proto_utils::QueryFlags::RECURSIVE,
+            requester: crate::matcher::RequesterKey::NONE,
+            client_ecs: None,
+        }
+        .slot()
     }
 
     /// 三条会写缓存的路径，各一条规则，回答都来自 `upstream`：直接转发、应答之后响应动作的转发、

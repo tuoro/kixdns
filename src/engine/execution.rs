@@ -1,5 +1,5 @@
 use std::cell::Cell;
-use std::hash::{BuildHasher, DefaultHasher, Hash, Hasher, RandomState};
+use std::hash::{BuildHasher, DefaultHasher, Hash, RandomState};
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
@@ -32,7 +32,7 @@ use super::refresh::{RefreshCheck, RefreshTarget};
 use super::response::{StaticAddresses, static_reply, write_static_reply};
 use super::response_log::{ResponseInfo, ResponseLog, Source};
 use super::rules::{Decision, ResponseContext, RuleCacheRecord};
-use super::types::{EngineInner, FastPathResponse};
+use super::types::{CacheKeys, EngineInner, FastPathResponse, KeyedQuestion};
 use super::utils::InflightCleanupGuard;
 
 /// The address the engine judges a client by. A dual-stack socket (an inbound DoH
@@ -51,24 +51,6 @@ fn client_address(peer: SocketAddr) -> SocketAddr {
         },
         SocketAddr::V4(_) => peer,
     }
-}
-
-/// The keys of one request in one pipeline (see `Engine::cache_keys`)
-/// 一个请求在一个 pipeline 里的键（见 `Engine::cache_keys`）
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CacheKeys {
-    /// Response cache slot / 响应缓存槽位
-    pub slot: u64,
-    /// Inflight entry / inflight 条目
-    pub inflight: u64,
-    /// The query bits the keys were computed with (see `QueryFlags`)
-    /// 算这些键时用的查询位（见 `QueryFlags`）
-    pub flags: crate::proto_utils::QueryFlags,
-    /// The requester's part the keys were computed with; with the question it makes up
-    /// what the inflight entry is checked against (see `InflightQuestion`)
-    /// 算这些键时用的请求方部分；它和问题一起就是 inflight 条目要核对的内容（见
-    /// `InflightQuestion`）
-    pub requester: RequesterKey,
 }
 
 /// A query read already, so as not to parse it again: the query as `handle_packet_fast` or
@@ -371,61 +353,6 @@ impl Engine {
     #[inline]
     pub fn get_request_timeout_ms(&self) -> u64 {
         request_timeout_ms(&self.state.load().pipeline.settings)
-    }
-
-    /// The response cache slot and the inflight entry of a request. The slot holds
-    /// every answer to the question, each tagged with the ECS subnets it applies to
-    /// (see `CacheEntry::reach`), so its key carries no subnet; requests wait on one
-    /// another only when they send the same, so the inflight key carries the
-    /// subnets the forwards would send for the requester and the client's own ECS.
-    /// 请求的响应缓存槽位和 inflight 条目。槽位存放这个问题的所有应答，每份标着它适用的
-    /// ECS 子网（见 `CacheEntry::reach`），所以它的键不含子网；请求只有发送相同的子网才能
-    /// 互相等待，所以 inflight 键带上转发会为这个请求方发送的子网，以及客户端自己带的 ECS。
-    #[inline]
-    #[allow(clippy::too_many_arguments)]
-    pub fn cache_keys(
-        cache_namespace: u64,
-        pipeline_id: &str,
-        qname: &[u8],
-        qtype: hickory_proto::rr::RecordType,
-        qclass: hickory_proto::rr::DNSClass,
-        flags: crate::proto_utils::QueryFlags,
-        requester: &RequesterKey,
-        client_ecs: Option<&crate::ecs::EcsKey>,
-    ) -> CacheKeys {
-        let mut h = Self::question_hasher(cache_namespace, pipeline_id, qname, qtype, qclass);
-        flags.bits().hash(&mut h);
-        let mut inflight = h.clone();
-        // The requester, for a pipeline whose answer depends on it (see
-        // `RuntimePipeline::requester`); nothing otherwise, so the key is unchanged
-        // 请求方，仅当 pipeline 的应答取决于它时（见 `RuntimePipeline::requester`）；
-        // 否则不写入，键不变
-        requester.hash_into(&mut h);
-        requester.hash_inflight_into(client_ecs, &mut inflight);
-        CacheKeys {
-            slot: h.finish(),
-            inflight: inflight.finish(),
-            flags,
-            requester: *requester,
-        }
-    }
-
-    /// The slot of `cache_keys` alone, for a lookup that registers no inflight entry
-    /// 只算 `cache_keys` 的槽位，用于不登记 inflight 条目的查找
-    #[inline]
-    pub fn cache_slot(
-        cache_namespace: u64,
-        pipeline_id: &str,
-        qname: &[u8],
-        qtype: hickory_proto::rr::RecordType,
-        qclass: hickory_proto::rr::DNSClass,
-        flags: crate::proto_utils::QueryFlags,
-        requester: &RequesterKey,
-    ) -> u64 {
-        let mut h = Self::question_hasher(cache_namespace, pipeline_id, qname, qtype, qclass);
-        flags.bits().hash(&mut h);
-        requester.hash_into(&mut h);
-        h.finish()
     }
 
     /// 算槽位号、inflight 键和规则缓存的键的哈希，先写进问题；查询位由响应缓存自己再写（规则从不看它们）。带密钥
@@ -785,18 +712,19 @@ impl Engine {
 
             // 1. Check Response Cache (L2) / 1. 检查响应缓存（L2）
             let cache_namespace = state.cache_namespace(pipeline_id);
-            let requester_key = pipeline.map_or(RequesterKey::NONE, |p| {
-                p.requester.key(requester, &state.geo.geoip)
-            });
-            let slot = Self::cache_slot(
-                cache_namespace,
+            let slot = KeyedQuestion {
+                namespace: cache_namespace,
                 pipeline_id,
-                q.qname.as_bytes(),
+                qname: q.qname.as_bytes(),
                 qtype,
                 qclass,
-                q.flags,
-                &requester_key,
-            );
+                flags: q.flags,
+                requester: pipeline.map_or(RequesterKey::NONE, |p| {
+                    p.requester.key(requester, &state.geo.geoip)
+                }),
+                client_ecs: q.client_subnet,
+            }
+            .slot();
 
             if let Some(hit) = self.cache_get(
                 slot,
@@ -1129,7 +1057,7 @@ impl Engine {
         lookup: &phases::CacheLookupContext<'_>,
         info: &mut ResponseInfo,
     ) -> Option<Bytes> {
-        if let Some((observer, ctx)) = lookup.observed {
+        if let Some((observer, ctx)) = lookup.request.observed {
             observer.cache_lookup(ctx);
         }
         let answer = match phases::check_cache(self, lookup, info) {
@@ -1141,7 +1069,7 @@ impl Engine {
             phases::Looked::Missed => None,
         };
         if answer.is_none()
-            && let Some((observer, ctx)) = lookup.observed
+            && let Some((observer, ctx)) = lookup.request.observed
         {
             observer.cache_miss(ctx);
         }
@@ -1161,7 +1089,7 @@ impl Engine {
         lookup: &phases::CacheLookupContext<'_>,
         stale: &CacheEntry,
     ) -> bool {
-        let settings = &lookup.state.pipeline.settings;
+        let settings = &lookup.request.state.pipeline.settings;
         let mark = super::refresh::RefreshTarget::mark_of(lookup.slot, &stale.reach);
         // 等待上限取客户端等待与本次请求剩余预算中的较小者。手上这份
         // 过期应答只有赶在外层请求超时之前返回才有意义，否则客户端拿到
@@ -1184,7 +1112,7 @@ impl Engine {
         let budget = Duration::from_millis(request_timeout_ms(settings));
         let client_timeout = Duration::from_millis(settings.serve_stale_client_timeout_ms).min(
             budget
-                .saturating_sub(lookup.start.elapsed())
+                .saturating_sub(lookup.request.start.elapsed())
                 .saturating_sub(STALE_SERVE_RESERVE),
         );
         // 先登记要被叫醒，再看刷新还在不在，这样不会错过在两步之间结束的刷新。以前每 5 毫秒查一次缓存，等 1.8 秒要醒
@@ -1203,7 +1131,7 @@ impl Engine {
             && tokio::time::timeout(client_timeout, ending).await.is_err();
         tracing::debug!(
             event = "client_wait_for_refresh",
-            qname = %lookup.qname,
+            qname = %lookup.request.qname,
             wait_ms = wait_start.elapsed().as_millis() as u64,
             still_refreshing,
             "waited for the background refresh of a stale answer"
@@ -1909,19 +1837,49 @@ impl Request<'_> {
         }
     }
 
-    /// `pipeline` 下这个问题的缓存键，按 `requester` 分辨请求方
-    /// This question's keys under `pipeline`, requesters told apart by `requester`
-    fn keys(&self, pipeline: &str, requester: &RequesterKey) -> CacheKeys {
-        Engine::cache_keys(
-            self.state.cache_namespace(pipeline),
-            pipeline,
-            self.qname.as_bytes(),
-            self.qtype,
-            self.qclass,
-            self.flags,
+    /// 这个请求在 `pipeline` 下、命名空间 `namespace` 里的问题，请求方部分是 `requester`（见 [`KeyedQuestion`]）：请求的
+    /// 键都照它算
+    /// This request's question under `pipeline`, in namespace `namespace`, with `requester` as
+    /// the requester's part (see [`KeyedQuestion`]): the request's keys are all computed from it
+    pub(crate) fn question<'q>(
+        &'q self,
+        pipeline: &'q str,
+        namespace: u64,
+        requester: RequesterKey,
+    ) -> KeyedQuestion<'q> {
+        KeyedQuestion {
+            namespace,
+            pipeline_id: pipeline,
+            qname: self.qname.as_bytes(),
+            qtype: self.qtype,
+            qclass: self.qclass,
+            flags: self.flags,
             requester,
-            self.requester.ecs.as_ref(),
-        )
+            client_ecs: self.requester.ecs,
+        }
+    }
+
+    /// 这个请求在 id 为 `id` 的 pipeline（`pipeline` 是它，选不到时为 None）下的键：按它的规则分辨请求方
+    /// This request's keys under the pipeline of id `id` (`pipeline` being it, None when none was
+    /// picked): requesters told apart by its rules
+    fn keys(&self, id: &str, pipeline: Option<&crate::matcher::RuntimePipeline>) -> CacheKeys {
+        let requester = pipeline.map_or(RequesterKey::NONE, |p| {
+            p.requester.key(self.requester, &self.state.geo.geoip)
+        });
+        self.question(id, self.state.cache_namespace(id), requester)
+            .keys()
+    }
+
+    /// 槽位里的应答要回答的这个问题，在 `pipeline` 下 / This question as the answers in a slot of
+    /// `pipeline` must answer it
+    pub(crate) fn cached_question<'q>(&'q self, pipeline: &'q str) -> CachedQuestion<'q> {
+        CachedQuestion {
+            qname: self.qname,
+            pipeline_id: pipeline,
+            qtype: u16::from(self.qtype),
+            qclass: u16::from(self.qclass),
+            flags: self.flags,
+        }
     }
 
     /// 在 `pipeline` 的槽位 `slot` 里查这个请求的应答 / Looking up this request's answer in slot
@@ -1932,18 +1890,9 @@ impl Request<'_> {
         slot: u64,
     ) -> phases::CacheLookupContext<'s> {
         phases::CacheLookupContext {
-            state: self.state,
-            qname: self.qname,
-            qtype: self.qtype,
-            qclass: self.qclass,
-            flags: self.flags,
+            request: self,
             pipeline_id: pipeline,
             slot,
-            tx_id: self.tx_id,
-            start: self.start,
-            peer: &self.peer,
-            requester: self.requester,
-            observed: self.observed,
         }
     }
 
@@ -1957,14 +1906,7 @@ impl Request<'_> {
     /// 去掉刷新要更新的那份应答，它还在的话（见 [`renewing`]）/ Drop the answer the refresh
     /// renews, if it is still there (see [`renewing`])
     fn drop_refreshed(&self, engine: &Engine, target: &RefreshTarget) {
-        let question = CachedQuestion {
-            qname: self.qname,
-            pipeline_id: &target.pipeline,
-            qtype: u16::from(self.qtype),
-            qclass: u16::from(self.qclass),
-            flags: self.flags,
-        };
-        engine.drop_refreshed(&question, target);
+        engine.drop_refreshed(&self.cached_question(&target.pipeline), target);
     }
 }
 
@@ -2095,16 +2037,10 @@ impl Route {
         pipeline_id: &Arc<str>,
         pipeline: Option<&crate::matcher::RuntimePipeline>,
     ) -> Self {
-        let keys = request.keys(
-            pipeline_id,
-            &pipeline.map_or(RequesterKey::NONE, |p| {
-                p.requester.key(request.requester, &request.state.geo.geoip)
-            }),
-        );
         Self {
             pipeline: Arc::clone(pipeline_id),
             key_pipeline: Arc::clone(pipeline_id),
-            keys,
+            keys: request.keys(pipeline_id, pipeline),
             resume_at: 0,
             reused_response: None,
             jumped: None,
@@ -2147,11 +2083,15 @@ impl Route {
         }
         self.key_pipeline = p.id.clone();
         // The keys follow the pipeline / 键随 pipeline 改变
-        self.keys = request.keys(
-            &p.id,
-            &p.requester.key(request.requester, &request.state.geo.geoip),
-        );
+        self.keys = request.keys(&p.id, Some(p));
         true
+    }
+
+    /// 这条路线的键所依据的问题（见 `Request::question`）：转发照它在 inflight 表里登记、等待
+    /// The question this route's keys came from (see `Request::question`), which a forward
+    /// registers and waits under in the inflight map
+    pub(crate) fn question<'q>(&'q self, request: &'q Request<'_>) -> KeyedQuestion<'q> {
+        request.question(&self.key_pipeline, self.keys.namespace, self.keys.requester)
     }
 
     /// 排第 `rule` 的规则越过了这个应答（continue）：`reused` 留给后面的 `allow`，求值从它的下一条接着走
@@ -2245,7 +2185,7 @@ impl Route {
                     Arc::clone(&self.key_pipeline),
                     u16::from(request.qtype),
                     u16::from(request.qclass),
-                    self.keys.flags,
+                    request.flags,
                     ttl,
                 )
                 .with_reach(self.trail.clone()),
@@ -2294,11 +2234,12 @@ mod tests {
         self as support, answering_upstream, answering_upstream_after, engine_from,
         engine_with_steps,
     };
-    use crate::engine::types::{InflightEntry, InflightQuestion};
+    use crate::engine::types::{InflightEntry, KeyedQuestion};
     use hickory_proto::op::{Message, MessageType, OpCode, Query};
     use hickory_proto::rr::rdata::A;
     use hickory_proto::rr::{Name, RData, Record, RecordType};
     use rustc_hash::FxHashMap;
+    use std::hash::Hasher;
     use std::net::IpAddr;
     use std::str::FromStr;
     use std::sync::Arc;
@@ -2346,17 +2287,17 @@ mod tests {
         let original = runtime_with_upstream("8.8.8.8:53");
         let engine = Engine::new(original.clone(), "test".to_string()).expect("create engine");
         let original_namespace = engine.state.load().cache_namespace("main");
-        let old_key = Engine::cache_keys(
-            original_namespace,
-            "main",
-            b"example.com",
-            RecordType::A,
-            DNSClass::IN,
-            crate::proto_utils::QueryFlags::RECURSIVE,
-            &RequesterKey::NONE,
-            None,
-        )
-        .slot;
+        let old_key = KeyedQuestion {
+            namespace: original_namespace,
+            pipeline_id: "main",
+            qname: b"example.com",
+            qtype: RecordType::A,
+            qclass: DNSClass::IN,
+            flags: crate::proto_utils::QueryFlags::RECURSIVE,
+            requester: RequesterKey::NONE,
+            client_ecs: None,
+        }
+        .slot();
         // A real reply: the cache keeps only replies it can read through to their ECS
         // 真实的应答：缓存只存它能读到 ECS 为止的应答
         let mut reply = Message::new(0, MessageType::Response, OpCode::Query);
@@ -2394,17 +2335,17 @@ mod tests {
             "a changed pipeline must stop addressing entries from the old configuration"
         );
 
-        let new_key = Engine::cache_keys(
-            changed_namespace,
-            "main",
-            b"example.com",
-            RecordType::A,
-            DNSClass::IN,
-            crate::proto_utils::QueryFlags::RECURSIVE,
-            &RequesterKey::NONE,
-            None,
-        )
-        .slot;
+        let new_key = KeyedQuestion {
+            namespace: changed_namespace,
+            pipeline_id: "main",
+            qname: b"example.com",
+            qtype: RecordType::A,
+            qclass: DNSClass::IN,
+            flags: crate::proto_utils::QueryFlags::RECURSIVE,
+            requester: RequesterKey::NONE,
+            client_ecs: None,
+        }
+        .slot();
         assert_ne!(old_key, new_key);
         assert!(
             engine.cached(new_key).is_none(),
@@ -2430,17 +2371,17 @@ mod tests {
         let request = request.to_vec().unwrap();
         // 刷新重放的查询算出的槽位 / The slot the query a refresh replays works out to
         let slot_in = |namespace| {
-            Engine::cache_keys(
+            KeyedQuestion {
                 namespace,
-                "main",
-                b"example.com",
-                RecordType::A,
-                DNSClass::IN,
-                crate::proto_utils::QueryFlags::of(&request),
-                &RequesterKey::NONE,
-                None,
-            )
-            .slot
+                pipeline_id: "main",
+                qname: b"example.com",
+                qtype: RecordType::A,
+                qclass: DNSClass::IN,
+                flags: crate::proto_utils::QueryFlags::of(&request),
+                requester: RequesterKey::NONE,
+                client_ecs: None,
+            }
+            .slot()
         };
         let old_state = engine.state.load_full();
         let old_key = slot_in(old_state.cache_namespace("main"));
@@ -2486,17 +2427,17 @@ mod tests {
             .expect("create engine");
         let request = example_query();
         let slot_of = |pipeline| {
-            Engine::cache_keys(
-                engine.state.load().cache_namespace(pipeline),
-                pipeline,
-                b"example.com",
-                RecordType::A,
-                DNSClass::IN,
-                crate::proto_utils::QueryFlags::of(&request),
-                &RequesterKey::NONE,
-                None,
-            )
-            .slot
+            KeyedQuestion {
+                namespace: engine.state.load().cache_namespace(pipeline),
+                pipeline_id: pipeline,
+                qname: b"example.com",
+                qtype: RecordType::A,
+                qclass: DNSClass::IN,
+                flags: crate::proto_utils::QueryFlags::of(&request),
+                requester: RequesterKey::NONE,
+                client_ecs: None,
+            }
+            .slot()
         };
         let renewed = RefreshTarget::new(
             slot_of("target"),
@@ -2831,16 +2772,17 @@ mod tests {
             let labels: Vec<Vec<u8>> = name.split('.').map(|l| l.as_bytes().to_vec()).collect();
             let query = static_query(7, [1, 0], &labels, 1, 1, (0, &[]));
             engine.handle_packet(&query, peer).await.unwrap();
-            let keys = Engine::cache_keys(
-                engine.state.load().cache_namespace("main"),
-                "main",
-                name.as_bytes(),
-                RecordType::A,
-                DNSClass::IN,
-                crate::proto_utils::QueryFlags::RECURSIVE,
-                &RequesterKey::NONE,
-                None,
-            );
+            let keys = KeyedQuestion {
+                namespace: engine.state.load().cache_namespace("main"),
+                pipeline_id: "main",
+                qname: name.as_bytes(),
+                qtype: RecordType::A,
+                qclass: DNSClass::IN,
+                flags: crate::proto_utils::QueryFlags::RECURSIVE,
+                requester: RequesterKey::NONE,
+                client_ecs: None,
+            }
+            .keys();
             answers.push(engine.cached_entries(keys.slot).remove(0));
         }
         let state = engine.state.load();
@@ -2945,25 +2887,26 @@ mod tests {
     #[test]
     fn names_made_to_collide_in_an_unkeyed_hash_land_apart() {
         let [first, second] = COLLIDING_NAMES.map(|name| {
-            Engine::cache_keys(
-                0,
-                "main",
-                name.as_bytes(),
-                RecordType::A,
-                DNSClass::IN,
-                crate::proto_utils::QueryFlags::RECURSIVE,
-                &RequesterKey::NONE,
-                None,
-            )
+            KeyedQuestion {
+                namespace: 0,
+                pipeline_id: "main",
+                qname: name.as_bytes(),
+                qtype: RecordType::A,
+                qclass: DNSClass::IN,
+                flags: crate::proto_utils::QueryFlags::RECURSIVE,
+                requester: RequesterKey::NONE,
+                client_ecs: None,
+            }
+            .keys()
         });
         assert_ne!(first.slot, second.slot);
         assert_ne!(first.inflight, second.inflight);
     }
 
-    /// 合并只合并问同一个问题的请求。另一个问题的条目落在同一个键上时（键只是哈希，见 `InflightQuestion`；带了密钥，两个
+    /// 合并只合并问同一个问题的请求。另一个问题的条目落在同一个键上时（键只是哈希，见 `KeyedQuestion`；带了密钥，两个
     /// 问题撞上只能是碰巧，这里直接把那个条目放上去），请求自己去问，拿到自己问题的应答，不挂在那个条目上，也什么都不交给它
     /// Merging only merges requests asking the same question. When another question's entry lands
-    /// on the same key (the key is only a hash, see `InflightQuestion`; keyed, two questions
+    /// on the same key (the key is only a hash, see `KeyedQuestion`; keyed, two questions
     /// collide by chance alone, and the entry is put there directly here), the request forwards
     /// by itself and gets the answer to its own question, joining that entry and handing it
     /// nothing.
@@ -2982,7 +2925,7 @@ mod tests {
                 &upstream.address,
             ));
             let namespace = engine.state.load().cache_namespace("main");
-            let question = |name: &'static str| InflightQuestion {
+            let question = |name: &'static str| KeyedQuestion {
                 flags: crate::proto_utils::QueryFlags::of(&query_for(name)),
                 namespace,
                 pipeline_id: "main",
@@ -2996,7 +2939,7 @@ mod tests {
             // question's inflight key
             let (owner, waiting) = tokio::sync::watch::channel(None);
             engine.inflight.insert(
-                question(asked).key(),
+                question(asked).keys().inflight,
                 InflightEntry::new(&question(other)).with_channel(owner),
             );
 
@@ -3625,7 +3568,7 @@ mod tests {
                 "actions": [{ "type": "forward", "upstream": answering }]
             }] }]),
         ));
-        let question = InflightQuestion {
+        let question = KeyedQuestion {
             flags: crate::proto_utils::QueryFlags::RECURSIVE,
             namespace: engine.state.load().cache_namespace("main"),
             pipeline_id: "main",
@@ -3635,16 +3578,7 @@ mod tests {
             requester: RequesterKey::NONE,
             client_ecs: None,
         };
-        let keys = Engine::cache_keys(
-            question.namespace,
-            question.pipeline_id,
-            question.qname,
-            question.qtype,
-            question.qclass,
-            crate::proto_utils::QueryFlags::RECURSIVE,
-            &question.requester,
-            None,
-        );
+        let keys = question.keys();
         let key = keys.slot;
         // 另一个请求在刷新所用的 inflight 键下登记的条目 / Another request's entry under the refresh's inflight key
         let (owner, waiter) = tokio::sync::watch::channel(None);
@@ -4938,17 +4872,17 @@ mod tests {
         let qname = "expire.com";
         let qtype = RecordType::A;
         let qclass = DNSClass::IN;
-        let dedupe_hash = Engine::cache_keys(
-            0,
-            &pipeline_id,
-            qname.as_bytes(),
+        let dedupe_hash = KeyedQuestion {
+            namespace: 0,
+            pipeline_id: &pipeline_id,
+            qname: qname.as_bytes(),
             qtype,
             qclass,
-            crate::proto_utils::QueryFlags::RECURSIVE,
-            &RequesterKey::NONE,
-            None,
-        )
-        .slot;
+            flags: crate::proto_utils::QueryFlags::RECURSIVE,
+            requester: RequesterKey::NONE,
+            client_ecs: None,
+        }
+        .slot();
 
         // Insert an entry that expired 5 seconds ago
         let entry = CacheEntry {
@@ -4992,28 +4926,13 @@ mod tests {
         // serve_stale 关着（build_test_engine），不用它，把它留给请求转发取回的应答去取代（见
         // `phases::usable_hit`）
         assert!(engine.cached(dedupe_hash).is_some());
-        let state = engine.state.load_full();
-        let requester = Requester {
-            address: peer.ip(),
-            edns: false,
-            ecs: None,
-        };
+        // 递归地问，和条目存的查询位一样 / Asked recursively, as the entry's query bits say
+        let mut recursive = packet.clone();
+        recursive[2] = 0x01;
+        let asked = crate::engine::test_support::Asked::new(&engine, qname, qtype, recursive, peer);
         let looked_up = phases::check_cache(
             &engine,
-            &phases::CacheLookupContext {
-                flags: crate::proto_utils::QueryFlags::RECURSIVE,
-                state: &state,
-                qname,
-                qtype,
-                qclass,
-                pipeline_id: &pipeline_id,
-                slot: dedupe_hash,
-                tx_id: 0xAABB,
-                start: Instant::now(),
-                peer: &peer,
-                requester,
-                observed: None,
-            },
+            &asked.request().lookup(&pipeline_id, dedupe_hash),
             &mut Default::default(),
         );
         assert!(
@@ -5315,23 +5234,13 @@ mod tests {
 
     /// The keys of the `stale.com` query in the default pipeline / 默认 pipeline 里 `stale.com` 查询的键
     fn stale_com_keys(engine: &Engine) -> CacheKeys {
-        let question = stale_com_question(engine);
-        Engine::cache_keys(
-            question.namespace,
-            question.pipeline_id,
-            question.qname,
-            question.qtype,
-            question.qclass,
-            crate::proto_utils::QueryFlags::RECURSIVE,
-            &question.requester,
-            None,
-        )
+        stale_com_question(engine).keys()
     }
 
-    /// The inflight question of the `stale.com` query in the default pipeline
-    /// 默认 pipeline 里 `stale.com` 查询的 inflight 问题
-    fn stale_com_question(engine: &Engine) -> InflightQuestion<'static> {
-        InflightQuestion {
+    /// The question of the `stale.com` query in the default pipeline
+    /// 默认 pipeline 里 `stale.com` 查询的问题
+    fn stale_com_question(engine: &Engine) -> KeyedQuestion<'static> {
+        KeyedQuestion {
             flags: crate::proto_utils::QueryFlags::RECURSIVE,
             namespace: engine.state.load().cache_namespace("default"),
             pipeline_id: "default",
@@ -6023,30 +5932,13 @@ mod tests {
         (engine, slot)
     }
 
-    /// 查 `stale.com` 用的上下文 / The context `stale.com` is looked up with
-    fn stale_com_lookup<'a>(
-        state: &'a Arc<crate::engine::types::EngineInner>,
-        peer: &'a SocketAddr,
-        slot: u64,
-    ) -> phases::CacheLookupContext<'a> {
-        phases::CacheLookupContext {
-            flags: crate::proto_utils::QueryFlags::RECURSIVE,
-            state,
-            qname: "stale.com",
-            qtype: RecordType::A,
-            qclass: DNSClass::IN,
-            pipeline_id: "default",
-            slot,
-            tx_id: 0xAABB,
-            start: Instant::now(),
-            peer,
-            requester: Requester {
-                address: peer.ip(),
-                edns: false,
-                ecs: None,
-            },
-            observed: None,
-        }
+    /// 从 `peer` 递归地问 `stale.com` 的请求 / The request asking `stale.com` recursively from
+    /// `peer`
+    fn stale_com_asked(engine: &Engine, peer: SocketAddr) -> crate::engine::test_support::Asked {
+        let mut packet = stale_com_query();
+        // RD 置位，和条目存的 `QueryFlags::RECURSIVE` 一样 / RD set, as the entry's `QueryFlags::RECURSIVE`
+        packet[2] = 0x01;
+        crate::engine::test_support::Asked::new(engine, "stale.com", RecordType::A, packet, peer)
     }
 
     /// 过期超过 serve_stale_expire_ttl 的应答不再当作 stale 提供：查缓存、上游失败时的兜底都不用它，也都不删它，留给
@@ -6063,8 +5955,9 @@ mod tests {
                 serve_stale_expire_ttl: expire_ttl,
                 ..Default::default()
             });
-            let state = engine.state.load_full();
-            let context = stale_com_lookup(&state, &peer, slot);
+            let asked = stale_com_asked(&engine, peer);
+            let request = asked.request();
+            let context = request.lookup("default", slot);
             assert_eq!(
                 phases::check_cache_after_failure(&engine, &context, &mut Default::default())
                     .is_some(),
@@ -6107,8 +6000,9 @@ mod tests {
                     serve_stale_ttl_reset: reset,
                     ..Default::default()
                 });
-                let state = engine.state.load_full();
-                let context = stale_com_lookup(&state, &peer, slot);
+                let asked = stale_com_asked(&engine, peer);
+                let request = asked.request();
+                let context = request.lookup("default", slot);
                 let served = if fallback {
                     phases::check_cache_after_failure(&engine, &context, &mut Default::default())
                         .is_some()
@@ -6146,8 +6040,9 @@ mod tests {
                 upstream,
                 ..(*stale_entry("default")).clone()
             });
-            let state = engine.state.load_full();
-            let context = stale_com_lookup(&state, &peer, slot);
+            let asked = stale_com_asked(&engine, peer);
+            let request = asked.request();
+            let context = request.lookup("default", slot);
             engine.cache_insert(slot, entry);
             assert!(
                 phases::check_cache_after_failure(&engine, &context, &mut Default::default())
@@ -6544,28 +6439,28 @@ mod tests {
         let qclass_ch = DNSClass::CH;
 
         // Act: Calculate hashes for same QNAME+QTYPE but different QCLASS
-        let hash_in = Engine::cache_keys(
-            0,
+        let hash_in = KeyedQuestion {
+            namespace: 0,
             pipeline_id,
-            qname.as_bytes(),
+            qname: qname.as_bytes(),
             qtype,
-            qclass_in,
-            crate::proto_utils::QueryFlags::RECURSIVE,
-            &RequesterKey::NONE,
-            None,
-        )
-        .slot;
-        let hash_ch = Engine::cache_keys(
-            0,
+            qclass: qclass_in,
+            flags: crate::proto_utils::QueryFlags::RECURSIVE,
+            requester: RequesterKey::NONE,
+            client_ecs: None,
+        }
+        .slot();
+        let hash_ch = KeyedQuestion {
+            namespace: 0,
             pipeline_id,
-            qname.as_bytes(),
+            qname: qname.as_bytes(),
             qtype,
-            qclass_ch,
-            crate::proto_utils::QueryFlags::RECURSIVE,
-            &RequesterKey::NONE,
-            None,
-        )
-        .slot;
+            qclass: qclass_ch,
+            flags: crate::proto_utils::QueryFlags::RECURSIVE,
+            requester: RequesterKey::NONE,
+            client_ecs: None,
+        }
+        .slot();
 
         // Assert: Verify different QCLASS produces different hashes
         assert_ne!(
@@ -6574,17 +6469,17 @@ mod tests {
         );
 
         // Act: Calculate hash for same QCLASS to verify consistency
-        let hash_in2 = Engine::cache_keys(
-            0,
+        let hash_in2 = KeyedQuestion {
+            namespace: 0,
             pipeline_id,
-            qname.as_bytes(),
+            qname: qname.as_bytes(),
             qtype,
-            qclass_in,
-            crate::proto_utils::QueryFlags::RECURSIVE,
-            &RequesterKey::NONE,
-            None,
-        )
-        .slot;
+            qclass: qclass_in,
+            flags: crate::proto_utils::QueryFlags::RECURSIVE,
+            requester: RequesterKey::NONE,
+            client_ecs: None,
+        }
+        .slot();
 
         // Assert: Verify same QCLASS produces same hash
         assert_eq!(
@@ -6609,39 +6504,39 @@ mod tests {
         // So we simulate that behavior by lowercasing the input first
         // 注意：在 parse_quick() 中，qname 在传递给此函数之前已经转为小写
         // 所以我们通过先小写输入来模拟这种行为
-        let hash1 = Engine::cache_keys(
-            0,
+        let hash1 = KeyedQuestion {
+            namespace: 0,
             pipeline_id,
-            qname_lower.to_lowercase().as_bytes(),
+            qname: qname_lower.to_lowercase().as_bytes(),
             qtype,
             qclass,
-            crate::proto_utils::QueryFlags::RECURSIVE,
-            &RequesterKey::NONE,
-            None,
-        )
-        .slot;
-        let hash2 = Engine::cache_keys(
-            0,
+            flags: crate::proto_utils::QueryFlags::RECURSIVE,
+            requester: RequesterKey::NONE,
+            client_ecs: None,
+        }
+        .slot();
+        let hash2 = KeyedQuestion {
+            namespace: 0,
             pipeline_id,
-            qname_upper.to_lowercase().as_bytes(),
+            qname: qname_upper.to_lowercase().as_bytes(),
             qtype,
             qclass,
-            crate::proto_utils::QueryFlags::RECURSIVE,
-            &RequesterKey::NONE,
-            None,
-        )
-        .slot;
-        let hash3 = Engine::cache_keys(
-            0,
+            flags: crate::proto_utils::QueryFlags::RECURSIVE,
+            requester: RequesterKey::NONE,
+            client_ecs: None,
+        }
+        .slot();
+        let hash3 = KeyedQuestion {
+            namespace: 0,
             pipeline_id,
-            qname_mixed.to_lowercase().as_bytes(),
+            qname: qname_mixed.to_lowercase().as_bytes(),
             qtype,
             qclass,
-            crate::proto_utils::QueryFlags::RECURSIVE,
-            &RequesterKey::NONE,
-            None,
-        )
-        .slot;
+            flags: crate::proto_utils::QueryFlags::RECURSIVE,
+            requester: RequesterKey::NONE,
+            client_ecs: None,
+        }
+        .slot();
 
         // Assert: Verify case-insensitive hashing produces same results
         assert_eq!(hash1, hash2, "QNAME hash should be case-insensitive");
@@ -6659,28 +6554,28 @@ mod tests {
         let qclass = DNSClass::IN;
 
         // Act: Calculate hashes for different QTYPE values
-        let hash_a = Engine::cache_keys(
-            0,
+        let hash_a = KeyedQuestion {
+            namespace: 0,
             pipeline_id,
-            qname.as_bytes(),
-            qtype_a,
+            qname: qname.as_bytes(),
+            qtype: qtype_a,
             qclass,
-            crate::proto_utils::QueryFlags::RECURSIVE,
-            &RequesterKey::NONE,
-            None,
-        )
-        .slot;
-        let hash_aaaa = Engine::cache_keys(
-            0,
+            flags: crate::proto_utils::QueryFlags::RECURSIVE,
+            requester: RequesterKey::NONE,
+            client_ecs: None,
+        }
+        .slot();
+        let hash_aaaa = KeyedQuestion {
+            namespace: 0,
             pipeline_id,
-            qname.as_bytes(),
-            qtype_aaaa,
+            qname: qname.as_bytes(),
+            qtype: qtype_aaaa,
             qclass,
-            crate::proto_utils::QueryFlags::RECURSIVE,
-            &RequesterKey::NONE,
-            None,
-        )
-        .slot;
+            flags: crate::proto_utils::QueryFlags::RECURSIVE,
+            requester: RequesterKey::NONE,
+            client_ecs: None,
+        }
+        .slot();
 
         // Assert: Verify different QTYPE produces different hashes
         assert_ne!(
@@ -6700,28 +6595,28 @@ mod tests {
         let qclass = DNSClass::IN;
 
         // Act: Calculate hashes for different QNAME values
-        let hash1 = Engine::cache_keys(
-            0,
+        let hash1 = KeyedQuestion {
+            namespace: 0,
             pipeline_id,
-            qname1.as_bytes(),
+            qname: qname1.as_bytes(),
             qtype,
             qclass,
-            crate::proto_utils::QueryFlags::RECURSIVE,
-            &RequesterKey::NONE,
-            None,
-        )
-        .slot;
-        let hash2 = Engine::cache_keys(
-            0,
+            flags: crate::proto_utils::QueryFlags::RECURSIVE,
+            requester: RequesterKey::NONE,
+            client_ecs: None,
+        }
+        .slot();
+        let hash2 = KeyedQuestion {
+            namespace: 0,
             pipeline_id,
-            qname2.as_bytes(),
+            qname: qname2.as_bytes(),
             qtype,
             qclass,
-            crate::proto_utils::QueryFlags::RECURSIVE,
-            &RequesterKey::NONE,
-            None,
-        )
-        .slot;
+            flags: crate::proto_utils::QueryFlags::RECURSIVE,
+            requester: RequesterKey::NONE,
+            client_ecs: None,
+        }
+        .slot();
 
         // Assert: Verify different QNAME produces different hashes
         assert_ne!(
