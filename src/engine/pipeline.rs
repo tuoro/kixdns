@@ -477,7 +477,7 @@ impl Engine {
                                 response_phase: None,
                                 rule_name: rule.name.clone(),
                                 rule_index: Some(idx),
-                                transport: Some(Transport::Udp),
+                                transport: Transport::Udp,
                                 ecs: None,
                                 allow_reuse: true,
                             };
@@ -498,19 +498,20 @@ impl Engine {
                             upstream_shared,
                         } => {
                             // 规则写了几个 forward 时，轮到头一个就照配置加载时合并好的一起问（见
-                            // `Rule::compute_merged_forward`），每个上游自己定传输；写在前面的 log 和只有一个 forward
-                            // 时一样已经执行过。以前合并的转发在执行动作之前就给出，这样的规则 log 从不执行
+                            // `Rule::compute_merged_forward`），每个上游的传输写在它自己的地址里，没写前缀的用 UDP；
+                            // 写在前面的 log 和只有一个 forward 时一样已经执行过。以前合并的转发在执行动作之前就给出，
+                            // 这样的规则 log 从不执行
                             // With several forwards written, the first one's turn asks them all as merged
-                            // at config load (see `Rule::compute_merged_forward`), each upstream deciding
-                            // its own transport; a log written before has run, as with a single forward.
-                            // The merged forward used to be given before any action ran, and the log of
-                            // such a rule never did
+                            // at config load (see `Rule::compute_merged_forward`), each upstream's
+                            // transport written in its own address, UDP for one without a scheme; a log
+                            // written before has run, as with a single forward. The merged forward used to
+                            // be given before any action ran, and the log of such a rule never did
                             let (upstream, pre_split_upstreams, transport, ecs) =
                                 match &rule.merged_forward {
                                     Some(merged) => (
                                         merged.upstream_str.clone(),
                                         Some(merged.upstream_list.clone()),
-                                        None,
+                                        Transport::Udp,
                                         merged.ecs.clone(),
                                     ),
                                     None => (
@@ -522,7 +523,7 @@ impl Engine {
                                             }
                                         },
                                         pre_split_upstreams.clone(),
-                                        Some(transport.unwrap_or(Transport::Udp)),
+                                        transport.unwrap_or(Transport::Udp),
                                         ecs.clone(),
                                     ),
                                 };

@@ -688,10 +688,14 @@ impl Engine {
         observer.request_finished(ctx, &outcome);
     }
 
-    /// Fast path: synchronous cache hit attempt / 快速路径：同步尝试缓存命中
-    /// Return Ok(Some(bytes)) means cache hit, can return directly / 返回 Ok(Some(bytes)) 表示缓存命中，可直接返回
-    /// Return Ok(None) means async processing needed (upstream forwarding) / 返回 Ok(None) 表示需要异步处理（上游转发）
-    /// Return Err means parsing error / 返回 Err 表示解析错误
+    /// 快速路径：同步地答查询。Ok(Some) 是当场答上了（`Direct`、`CacheHit`），或者要等上游、交给异步路径（`AsyncNeeded`，
+    /// 带着读出的查询和选中的 pipeline）；Ok(None) 是快速解析读不了这个查询，由完整路径从头读；Err 只在不支持的 EDNS 版本
+    /// 的 BADVERS 写不出来时，监听器回 SERVFAIL
+    /// Fast path: answer a query synchronously. Ok(Some) when it is answered on the spot
+    /// (`Direct`, `CacheHit`), or waits on an upstream and goes on to the async path
+    /// (`AsyncNeeded`, with the query as read and the pipeline picked); Ok(None) when the quick
+    /// parse cannot read the query, which the full path reads from scratch; Err only when the
+    /// BADVERS for an unsupported EDNS version cannot be written, the listener answering SERVFAIL
     /// Every answer goes back with what it copies from the query as the client wrote it
     /// (see `proto_utils::reply_as_asked`), and the observer is lent that same answer
     /// 每个回答照抄查询的部分都照客户端的写法发回（见 `proto_utils::reply_as_asked`），出借给
@@ -1095,11 +1099,11 @@ impl Engine {
             .await
     }
 
-    /// Public wrapper for handle_packet_internal with pre-parsed data
-    /// handle_packet_internal 的公共包装，接受预解析数据
-    ///
-    /// This method is used by UDP worker to avoid re-parsing when cache miss occurs
-    /// 此方法由 UDP worker 使用，在缓存未命中时避免重新解析
+    /// 快速路径读过的查询走完整路径：`pre_parsed` 是 `handle_packet_fast` 为这同一个包给的，不再解析一遍。三个监听器都经
+    /// `Engine::answer_after_fast_path` 从这里进来
+    /// The full path for a query the fast path read: `pre_parsed` is what `handle_packet_fast`
+    /// gave for this very packet, with no second parse. All three listeners come in here through
+    /// `Engine::answer_after_fast_path`
     pub async fn handle_packet_internal_with_pre_parsed(
         &self,
         packet: &[u8],
@@ -1125,7 +1129,7 @@ impl Engine {
         if let Some((observer, ctx)) = lookup.observed {
             observer.cache_lookup(ctx);
         }
-        let answer = match phases::check_cache_logged(self, lookup, info) {
+        let answer = match phases::check_cache(self, lookup, info) {
             phases::Looked::Answered(answer) => Some(answer),
             phases::Looked::Waiting(stale) => {
                 let still_refreshing = self.wait_for_refresh(lookup, &stale).await;
@@ -1142,12 +1146,12 @@ impl Engine {
     }
 
     /// RFC 8767 客户端超时（对应 Unbound 的 serve-expired-client-timeout）：等过期的 `stale` 的刷新结束，最多等
-    /// serve_stale_client_timeout_ms，给出等到头时刷新还在不在跑。刷新是查缓存时发起的（见 `phases::check_cache_logged`），
+    /// serve_stale_client_timeout_ms，给出等到头时刷新还在不在跑。刷新是查缓存时发起的（见 `phases::check_cache`），
     /// 刷新标记一放开就叫醒这里；没有刷新在跑（已经结束了，或者同时在刷的太多、没发起）就不等
     /// RFC 8767 client timeout (Unbound's serve-expired-client-timeout): wait for the refresh of
     /// the stale `stale` to end, for serve_stale_client_timeout_ms at most, telling whether it
     /// still runs when the wait is over. The lookup started the refresh (see
-    /// `phases::check_cache_logged`), and its mark going wakes this; with no refresh running (it
+    /// `phases::check_cache`), and its mark going wakes this; with no refresh running (it
     /// ended already, or none started, too many running at once) there is no wait
     async fn wait_for_refresh(
         &self,
@@ -1592,7 +1596,7 @@ impl Engine {
                 } => {
                     let (response_matchers, response_actions_on_match, response_actions_on_miss) =
                         crate::matcher::ResponsePhase::parts(response_phase.as_deref());
-                    let forwarded = phases::handle_forward_decision_logged(
+                    let forwarded = phases::handle_forward_decision(
                         self,
                         request,
                         route,
@@ -4591,14 +4595,15 @@ mod tests {
         )
     }
 
-    /// 在 `engine` 上为 `request` 执行 `actions` 的上下文，手上的应答是 `ctx_opt`
+    /// 在 `engine` 上为 `request` 执行 `actions` 的上下文，手上的应答是 `ctx_opt`，转发记在 `trail` 里
     /// The context for running `actions` on `engine` for `request`, with `ctx_opt` the answer
-    /// in hand
+    /// in hand and forwards noted in `trail`
     fn response_actions_context<'a>(
         engine: &'a Engine,
         request: &'a Request<'a>,
         actions: &'a [Action],
         ctx_opt: Option<ResponseContext>,
+        trail: &'a mut EcsReach,
     ) -> ApplyResponseActionsContext<'a> {
         ApplyResponseActionsContext {
             engine,
@@ -4609,7 +4614,8 @@ mod tests {
             pipeline_id: "pipeline",
             rule_name: "rule",
             remaining_jumps: 10,
-            trail: None,
+            trail,
+            rule_ecs: crate::ecs_scope::ForwardEcs::of(None, &request.requester.ecs_view()),
         }
     }
 
@@ -4624,7 +4630,8 @@ mod tests {
         // Act: Apply response actions with Allow action
         let asked = asked(&engine, "example.com", RecordType::A, &packet);
         let request = asked.request();
-        let ctx = response_actions_context(&engine, &request, &actions, Some(ctx));
+        let mut trail = EcsReach::default();
+        let ctx = response_actions_context(&engine, &request, &actions, Some(ctx), &mut trail);
         let result = apply_response_actions(ctx)
             .await
             .expect("response actions allow should succeed");
@@ -4661,8 +4668,14 @@ mod tests {
         let packet = query_packet("example.com", RecordType::A);
         let asked = asked(&engine, "example.com", RecordType::A, &packet);
         let request = asked.request();
-        let ctx =
-            response_actions_context(&engine, &request, &actions, Some(build_response_context()));
+        let mut trail = EcsReach::default();
+        let ctx = response_actions_context(
+            &engine,
+            &request,
+            &actions,
+            Some(build_response_context()),
+            &mut trail,
+        );
         match apply_response_actions(ctx).await.expect("response actions") {
             ResponseActionResult::Upstream { ctx, .. } => {
                 assert_eq!(ctx.raw.as_ref(), b"resp", "the upstream's answer goes out");
@@ -4682,7 +4695,8 @@ mod tests {
         // Act: Apply response actions with Continue action
         let asked = asked(&engine, "example.com", RecordType::A, &packet);
         let request = asked.request();
-        let ctx = response_actions_context(&engine, &request, &actions, Some(ctx));
+        let mut trail = EcsReach::default();
+        let ctx = response_actions_context(&engine, &request, &actions, Some(ctx), &mut trail);
         let result = apply_response_actions(ctx)
             .await
             .expect("response actions continue should succeed");
@@ -4710,7 +4724,8 @@ mod tests {
         // Act: Apply response actions with Allow action and non-matching matcher
         let asked = asked(&engine, "example.com", RecordType::A, &packet);
         let request = asked.request();
-        let ctx = response_actions_context(&engine, &request, &actions, Some(ctx));
+        let mut trail = EcsReach::default();
+        let ctx = response_actions_context(&engine, &request, &actions, Some(ctx), &mut trail);
         let result = apply_response_actions(ctx)
             .await
             .expect("response actions allow should succeed even on miss");
@@ -4739,7 +4754,8 @@ mod tests {
         // Act: Apply response actions with Deny action
         let asked = asked(&engine, "example.com", RecordType::A, &packet);
         let request = asked.request();
-        let ctx = response_actions_context(&engine, &request, &actions, None);
+        let mut trail = EcsReach::default();
+        let ctx = response_actions_context(&engine, &request, &actions, None, &mut trail);
         let result = apply_response_actions(ctx)
             .await
             .expect("response actions deny should return static");
@@ -4772,8 +4788,11 @@ mod tests {
                 &query_packet("example.com", qtype),
             );
             let request = asked.request();
-            apply_response_actions(response_actions_context(&engine, &request, &actions, None))
-                .await
+            let mut trail = EcsReach::default();
+            apply_response_actions(response_actions_context(
+                &engine, &request, &actions, None, &mut trail,
+            ))
+            .await
         };
         let answer_ips = |resp: &Message| -> Vec<IpAddr> {
             resp.answers
@@ -4836,7 +4855,8 @@ mod tests {
         let packet = query_packet("alias.example", RecordType::A);
         let asked = asked(&engine, "alias.example", RecordType::A, &packet);
         let request = asked.request();
-        let ctx = response_actions_context(&engine, &request, &actions, None);
+        let mut trail = EcsReach::default();
+        let ctx = response_actions_context(&engine, &request, &actions, None, &mut trail);
 
         match apply_response_actions(ctx).await.expect("static cname") {
             ResponseActionResult::Static { bytes, rcode, .. } => {
@@ -4948,7 +4968,7 @@ mod tests {
             edns: false,
             ecs: None,
         };
-        let looked_up = phases::check_cache_logged(
+        let looked_up = phases::check_cache(
             &engine,
             &phases::CacheLookupContext {
                 flags: crate::proto_utils::QueryFlags::RECURSIVE,
@@ -5949,7 +5969,7 @@ mod tests {
             engine.cache_insert(slot, stale_entry("default"));
             assert_eq!(
                 matches!(
-                    phases::check_cache_logged(&engine, &context, &mut Default::default()),
+                    phases::check_cache(&engine, &context, &mut Default::default()),
                     phases::Looked::Answered(_)
                 ),
                 served,
@@ -5985,7 +6005,7 @@ mod tests {
                         .is_some()
                 } else {
                     matches!(
-                        phases::check_cache_logged(&engine, &context, &mut Default::default()),
+                        phases::check_cache(&engine, &context, &mut Default::default()),
                         phases::Looked::Answered(_)
                     )
                 };
@@ -6047,7 +6067,7 @@ mod tests {
             );
             assert_eq!(
                 matches!(
-                    phases::check_cache_logged(&engine, &context, &mut Default::default()),
+                    phases::check_cache(&engine, &context, &mut Default::default()),
                     phases::Looked::Answered(_)
                 ),
                 served,
