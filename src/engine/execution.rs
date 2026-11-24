@@ -12,7 +12,7 @@ use anyhow::Context;
 use bytes::Bytes;
 
 use hickory_proto::op::{Message, ResponseCode};
-use hickory_proto::rr::DNSClass;
+use hickory_proto::rr::{DNSClass, RecordType};
 
 use hickory_proto::serialize::binary::BinDecodable;
 use smallvec::SmallVec;
@@ -31,11 +31,11 @@ use crate::proto_utils::parse_quick;
 use super::concurrency::PermitGuard;
 use super::matcher_adapter::MatcherContext;
 use super::observation::{ObservedRequest, report_decision, report_rule_cache_hit};
-use super::response::{StaticAddresses, build_fast_static_response, write_static_reply};
+use super::response::{StaticAddresses, static_reply, write_static_reply};
 use super::response_log::{ResponseInfo, ResponseLog, Source};
 use super::rules::RuleCacheRecord;
 use super::types::{EngineInner, FastPathResponse};
-use super::utils::{InflightCleanupGuard, engine_helpers};
+use super::utils::InflightCleanupGuard;
 use crate::cache::CachedQuestion;
 use crate::ecs_scope::EcsReach;
 use crate::engine::refresh::{RefreshCheck, RefreshTarget};
@@ -78,16 +78,13 @@ pub struct CacheKeys {
     pub requester: RequesterKey,
 }
 
-/// Pre-parsed data from handle_packet_fast to avoid re-parsing
-/// 来自 handle_packet_fast 的预解析数据，避免重新解析
+/// Pre-parsed data from handle_packet_fast to avoid re-parsing: the query as the quick parse
+/// read it and the pipeline picked, for this very packet (see `Engine::answer_after_fast_path`)
+/// 来自 handle_packet_fast 的预解析数据，避免重新解析：快速解析读出的查询和选中的 pipeline，是这一个包的（见
+/// `Engine::answer_after_fast_path`）
 #[derive(Clone)]
 pub struct PreParsedData {
-    qname: Arc<str>,
-    qtype: hickory_proto::rr::RecordType,
-    qclass: DNSClass,
-    tx_id: u16,
-    edns_present: bool,
-    pipeline_id: Arc<str>,
+    head: RequestHead,
     /// 选出 `pipeline_id` 的那份配置：请求接着在异步路径上也用它。以前异步路径再取一次当前的配置，中间赶上热重载时，
     /// 旧配置选的 pipeline 在新配置里没有，就落到默认转发上，既不是旧配置也不是新配置会给的回答（新配置里的拦截规则也
     /// 就被绕过）
@@ -101,61 +98,27 @@ pub struct PreParsedData {
 impl std::fmt::Debug for PreParsedData {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PreParsedData")
-            .field("qname", &self.qname)
-            .field("qtype", &self.qtype)
-            .field("qclass", &self.qclass)
-            .field("tx_id", &self.tx_id)
-            .field("edns_present", &self.edns_present)
-            .field("pipeline_id", &self.pipeline_id)
+            .field("head", &self.head)
             .finish_non_exhaustive()
     }
 }
 
-impl PreParsedData {
-    pub(crate) fn new(
-        qname: impl Into<Arc<str>>,
-        qtype: u16,
-        qclass: u16,
-        tx_id: u16,
-        edns_present: bool,
-        pipeline_id: Arc<str>,
-        state: Arc<EngineInner>,
-    ) -> Self {
-        Self {
-            qname: qname.into(),
-            qtype: hickory_proto::rr::RecordType::from(qtype),
-            qclass: DNSClass::from(qclass),
-            tx_id,
-            edns_present,
-            pipeline_id,
-            state,
-        }
-    }
-}
-
-/// A static answer built on the fast path, as its client gets it: a client that
-/// sent ECS gets the echo of its own subnet (see `phases::client_reply`), and a
-/// static answer, carrying no ECS, goes to the others as it is.
-/// 快速路径上构造的静态应答，按客户端该收到的样子：带了 ECS 的客户端拿到回显它自己子网的
-/// 应答（见 `phases::client_reply`）；静态应答本来不带 ECS，原样交给其他客户端。
-fn fast_client_reply(reply: Bytes, client: Option<&crate::ecs::EcsKey>) -> Bytes {
-    match client {
-        // A static answer depends on no ECS / 静态应答不取决于任何 ECS
-        Some(_) => phases::client_reply(reply, client, 0),
-        None => reply,
-    }
-}
-
-/// 写成字节的静态应答（见 [`write_static_reply`]）交给客户端前的样子。查询没有附加段就不会有 OPT，写好的就是最后的
-/// 样子，不必再规整一遍
-/// A static answer written as bytes (see [`write_static_reply`]) as it goes to the client. A query with
-/// no additional section has no OPT, and the answer as written is final, with nothing left to shape
+/// 静态应答（见 [`static_reply`]）交给客户端前的样子：带了 ECS 的客户端拿到回显它自己子网的应答（见
+/// `phases::client_reply`），静态应答本来不带 ECS、不取决于任何 ECS；再照查询规整。查询没有附加段就不会有 OPT 和 ECS，
+/// 写好的就是最后的样子，不必再规整一遍
+/// A static answer (see [`static_reply`]) as it goes to the client: a client that sent ECS gets
+/// the echo of its own subnet (see `phases::client_reply`), a static answer carrying no ECS and
+/// depending on none; then shaped as the query asks. A query with no additional section has no
+/// OPT and no ECS, and the answer as written is final, with nothing left to shape
 fn shaped_static_reply(reply: Bytes, packet: &[u8], client: Option<&crate::ecs::EcsKey>) -> Bytes {
     if packet[10..12] == [0, 0] {
-        reply
-    } else {
-        crate::proto_utils::reply_as_asked(fast_client_reply(reply, client), packet)
+        return reply;
     }
+    let reply = match client {
+        Some(_) => phases::client_reply(reply, client, 0),
+        None => reply,
+    };
+    crate::proto_utils::reply_as_asked(reply, packet)
 }
 
 /// 请求编号一个线程一次领这么多，用完再领：这个数所有核都要写，每个查询领一次就是每个查询抢一次
@@ -608,15 +571,12 @@ impl Engine {
 
     /// Report a request that `handle_packet_fast` answered without the async
     /// path: the whole lifecycle is emitted in one batch at the answering site.
-    /// `response` is the answer, or the error that stopped the engine from
-    /// building one; the listener then answers SERVFAIL by itself. `hops` are the
-    /// request-phase jumps followed on the way to `pipeline_id`, reported as the
-    /// full path reports them; a request that jumped is not offered whole, an offer
-    /// having room for one pipeline.
+    /// `response` is the answer. `hops` are the request-phase jumps followed on the
+    /// way to `pipeline_id`, reported as the full path reports them; a request that
+    /// jumped is not offered whole, an offer having room for one pipeline.
     /// 上报由 handle_packet_fast 直接应答的请求：整个生命周期在应答处一次性上报。
-    /// `response` 是应答，或者引擎没能构造出应答的错误；此时由监听器自己回 SERVFAIL。`hops` 是到
-    /// `pipeline_id` 之前跟着走过的请求阶段跳转，照完整路径的样子上报；跳转过的请求不整份提供，整份的只放得下一个
-    /// pipeline。
+    /// `response` 是应答。`hops` 是到 `pipeline_id` 之前跟着走过的请求阶段跳转，照完整路径的样子上报；跳转过的请求不整份
+    /// 提供，整份的只放得下一个 pipeline。
     fn observe_fast_path(
         &self,
         observer: &dyn EngineObserver,
@@ -624,18 +584,13 @@ impl Engine {
         hops: &[Hop<'_>],
         pipeline_id: &str,
         answer: FastPathAnswer<'_>,
-        response: Result<&[u8], &anyhow::Error>,
+        response: &[u8],
     ) {
-        let error = response.as_ref().err().map(|error| format!("{error:#}"));
         let outcome = RequestOutcome {
             latency: ctx.started.elapsed(),
-            status: if error.is_some() {
-                RequestStatus::Failed
-            } else {
-                RequestStatus::Completed
-            },
-            response: response.ok(),
-            error: error.as_deref(),
+            status: RequestStatus::Completed,
+            response: Some(response),
+            error: None,
         };
         let taken_whole = hops.is_empty()
             && match &answer {
@@ -733,10 +688,14 @@ impl Engine {
         observer.request_finished(ctx, &outcome);
     }
 
-    /// Fast path: synchronous cache hit attempt / 快速路径：同步尝试缓存命中
-    /// Return Ok(Some(bytes)) means cache hit, can return directly / 返回 Ok(Some(bytes)) 表示缓存命中，可直接返回
-    /// Return Ok(None) means async processing needed (upstream forwarding) / 返回 Ok(None) 表示需要异步处理（上游转发）
-    /// Return Err means parsing error / 返回 Err 表示解析错误
+    /// 快速路径：同步地答查询。Ok(Some) 是当场答上了（`Direct`、`CacheHit`），或者要等上游、交给异步路径（`AsyncNeeded`，
+    /// 带着读出的查询和选中的 pipeline）；Ok(None) 是快速解析读不了这个查询，由完整路径从头读；Err 只在不支持的 EDNS 版本
+    /// 的 BADVERS 写不出来时，监听器回 SERVFAIL
+    /// Fast path: answer a query synchronously. Ok(Some) when it is answered on the spot
+    /// (`Direct`, `CacheHit`), or waits on an upstream and goes on to the async path
+    /// (`AsyncNeeded`, with the query as read and the pipeline picked); Ok(None) when the quick
+    /// parse cannot read the query, which the full path reads from scratch; Err only when the
+    /// BADVERS for an unsupported EDNS version cannot be written, the listener answering SERVFAIL
     /// Every answer goes back with what it copies from the query as the client wrote it
     /// (see `proto_utils::reply_as_asked`), and the observer is lent that same answer
     /// 每个回答照抄查询的部分都照客户端的写法发回（见 `proto_utils::reply_as_asked`），出借给
@@ -775,19 +734,8 @@ impl Engine {
         let qclass = DNSClass::from(q.qclass);
         let qtype = hickory_proto::rr::RecordType::from(q.qtype);
         let qname_str = q.qname;
-        let pipeline_opt = select_pipeline(
-            cfg,
-            &PipelineSelectionContext {
-                qname: qname_str,
-                client_ip: peer.ip(),
-                qclass,
-                edns_present: q.edns_present,
-                qtype,
-                listener_label: &self.listener_label,
-                geosite_manager: Some(&self.geosite_manager),
-                geoip_manager: Some(&self.geoip_manager),
-            },
-        );
+        let pipeline_opt =
+            self.pick_pipeline(cfg, qname_str, qtype, qclass, peer.ip(), q.edns_present);
 
         let name_of = |pipeline: Option<&crate::matcher::RuntimePipeline>| {
             pipeline.map_or_else(|| Arc::from(NO_PIPELINE), |pipeline| pipeline.id.clone())
@@ -928,7 +876,7 @@ impl Engine {
                             &hops,
                             pipeline_id,
                             FastPathAnswer::Cache(phases::cache_hit_of(&hit, kind, elapsed_secs)),
-                            Ok(&reply),
+                            &reply,
                         );
                     }
                     log.answered(&reply);
@@ -982,7 +930,7 @@ impl Engine {
                                 CacheHitKind::Fresh,
                                 elapsed_secs,
                             )),
-                            Ok(&reply),
+                            &reply,
                         );
                     }
                     let mut log = response_log(pipeline);
@@ -1000,12 +948,11 @@ impl Engine {
                 }
             }
 
-            // 编译规则或规则缓存给的静态应答。在 `?` 之前上报：构造不出应答的请求也在这里结束，由监听器
-            // 自己回 SERVFAIL。
-            // A static answer from a compiled rule or the rule cache. Report before `?`: a
-            // response that cannot be built still ends the request here, and the listener
-            // answers SERVFAIL by itself.
-            let finish_static = |built: anyhow::Result<Bytes>, answer: FastPathAnswer<'_>| {
+            // 编译规则或规则缓存给的静态应答，照客户端问的样子交出（见 `shaped_static_reply`）
+            // A static answer from a compiled rule or the rule cache, going out as the client
+            // asked (see `shaped_static_reply`)
+            let finish_static = |reply: Bytes, answer: FastPathAnswer<'_>| {
+                let reply = shaped_static_reply(reply, packet, q.client_subnet.as_ref());
                 if let Some(observer) = observed {
                     self.observe_fast_path(
                         observer,
@@ -1013,32 +960,19 @@ impl Engine {
                         &hops,
                         pipeline_id,
                         answer,
-                        built.as_deref(),
+                        &reply,
                     );
                 }
-                let resp = built?;
                 let mut log = response_log(pipeline);
                 log.info.upstream = Some(Source::Static);
-                log.answered(&resp);
-                anyhow::Ok(Some(FastPathResponse::Direct(resp)))
+                log.answered(&reply);
+                Some(FastPathResponse::Direct(reply))
             };
-            let answer_static = |rcode, answers: &Vec<hickory_proto::rr::Record>, answer| {
-                let built =
-                    match write_static_reply(packet, rcode, StaticAddresses::Records(answers)) {
-                        Some(reply) => {
-                            Ok(shaped_static_reply(reply, packet, q.client_subnet.as_ref()))
-                        }
-                        None => build_fast_static_response(
-                            q.tx_id, qname_str, q.qtype, q.qclass, rcode, answers,
-                        )
-                        .map(|reply| {
-                            crate::proto_utils::reply_as_asked(
-                                fast_client_reply(reply, q.client_subnet.as_ref()),
-                                packet,
-                            )
-                        }),
-                    };
-                finish_static(built, answer)
+            let answer_static = |rcode, answers: &[hickory_proto::rr::Record], answer| {
+                finish_static(
+                    static_reply(packet, qname_str, qtype, qclass, rcode, answers),
+                    answer,
+                )
             };
 
             // 2. 规则缓存（L1）：和完整路径一样先看规则缓存（见 `apply_rules`），存着决定的不必再求值规则。以前快速路径
@@ -1047,35 +981,19 @@ impl Engine {
             // `apply_rules`), and a decision kept there needs no rules evaluated. The fast path
             // used to evaluate the compiled rules first, for nothing when a forward was kept
             let cached = pipeline.and_then(|p| {
-                let rule_requester = p.rule_requester.key(requester, Some(&self.geoip_manager));
-                let rule_hash = crate::engine::rules::calculate_rule_hash(
-                    cache_namespace,
-                    pipeline_id,
-                    qname_str,
-                    qtype,
-                    qclass,
-                    &rule_requester,
-                );
-                // 过期的这里不去掉，见 `apply_rules` / An expired entry is not removed here, see `apply_rules`
-                self.rule_cache.get(rule_hash).filter(|record| {
-                    record.entry.matches_at(
-                        start,
-                        pipeline_id,
-                        qname_str,
-                        qtype,
-                        qclass,
-                        &rule_requester,
-                    )
-                })
+                self.cached_decision(
+                    &self.rule_question(cache_namespace, p, qname_str, qtype, qclass, requester),
+                    start,
+                )
             });
             let (next, hop) = if let Some(record) = cached {
                 match &record.entry.decision {
                     Decision::Static { rcode, answers } => {
-                        return answer_static(
+                        return Ok(answer_static(
                             *rcode,
                             answers,
                             FastPathAnswer::CachedRules { record: &record },
-                        );
+                        ));
                     }
                     Decision::Jump { pipeline: target } => (
                         cfg.pipeline(target),
@@ -1126,9 +1044,7 @@ impl Engine {
                                 rcode,
                                 answers,
                             };
-                            let reply =
-                                shaped_static_reply(reply, packet, q.client_subnet.as_ref());
-                            return finish_static(Ok(reply), answer);
+                            return Ok(finish_static(reply, answer));
                         }
                         let (rcode, answers) = action.records(qname_str, qtype, qclass);
                         let answer = FastPathAnswer::StaticRule {
@@ -1136,7 +1052,7 @@ impl Engine {
                             rcode,
                             answers: answers.len(),
                         };
-                        return answer_static(rcode, &answers, answer);
+                        return Ok(answer_static(rcode, &answers, answer));
                     }
                     None => break,
                 }
@@ -1156,38 +1072,10 @@ impl Engine {
         // Cache miss, need async processing / 缓存未命中，需要异步处理
         // Return AsyncNeeded with pre-parsed data to avoid re-parsing in handle_packet
         // 返回 AsyncNeeded 包含预解析数据，避免在 handle_packet 中重新解析
-        Ok(Some(FastPathResponse::AsyncNeeded(PreParsedData::new(
-            qname_str,
-            q.qtype,
-            q.qclass,
-            q.tx_id,
-            q.edns_present,
-            name_of(pipeline_opt),
-            arc_swap::Guard::into_inner(state),
-        ))))
-    }
-
-    /// 引擎现在这份配置下的一个查询的预解析数据，和快速路径交给异步路径的一样（见 [`PreParsedData`]）
-    /// The pre-parsed data of a query under the engine's configuration now, as the fast path hands
-    /// to the async path (see [`PreParsedData`])
-    pub fn pre_parsed(
-        &self,
-        qname: impl Into<Arc<str>>,
-        qtype: u16,
-        qclass: u16,
-        tx_id: u16,
-        edns_present: bool,
-        pipeline_id: Arc<str>,
-    ) -> PreParsedData {
-        PreParsedData::new(
-            qname,
-            qtype,
-            qclass,
-            tx_id,
-            edns_present,
-            pipeline_id,
-            self.state.load_full(),
-        )
+        Ok(Some(FastPathResponse::AsyncNeeded(PreParsedData {
+            head: RequestHead::quick(&q, name_of(pipeline_opt)),
+            state: arc_swap::Guard::into_inner(state),
+        })))
     }
 
     pub async fn handle_packet(&self, packet: &[u8], peer: SocketAddr) -> anyhow::Result<Bytes> {
@@ -1195,11 +1083,11 @@ impl Engine {
             .await
     }
 
-    /// Public wrapper for handle_packet_internal with pre-parsed data
-    /// handle_packet_internal 的公共包装，接受预解析数据
-    ///
-    /// This method is used by UDP worker to avoid re-parsing when cache miss occurs
-    /// 此方法由 UDP worker 使用，在缓存未命中时避免重新解析
+    /// 快速路径读过的查询走完整路径：`pre_parsed` 是 `handle_packet_fast` 为这同一个包给的，不再解析一遍。三个监听器都经
+    /// `Engine::answer_after_fast_path` 从这里进来
+    /// The full path for a query the fast path read: `pre_parsed` is what `handle_packet_fast`
+    /// gave for this very packet, with no second parse. All three listeners come in here through
+    /// `Engine::answer_after_fast_path`
     pub async fn handle_packet_internal_with_pre_parsed(
         &self,
         packet: &[u8],
@@ -1225,7 +1113,7 @@ impl Engine {
         if let Some((observer, ctx)) = lookup.observed {
             observer.cache_lookup(ctx);
         }
-        let answer = match phases::check_cache_logged(self, lookup, info) {
+        let answer = match phases::check_cache(self, lookup, info) {
             phases::Looked::Answered(answer) => Some(answer),
             phases::Looked::Waiting(stale) => {
                 let still_refreshing = self.wait_for_refresh(lookup, &stale).await;
@@ -1242,12 +1130,12 @@ impl Engine {
     }
 
     /// RFC 8767 客户端超时（对应 Unbound 的 serve-expired-client-timeout）：等过期的 `stale` 的刷新结束，最多等
-    /// serve_stale_client_timeout_ms，给出等到头时刷新还在不在跑。刷新是查缓存时发起的（见 `phases::check_cache_logged`），
+    /// serve_stale_client_timeout_ms，给出等到头时刷新还在不在跑。刷新是查缓存时发起的（见 `phases::check_cache`），
     /// 刷新标记一放开就叫醒这里；没有刷新在跑（已经结束了，或者同时在刷的太多、没发起）就不等
     /// RFC 8767 client timeout (Unbound's serve-expired-client-timeout): wait for the refresh of
     /// the stale `stale` to end, for serve_stale_client_timeout_ms at most, telling whether it
     /// still runs when the wait is over. The lookup started the refresh (see
-    /// `phases::check_cache_logged`), and its mark going wakes this; with no refresh running (it
+    /// `phases::check_cache`), and its mark going wakes this; with no refresh running (it
     /// ended already, or none started, too many running at once) there is no wait
     async fn wait_for_refresh(
         &self,
@@ -1309,12 +1197,15 @@ impl Engine {
     /// pre_parsed: Optional pre-parsed data from handle_packet_fast to avoid re-parsing
     /// pre_parsed: 来自 handle_packet_fast 的可选预解析数据，避免重新解析
     ///
-    /// refresh：后台刷新时它要更新的条目，有它就是后台刷新。刷新不查缓存，总是去问上游；写进这个条目的槽位，即原请求查过
-    /// 的那个；不上报缓存命中、不记应答日志；失败原样交回，由 refresh.rs 记录
+    /// refresh：后台刷新时它要更新的条目，有它就是后台刷新。刷新不查缓存，总是去问上游；它照原请求重放，沿着规则走到哪里
+    /// 就写在哪里的键下，和客户端请求一样，路线没变时就是原请求查过的那个槽位；不上报缓存命中、不记应答日志；失败原样交回，
+    /// 由 refresh.rs 记录
     /// refresh: for a background refresh, the entry it renews, and the request is one exactly
-    /// when it is given. A refresh looks up no cache and always asks upstream; it writes into
-    /// that entry's slot, the one the original request looked up; it reports no cache hit and
-    /// writes no response record; a failure comes back as it is, for refresh.rs to note
+    /// when it is given. A refresh looks up no cache and always asks upstream; replaying the
+    /// original request, it writes under the keys of wherever the rules lead it, as a client
+    /// request does, which is the slot the original request looked up while the route is the
+    /// same; it reports no cache hit and writes no response record; a failure comes back as it
+    /// is, for refresh.rs to note
     pub(crate) async fn handle_packet_internal(
         &self,
         packet: &[u8],
@@ -1331,12 +1222,14 @@ impl Engine {
         // through response actions and cache writes. Background refresh passes
         // the snapshot that produced its cache key via `state_override`, and the
         // fast path the one that selected its pipeline via `pre_parsed`.
-        let state = match (state_override, &pre_parsed) {
-            (Some(state), _) => state,
-            (None, Some(pre)) => Arc::clone(&pre.state),
-            (None, None) => self.state.load_full(),
+        let (state, head) = match pre_parsed {
+            Some(pre) => (pre.state, pre.head),
+            None => {
+                let state = state_override.unwrap_or_else(|| self.state.load_full());
+                let head = self.read_request(packet, peer, &state.pipeline)?;
+                (state, head)
+            }
         };
-        let head = self.read_request(packet, peer, pre_parsed, &state.pipeline)?;
         // A refresh replays its request's ECS from the key the cache kept, as an option
         // nobody can read does not survive into the replayed packet (see
         // `RefreshTarget::client_ecs`)
@@ -1398,8 +1291,8 @@ impl Engine {
             qtype: head.qtype,
             qclass: head.qclass,
             tx_id: head.tx_id,
-            // Read off the packet itself, whoever pre-parsed it / 无论谁预解析，都从包本身读
-            flags: crate::proto_utils::QueryFlags::of(packet),
+            flags: head.flags,
+            edns_version: head.edns_version,
             peer,
             // Who is asking, as far as rules and ECS can tell / 规则和 ECS 能分辨的请求方
             requester: Requester {
@@ -1432,12 +1325,14 @@ impl Engine {
         };
         // A request that continued still holds its entry here, and its waiters get
         // the final answer: the entry's key keeps them to requesters that the rules
-        // run after the continue treat alike (see `RuntimePipeline::requester`). If
-        // the request returns an error or is cancelled, the guard drops and removes
-        // the entry, and the waiters forward themselves.
+        // run after the continue treat alike (see `RuntimePipeline::requester`). A
+        // request that ends without an answer to share (an error: the jump limit, flow
+        // control keeping a forward from waiting, see `decide`) or is cancelled drops
+        // the guard, which removes the entry, and the waiters forward themselves.
         // continue 过的请求走到这里仍持有条目，等待者拿到最终应答：条目的键只让 continue
         // 之后运行的规则一样对待的请求方等在上面（见 `RuntimePipeline::requester`）。请求
-        // 返回错误或被取消时，守卫被丢弃并移除条目，等待者自己转发。
+        // 没以可以交出的应答结束（出错：跳转上限、流控没让转发等，见 `decide`）或者被取消时，
+        // 守卫被丢弃并移除条目，等待者自己转发。
         if let Some(mut guard) = route.held_inflight.take()
             && let Ok(bytes) = &result
         {
@@ -1447,21 +1342,25 @@ impl Engine {
         }
         // Every reply leaves with the ECS option its client should see, and with what it
         // copies from the query as the client wrote it (see `proto_utils::reply_as_asked`);
-        // waiters were handed the reply before this and do the same for their own clients
+        // waiters were handed the reply before this and do the same for their own clients.
+        // A request that ended in an error answers its client SERVFAIL, which the client
+        // must get rather than silence, a missing reply being a timeout to it; the stub
+        // resolver retries (RFC 1035)
         // 每个应答都带着它的客户端该看到的 ECS 选项、照客户端写法的照抄部分离开（见
-        // `proto_utils::reply_as_asked`）；等待者在这之前拿到应答，各自为自己的客户端做同样的处理
+        // `proto_utils::reply_as_asked`）；等待者在这之前拿到应答，各自为自己的客户端做同样的处理。
+        // 以错误结束的请求给它的客户端回 SERVFAIL：客户端得拿到确定的应答，没有回音在它看来就是超时；
+        // stub 解析器会重试（RFC 1035）
         let result = if background_refresh {
             result
         } else {
             let at_least = route
                 .echo_floor
                 .max(route.trail.echo_scope(&request.requester.ecs_view()));
-            result.map(|bytes| {
-                crate::proto_utils::reply_as_asked(
-                    phases::client_reply(bytes, client_ecs.as_ref(), at_least),
-                    packet,
-                )
-            })
+            let reply = result.unwrap_or_else(|_| crate::proto_utils::servfail_reply(packet));
+            Ok(crate::proto_utils::reply_as_asked(
+                phases::client_reply(reply, client_ecs.as_ref(), at_least),
+                packet,
+            ))
         };
         response_log.finish(&result);
         if let Some(observed) = observed.as_mut() {
@@ -1470,62 +1369,70 @@ impl Engine {
         result
     }
 
-    /// 读出请求的问题，选好 pipeline：快速路径预解析过的照用；否则先快速解析，读不了再完整解析
-    /// Read the request's question and pick its pipeline: what the fast path pre-parsed is
-    /// taken as it is; otherwise the quick parse comes first, the full one when it cannot read it
+    /// 读出请求的问题，选好 pipeline：先快速解析，读不了再完整解析，还读不了就是 [`UnreadableQuery`]
+    /// Read the request's question and pick its pipeline: the quick parse first, the full one
+    /// when it cannot read it, and a query neither reads is an [`UnreadableQuery`]
     fn read_request(
         &self,
         packet: &[u8],
         peer: SocketAddr,
-        pre_parsed: Option<PreParsedData>,
         cfg: &RuntimePipelineConfig,
     ) -> anyhow::Result<RequestHead> {
-        if let Some(pre) = pre_parsed {
-            return Ok(RequestHead {
-                qname: pre.qname,
-                qtype: pre.qtype,
-                qclass: pre.qclass,
-                tx_id: pre.tx_id,
-                edns_present: pre.edns_present,
-                pipeline_id: pre.pipeline_id,
-                // Read off the packet itself, whoever pre-parsed it / 无论谁预解析，都从包本身读
-                client_ecs: crate::proto_utils::client_subnet(packet),
-            });
-        }
+        let pipeline_of = |head: (&str, RecordType, DNSClass, bool)| {
+            let (qname, qtype, qclass, edns_present) = head;
+            self.pick_pipeline(cfg, qname, qtype, qclass, peer.ip(), edns_present)
+                .map_or_else(|| Arc::from(NO_PIPELINE), |pipeline| pipeline.id.clone())
+        };
         let mut qname_buf = [0u8; 256];
-        let (qname, qtype, qclass, tx_id, edns_present, client_ecs) =
-            match parse_quick(packet, &mut qname_buf) {
-                Some(q) => (
-                    Arc::<str>::from(q.qname),
-                    hickory_proto::rr::RecordType::from(q.qtype),
-                    DNSClass::from(q.qclass),
-                    q.tx_id,
-                    q.edns_present,
-                    q.client_subnet,
-                ),
-                None => {
-                    anyhow::ensure!(
-                        crate::proto_utils::question_name_readable(packet),
-                        "unreadable question name"
-                    );
-                    let req = Message::from_bytes(packet).context("parse request")?;
-                    let question = req.queries.first().context("empty question")?;
-                    (
-                        // The text parse_quick would have built / parse_quick 会拼出的同一段文本
-                        Arc::from(crate::proto_utils::name_text(question.name())),
-                        question.query_type(),
-                        question.query_class(),
-                        req.metadata.id,
-                        req.edns.is_some(),
-                        crate::proto_utils::client_subnet(packet),
-                    )
-                }
-            };
-        let pipeline_id = select_pipeline(
+        if let Some(q) = parse_quick(packet, &mut qname_buf) {
+            let pipeline_id = pipeline_of((
+                q.qname,
+                RecordType::from(q.qtype),
+                DNSClass::from(q.qclass),
+                q.edns_present,
+            ));
+            return Ok(RequestHead::quick(&q, pipeline_id));
+        }
+        anyhow::ensure!(
+            crate::proto_utils::question_name_end(packet).is_some(),
+            UnreadableQuery
+        );
+        let req = Message::from_bytes(packet).context(UnreadableQuery)?;
+        let question = req.queries.first().context(UnreadableQuery)?;
+        // The text parse_quick would have built / parse_quick 会拼出的同一段文本
+        let qname: Arc<str> = Arc::from(crate::proto_utils::name_text(question.name()));
+        let (qtype, qclass) = (question.query_type(), question.query_class());
+        let edns_present = req.edns.is_some();
+        Ok(RequestHead {
+            pipeline_id: pipeline_of((&qname, qtype, qclass, edns_present)),
+            qname,
+            qtype,
+            qclass,
+            tx_id: req.metadata.id,
+            flags: crate::proto_utils::QueryFlags::of(packet),
+            edns_present,
+            edns_version: crate::proto_utils::edns_version(packet).unwrap_or(0),
+            client_ecs: crate::proto_utils::client_subnet(packet),
+        })
+    }
+
+    /// `cfg` 为这个问题、这个客户端选的 pipeline（见 [`select_pipeline`]），快速路径和完整路径都从这里选
+    /// The pipeline `cfg` picks for this question and this client (see [`select_pipeline`]), the
+    /// fast path and the full path both picking here
+    fn pick_pipeline<'a>(
+        &self,
+        cfg: &'a RuntimePipelineConfig,
+        qname: &str,
+        qtype: RecordType,
+        qclass: DNSClass,
+        client_ip: IpAddr,
+        edns_present: bool,
+    ) -> Option<&'a crate::matcher::RuntimePipeline> {
+        select_pipeline(
             cfg,
             &PipelineSelectionContext {
-                qname: &qname,
-                client_ip: peer.ip(),
+                qname,
+                client_ip,
                 qclass,
                 edns_present,
                 qtype,
@@ -1534,16 +1441,6 @@ impl Engine {
                 geoip_manager: Some(&self.geoip_manager),
             },
         )
-        .map_or_else(|| Arc::from(NO_PIPELINE), |pipeline| pipeline.id.clone());
-        Ok(RequestHead {
-            qname,
-            qtype,
-            qclass,
-            tx_id,
-            edns_present,
-            pipeline_id,
-            client_ecs,
-        })
     }
 
     /// 决定怎么回答 `request`：不支持的 EDNS 版本回 BADVERS；查缓存；然后沿着规则走（跳转、continue、静态应答、转发），
@@ -1560,11 +1457,11 @@ impl Engine {
     ) -> anyhow::Result<Bytes> {
         let packet = request.packet;
         // RFC 6891 section 6.1.3, as on the fast path: an unsupported EDNS version is
-        // answered BADVERS. Read off the packet itself, so a query the fast parser
-        // cannot read (trailing bytes, a name that needs escapes) meets it too
-        // RFC 6891 第 6.1.3 节，和快速路径一样：不支持的 EDNS 版本回 BADVERS。从包本身读，
-        // 快速解析读不了的查询（结尾多了字节、名字要转义）也一样
-        if crate::proto_utils::edns_version(packet).is_some_and(|version| version != 0) {
+        // answered BADVERS, a query the fast parser cannot read (trailing bytes, a name that
+        // needs escapes) included
+        // RFC 6891 第 6.1.3 节，和快速路径一样：不支持的 EDNS 版本回 BADVERS，快速解析读不了的查询（结尾多了
+        // 字节、名字要转义）也一样
+        if request.edns_version != 0 {
             return crate::proto_utils::badvers_response(packet).context("build BADVERS response");
         }
         let background_refresh = request.refresh.is_some();
@@ -1612,25 +1509,23 @@ impl Engine {
                 if route.jumps_left == 0 {
                     crate::warn_sparse!("max jump limit reached");
                     // How many jumps a request has left depends on the way it
-                    // came, which no key carries, so this SERVFAIL is its own: a
-                    // waiter on its held entry may have jumps to spare, so the
-                    // entry goes rather than hand it over, and it is not cached
-                    // for a request that enters this pipeline directly.
+                    // came, which no key carries, so this SERVFAIL is its own
+                    // (see `handle_packet_internal`): a waiter on its held entry
+                    // may have jumps to spare, so the entry goes rather than hand
+                    // it over, and it is not cached for a request that enters
+                    // this pipeline directly.
                     // 请求还能跳几次取决于它一路怎么来的，键里没有这一项，所以这个
-                    // SERVFAIL 只属于它：等在持有条目上的请求可能还有余量，所以放掉
-                    // 条目，不把它交出去；也不缓存给直接进入这个 pipeline 的请求。
-                    drop(route.held_inflight.take());
+                    // SERVFAIL 只属于它（见 `handle_packet_internal`）：等在持有条目上的
+                    // 请求可能还有余量，所以放掉条目，不把它交出去；也不缓存给直接进入
+                    // 这个 pipeline 的请求。
                     info.upstream = Some(Source::Static);
-                    return request.servfail("parse request");
+                    anyhow::bail!("the jump limit was reached");
                 }
                 route.jumps_left -= 1;
                 let Some(p) = cfg.pipeline(pipeline) else {
                     crate::warn_sparse!(pipeline = %pipeline, "jump target pipeline not found");
-                    decision = Decision::Static {
-                        rcode: ResponseCode::ServFail,
-                        answers: Vec::new(),
-                    };
-                    break;
+                    info.upstream = Some(Source::Static);
+                    return Ok(crate::proto_utils::servfail_reply(packet));
                 };
                 info.pipeline = Some(p.id.clone());
                 if let Some((observer, ctx)) = request.observed {
@@ -1669,22 +1564,9 @@ impl Engine {
                 Decision::Jump { .. } => unreachable!("the loop above resolves every jump"),
                 Decision::Static { rcode, answers } => {
                     info.upstream = Some(Source::Static);
-                    return phases::handle_static_decision(
-                        self,
-                        &phases::StaticDecisionContext {
-                            packet,
-                            qname: request.qname,
-                            qtype: request.qtype,
-                            qclass: request.qclass,
-                            pipeline_id: &route.key_pipeline,
-                            slot: route.keys.slot,
-                            flags: request.flags,
-                            reach: &route.trail,
-                            answer_ttl: route.answer_ttl,
-                        },
-                        rcode,
-                        answers,
-                    );
+                    return Ok(phases::handle_static_decision(
+                        self, request, route, rcode, &answers,
+                    ));
                 }
                 Decision::Forward {
                     upstream,
@@ -1698,7 +1580,7 @@ impl Engine {
                 } => {
                     let (response_matchers, response_actions_on_match, response_actions_on_miss) =
                         crate::matcher::ResponsePhase::parts(response_phase.as_deref());
-                    let forwarded = phases::handle_forward_decision_logged(
+                    let forwarded = phases::handle_forward_decision(
                         self,
                         request,
                         route,
@@ -1719,8 +1601,8 @@ impl Engine {
 
                     match forwarded {
                         Ok(phases::ForwardResult::Success(bytes)) => return Ok(bytes),
-                        Ok(phases::ForwardResult::Continue { ctx, answer_ttl }) => {
-                            route.continued(*ctx, rule_index, answer_ttl);
+                        Ok(phases::ForwardResult::Continue { ctx }) => {
+                            route.continued(*ctx, rule_index);
                             // 只有规则的回答检查会 continue，所以请求在配置里的某个 pipeline 里
                             // Only a rule's answer check continues, so the request is in a
                             // pipeline of the configuration
@@ -1734,56 +1616,36 @@ impl Engine {
                             pipeline,
                             packet,
                             carried,
-                            answer_ttl,
                         }) => {
-                            route.response_jumped(packet, carried, response_jump_limit, answer_ttl);
+                            route.response_jumped(packet, carried, response_jump_limit);
                             decision = Decision::Jump { pipeline };
                             continue 'decision_loop;
                         }
+                        // 这次转发没以应答结束。后台刷新没有要应答的客户端：上游失败了就到此为止，失败原样交回，由
+                        // refresh.rs 记录。客户端请求只剩流控没让等的这一种（见 `UpstreamFailure::withheld`）：上游失败、
+                        // 应答读不了都已经在转发里化成了过期应答、SERVFAIL 或 miss 动作的结果。它是这台设备自己的事，
+                        // 这个请求只给自己回 SERVFAIL，不交给等在它条目上的别的请求（见 `handle_packet_internal`）；
+                        // 也不逐个记警告，拦着的时候每秒可以有几万个
+                        // The forward ended without an answer. A background refresh answers no
+                        // client: once the upstream failed it ends there, the failure coming back
+                        // as it is for refresh.rs to log. For a client request only one is left,
+                        // flow control keeping the query from waiting (see
+                        // `UpstreamFailure::withheld`): an upstream failure or a reply that cannot be
+                        // read has become a stale answer, SERVFAIL or the miss actions' outcome
+                        // within the forward. It is the device's own affair, so the request answers
+                        // SERVFAIL to itself alone and not to the requests waiting on its entry (see
+                        // `handle_packet_internal`); nor is a warning logged for each, held back
+                        // there being tens of thousands a second
                         Err(e) => {
-                            // A background refresh answers no client: it gets the
-                            // failure itself, which refresh.rs logs.
-                            // 后台刷新没有要应答的客户端：失败原样交回，由 refresh.rs 记录。
-                            if background_refresh {
-                                return Err(e);
-                            }
-                            // 这次转发没有以应答结束，以错误结束：上游的应答两种解析都读不了、响应动作要用的请求
-                            // 解析不了、响应动作里的转发被流控拦下，等等；有没有 continue 过都一样（上游失败本身
-                            // 已经在转发里化成了过期应答、SERVFAIL 或 miss 动作的结果）。客户端也得拿到确定的应答，
-                            // 不能没有回音：DNS 客户端把没有回音当超时。回 SERVFAIL，stub 解析器会重试（RFC 1035）
-                            // The forward ended in an error rather than an answer: an upstream reply
-                            // neither parser reads, a request the response actions need that cannot
-                            // be parsed, a response action's forward flow control kept back, and so
-                            // on, whether or not a rule continued before (an upstream failure itself
-                            // has become a stale answer, SERVFAIL or the miss actions' outcome within
-                            // the forward). The client must still get a definitive answer, never
-                            // silence: DNS clients treat a missing reply as a timeout. SERVFAIL lets
-                            // the stub resolver retry (RFC 1035)
-                            // 流控没让等的失败是这台设备自己的事（见 `UpstreamFailure::withheld`）：规则
-                            // continue 以后还留着的条目现在放下，这个 SERVFAIL 不交给等在上面的别的请求；
-                            // 也不逐个记警告，拦着的时候每秒可以有几万个
-                            // A failure with flow control keeping the query from waiting is the
-                            // device's own affair (see `UpstreamFailure::withheld`): the entry
-                            // still held after a rule continued goes now, and this SERVFAIL is
-                            // not handed to the other requests waiting on it; nor is a warning
-                            // logged for each, held back there being tens of thousands a second
-                            if crate::engine::upstream::UpstreamFailure::was_withheld(&e) {
-                                drop(route.held_inflight.take());
+                            if !background_refresh {
                                 tracing::debug!(
                                     event = "forward_withheld",
                                     error = %e,
                                     rule = %rule_name,
                                     "flow control kept the forward from the upstream, returning SERVFAIL"
                                 );
-                            } else {
-                                crate::warn_sparse!(
-                                    event = "forward_failed",
-                                    error = %e,
-                                    rule = %rule_name,
-                                    "forward failed, returning SERVFAIL"
-                                );
                             }
-                            return request.servfail("parse request for SERVFAIL");
+                            return Err(e);
                         }
                     }
                 }
@@ -1919,16 +1781,55 @@ impl Engine {
     }
 }
 
-/// 读出来的请求问题和选中的 pipeline（见 `Engine::read_request`）
-/// The request's question as read, and the pipeline picked (see `Engine::read_request`)
+/// 读不了的查询：问题名不合规、完整解析也读不了、没有问题（见 `Engine::read_request`）。读得了读不了在读的那一刻定下，
+/// 监听器据此回 FORMERR（见 `Engine::answer_after_fast_path`）；读得了的查询以后怎样都不会再是它
+/// A query that cannot be read: a question name that breaks the rules, the full parse failing
+/// too, no question (see `Engine::read_request`). Whether a query can be read is settled the
+/// moment it is read, and the listener answers FORMERR by it (see
+/// `Engine::answer_after_fast_path`); a query that was read never becomes one later
+#[derive(Debug)]
+pub struct UnreadableQuery;
+
+impl std::fmt::Display for UnreadableQuery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the query cannot be read")
+    }
+}
+
+impl std::error::Error for UnreadableQuery {}
+
+/// 读出来的请求和选中的 pipeline（见 `Engine::read_request`）；快速路径读过的照样交给异步路径（见 [`PreParsedData`]）
+/// The request as read, and the pipeline picked (see `Engine::read_request`); what the fast
+/// path read goes on to the async path as it is (see [`PreParsedData`])
+#[derive(Debug, Clone)]
 struct RequestHead {
     qname: Arc<str>,
-    qtype: hickory_proto::rr::RecordType,
+    qtype: RecordType,
     qclass: DNSClass,
     tx_id: u16,
+    flags: crate::proto_utils::QueryFlags,
     edns_present: bool,
-    pipeline_id: Arc<str>,
+    /// 请求 OPT 里的 EDNS 版本，没有 OPT 时为 0 / The EDNS version in the request's OPT, 0 without one
+    edns_version: u8,
     client_ecs: Option<crate::ecs::EcsKey>,
+    pipeline_id: Arc<str>,
+}
+
+impl RequestHead {
+    /// 快速解析读出的 `q`，选中的是 `pipeline_id` / `q` as the quick parse read it, `pipeline_id` picked
+    fn quick(q: &crate::proto_utils::QuickQuery<'_>, pipeline_id: Arc<str>) -> Self {
+        Self {
+            qname: Arc::from(q.qname),
+            qtype: RecordType::from(q.qtype),
+            qclass: DNSClass::from(q.qclass),
+            tx_id: q.tx_id,
+            flags: q.flags,
+            edns_present: q.edns_present,
+            edns_version: q.edns_version,
+            client_ecs: q.client_subnet,
+            pipeline_id,
+        }
+    }
 }
 
 /// 一个请求在整个处理过程中不变的部分：它的包、问题、谁在问、用的配置快照，和后台刷新时要更新的条目
@@ -1944,6 +1845,9 @@ pub(crate) struct Request<'a> {
     pub(crate) qclass: DNSClass,
     pub(crate) tx_id: u16,
     pub(crate) flags: crate::proto_utils::QueryFlags,
+    /// 请求 OPT 里的 EDNS 版本，没有 OPT 时为 0 / The EDNS version in the request's OPT, 0
+    /// without one
+    pub(crate) edns_version: u8,
     pub(crate) peer: SocketAddr,
     /// Who is asking (address, EDNS, the client's own ECS) / 谁在问（地址、EDNS、客户端自己的 ECS）
     pub(crate) requester: Requester,
@@ -1999,12 +1903,6 @@ impl Request<'_> {
     /// the client; nobody, None, for a background refresh
     pub(crate) fn asker(&self) -> Option<std::net::IpAddr> {
         self.refresh.is_none().then(|| self.peer.ip())
-    }
-
-    /// 回这个请求的 SERVFAIL；`context` 是请求读不出来时的错误说明
-    /// Answer this request SERVFAIL; `context` describes the error when it cannot be read
-    fn servfail(&self, context: &'static str) -> anyhow::Result<Bytes> {
-        engine_helpers::build_servfail_response(&Message::from_bytes(self.packet).context(context)?)
     }
 
     /// 去掉刷新要更新的那份应答，它还在的话（见 [`renewing`]）/ Drop the answer the refresh
@@ -2086,19 +1984,22 @@ pub(crate) struct Route {
     /// have one budget, a response action's jump with the rule-level jumps after it another (see
     /// `Route::response_jumped`)
     jumps_left: usize,
-    /// 接下来的应答所依据的上游应答在缓存里能留多久：在这些键下最近一次 continue 或回答检查跳转，是在那份上游应答上
-    /// 做的（见 `phases::ForwardResult::Continue`）。这时规则给出的静态应答缓存起来，下次不必再问上游，只是不比那份应答
-    /// 留得久（见 `phases::StaticDecisionContext::answer_ttl`）。miss 动作在上游失败以后做的不据哪份应答，手里没有；请求
-    /// 阶段跳进别的 pipeline、换了键，也就不再据它：那里直接给出的，直接进那里的请求也照样直接拿到。这两种都是 0
-    /// How long the upstream answer what answers next goes by may stay in the cache: the latest
-    /// continue or answer check's jump under these keys was made on that upstream answer (see
-    /// `phases::ForwardResult::Continue`). A static answer the rules give now is cached so as
-    /// not to ask the upstream again, only no longer than that answer may be (see
-    /// `phases::StaticDecisionContext::answer_ttl`). One the miss actions made after an
-    /// upstream failure goes by no answer, there being none in hand; a request-phase jump into
-    /// another pipeline, changing the keys, goes by it no more: what is given outright there is
-    /// given outright to the requests entering there directly too. Both are 0
-    answer_ttl: u32,
+    /// 接下来的应答所依据的上游应答在缓存里能留多久：在这些键下回答检查做决定时据的每一份上游应答里最短的那个（见
+    /// `Route::went_by`），还没据过哪份应答时为 None。规则此后给出的静态应答缓存起来，下次不必再问上游，只是不比其中哪一份
+    /// 留得久（见 `phases::static_ttl`）：哪一份到期了，上游都可能答得不一样，回答检查也就可能走另一条路。miss 动作在上游
+    /// 失败以后做的决定不据哪份应答，记作 0，此后给出的都不缓存；请求阶段跳进别的 pipeline、换了键，又从 None 开始：那里直接
+    /// 给出的，直接进那里的请求也照样直接拿到
+    /// How long the upstream answers what answers next goes by may stay in the cache: the
+    /// least of every upstream answer an answer check decided on under these keys (see
+    /// `Route::went_by`), None while none has been gone by. A static answer the rules give
+    /// from here on is cached so as not to ask the upstream again, only no longer than any of
+    /// them may be (see `phases::static_ttl`): once any one expires the upstream may answer
+    /// otherwise, and the checks may take another way. What the miss actions decide after an
+    /// upstream failure goes by no answer and counts as 0, nothing given after it being
+    /// cached; a request-phase jump into another pipeline, changing the keys, starts again
+    /// from None: what is given outright there is given outright to the requests entering
+    /// there directly too
+    pub(crate) answer_ttl: Option<u32>,
     /// The forwards the request passed in the current pipeline, each with the ECS it sent
     /// and whom its reply applies to; every answer the request caches applies to the
     /// requesters all of them admit (see `CacheEntry::reach`). A forward adds its own here.
@@ -2124,25 +2025,21 @@ pub(crate) struct Route {
 }
 
 impl Route {
-    /// 从选中的 `pipeline_id` 出发（`pipeline` 是它，选不到时为 None）。刷新写进它要更新的条目的槽位
-    /// Starting from the picked `pipeline_id` (`pipeline` being it, None when none was picked).
-    /// A refresh writes into the slot of the entry it renews
+    /// 从选中的 `pipeline_id` 出发（`pipeline` 是它，选不到时为 None）
+    /// Starting from the picked `pipeline_id` (`pipeline` being it, None when none was picked)
     fn new(
         engine: &Engine,
         request: &Request<'_>,
         pipeline_id: &Arc<str>,
         pipeline: Option<&crate::matcher::RuntimePipeline>,
     ) -> Self {
-        let mut keys = request.keys(
+        let keys = request.keys(
             pipeline_id,
             &pipeline.map_or(RequesterKey::NONE, |p| {
                 p.requester
                     .key(request.requester, Some(&engine.geoip_manager))
             }),
         );
-        if let Some(target) = request.refresh {
-            keys.slot = target.slot;
-        }
         Self {
             pipeline: Arc::clone(pipeline_id),
             key_pipeline: Arc::clone(pipeline_id),
@@ -2151,7 +2048,7 @@ impl Route {
             reused_response: None,
             jumped: None,
             jumps_left: request.state.pipeline.settings.response_jump_limit as usize,
-            answer_ttl: 0,
+            answer_ttl: None,
             trail: EcsReach::default(),
             echo_floor: 0,
             held_inflight: None,
@@ -2190,7 +2087,7 @@ impl Route {
             .echo_floor
             .max(self.trail.echo_scope(&request.requester.ecs_view()));
         self.trail = EcsReach::default();
-        self.answer_ttl = 0;
+        self.answer_ttl = None;
         self.key_pipeline = p.id.clone();
         // The keys follow the pipeline / 键随 pipeline 改变
         self.keys = request.keys(
@@ -2201,14 +2098,58 @@ impl Route {
         true
     }
 
-    /// 规则越过了这个应答（continue；`answer_ttl` 见 `phases::ForwardResult::Continue`）：`reused` 留给后面的
-    /// `allow`，`rule` 下一轮不再求值
-    /// A rule continued past this answer (`answer_ttl` see `phases::ForwardResult::Continue`):
-    /// `reused` is kept for a later `allow`, and `rule` is not evaluated again
-    fn continued(&mut self, reused: Option<ResponseContext>, rule: Option<usize>, answer_ttl: u32) {
-        self.answer_ttl = answer_ttl;
+    /// 规则越过了这个应答（continue）：`reused` 留给后面的 `allow`，`rule` 下一轮不再求值
+    /// A rule continued past this answer: `reused` is kept for a later `allow`, and `rule` is
+    /// not evaluated again
+    fn continued(&mut self, reused: Option<ResponseContext>, rule: Option<usize>) {
         self.reused_response = reused;
         self.skip_rules.extend(rule);
+    }
+
+    /// 回答检查据一份能在缓存里留 `ttl` 秒的上游应答做了决定（上游失败以后的 miss 动作是 0）：记进 `answer_ttl`，给出
+    /// 此后的静态应答最多缓存多久
+    /// An answer check decided on an upstream answer that may stay in the cache `ttl` seconds
+    /// (0 for the miss actions after an upstream failure): noted in `answer_ttl`, giving how
+    /// long a static answer from here on may be cached at most
+    pub(crate) fn went_by(&mut self, ttl: u32) -> u32 {
+        let least = self.answer_ttl.map_or(ttl, |before| before.min(ttl));
+        self.answer_ttl = Some(least);
+        least
+    }
+
+    /// 在这条路线的键下为 `request` 缓存应答 `bytes`，留 `ttl` 秒，适用于 trail 接受的请求方；`ttl` 为 0 时不写（见
+    /// `phases::ttl_to_cache`、`phases::static_ttl`）。转发得到的、规则给出的应答都经这里写
+    /// Cache the answer `bytes` for `request` under this route's keys for `ttl` seconds, for the
+    /// requesters the trail admits; with `ttl` 0 nothing is cached (see `phases::ttl_to_cache`,
+    /// `phases::static_ttl`). Answers forwards got and answers the rules gave are written here
+    /// alike
+    pub(crate) fn cache(
+        &self,
+        engine: &Engine,
+        request: &Request<'_>,
+        bytes: &Bytes,
+        rcode: ResponseCode,
+        upstream: Option<Arc<str>>,
+        ttl: u32,
+    ) {
+        if ttl == 0 {
+            return;
+        }
+        engine.insert_dns_cache_entry(
+            self.keys.slot,
+            CacheEntry::from_response(
+                bytes.clone(),
+                rcode,
+                upstream,
+                Arc::clone(request.qname),
+                Arc::clone(&self.key_pipeline),
+                u16::from(request.qtype),
+                u16::from(request.qclass),
+                self.keys.flags,
+                ttl,
+            )
+            .with_reach(self.trail.clone()),
+        );
     }
 
     /// 响应动作还能跳几次：头一次响应阶段的跳转之前是整份 `limit`，之后是那一份剩下的（见 [`Self::response_jumped`]）
@@ -2222,20 +2163,17 @@ impl Route {
         }
     }
 
-    /// 响应动作跳走：跳过去以前那次转发的应答就是越过的那个，和 continue 一样（`answer_ttl` 也一样；刷新时上游失败的到不了
-    /// 这里）；此后的转发照原样发出 `packet`。第一次响应阶段的跳转起另算一份次数（`limit`）
+    /// 响应动作跳走：跳过去以前那次转发的应答就是越过的那个，和 continue 一样；此后的转发照原样发出 `packet`。第一次
+    /// 响应阶段的跳转起另算一份次数（`limit`）
     /// A response action jumped away: the answer of the forward before the jump is one passed
-    /// over, as on a continue (`answer_ttl` too; a refresh whose upstream failed never gets here);
-    /// the forwards from here on send `packet` as it is. The first response-phase jump starts a
-    /// budget of its own (`limit`)
+    /// over, as on a continue; the forwards from here on send `packet` as it is. The first
+    /// response-phase jump starts a budget of its own (`limit`)
     fn response_jumped(
         &mut self,
         packet: Bytes,
         carried: crate::ecs_scope::ForwardEcs,
         limit: usize,
-        answer_ttl: u32,
     ) {
-        self.answer_ttl = answer_ttl;
         if self.jumped.is_none() {
             self.jumps_left = limit;
         }
@@ -2384,42 +2322,35 @@ mod tests {
             "test".to_string(),
         )
         .expect("create engine");
-        let old_state = engine.state.load_full();
-        let old_namespace = old_state.cache_namespace("main");
-        let old_key = Engine::cache_keys(
-            old_namespace,
-            "main",
-            b"example.com",
-            RecordType::A,
-            DNSClass::IN,
-            crate::proto_utils::QueryFlags::RECURSIVE,
-            &RequesterKey::NONE,
-            None,
-        )
-        .slot;
-
-        engine.reload(runtime_with_static_ip(&upstream, "192.0.2.2"));
-        let new_namespace = engine.state.load().cache_namespace("main");
-        let new_key = Engine::cache_keys(
-            new_namespace,
-            "main",
-            b"example.com",
-            RecordType::A,
-            DNSClass::IN,
-            crate::proto_utils::QueryFlags::RECURSIVE,
-            &RequesterKey::NONE,
-            None,
-        )
-        .slot;
-
         let mut request = Message::new(0xCAFE, MessageType::Query, OpCode::Query);
         request.add_query(Query::query(
             Name::from_str("example.com").unwrap(),
             RecordType::A,
         ));
+        let request = request.to_vec().unwrap();
+        // 刷新重放的查询算出的槽位 / The slot the query a refresh replays works out to
+        let slot_in = |namespace| {
+            Engine::cache_keys(
+                namespace,
+                "main",
+                b"example.com",
+                RecordType::A,
+                DNSClass::IN,
+                crate::proto_utils::QueryFlags::of(&request),
+                &RequesterKey::NONE,
+                None,
+            )
+            .slot
+        };
+        let old_state = engine.state.load_full();
+        let old_key = slot_in(old_state.cache_namespace("main"));
+
+        engine.reload(runtime_with_static_ip(&upstream, "192.0.2.2"));
+        let new_key = slot_in(engine.state.load().cache_namespace("main"));
+
         let response = engine
             .handle_packet_internal(
-                &request.to_vec().unwrap(),
+                &request,
                 "127.0.0.1:53000".parse().unwrap(),
                 None,
                 Some(engine.refresh_of(old_key)),
@@ -2437,6 +2368,61 @@ mod tests {
         assert!(
             engine.cached(new_key).is_none(),
             "work from the old snapshot must not populate the active generation"
+        );
+    }
+
+    /// 刷新照客户端请求的样子把应答写在它这一路的键下，查这个问题的请求就在那里找到它，不论被刷新的条目在哪个槽位。这里
+    /// 条目在请求阶段跳转的目标下，而刷新这次没有跳过去（请求阶段的规则据实时更新的 Geo 数据改了主意，比如）。以前刷新把
+    /// 槽位改成条目的：应答连同入口 pipeline 的问题落在目标的槽位里，查这个问题的请求谁也不去那里找
+    /// A refresh writes its answer under the keys of the way it goes, as a client request does,
+    /// and a request asking the question finds it there, whichever slot the renewed entry is in.
+    /// Here the entry is under the target of a request-phase jump, which the refresh does not
+    /// make this time (the request-phase rules changing their mind on live Geo data, say). A
+    /// refresh used to take the entry's slot for its own: the answer, with the entry pipeline's
+    /// question, landed in the target's slot, where no request asking that question looks
+    #[tokio::test]
+    async fn a_refresh_caches_its_answer_where_its_route_leads() {
+        let upstream = answering_upstream("192.0.2.9".parse().unwrap(), 300).await;
+        let engine = Engine::new(runtime_with_upstream(&upstream.address), "test".to_string())
+            .expect("create engine");
+        let request = example_query();
+        let slot_of = |pipeline| {
+            Engine::cache_keys(
+                engine.state.load().cache_namespace(pipeline),
+                pipeline,
+                b"example.com",
+                RecordType::A,
+                DNSClass::IN,
+                crate::proto_utils::QueryFlags::of(&request),
+                &RequesterKey::NONE,
+                None,
+            )
+            .slot
+        };
+        let renewed = RefreshTarget::new(
+            slot_of("target"),
+            Arc::from("target"),
+            Default::default(),
+            std::time::Instant::now(),
+        );
+        engine
+            .handle_packet_internal(
+                &request,
+                "127.0.0.1:53000".parse().unwrap(),
+                None,
+                Some(renewed),
+                None,
+            )
+            .await
+            .expect("refreshed");
+
+        assert!(engine.cached(slot_of("target")).is_none());
+        assert!(engine.cached(slot_of("main")).is_some());
+        support::ask(&engine, &request, "127.0.0.1:53000".parse().unwrap()).await;
+        assert_eq!(
+            upstream.queries(),
+            1,
+            "the request found the refreshed answer"
         );
     }
 
@@ -3866,99 +3852,6 @@ mod tests {
     }
 
     // ========================================================================
-    // Engine Helper Functions Unit Tests / 引擎辅助函数单元测试
-    // ========================================================================
-
-    #[test]
-    fn test_engine_helpers_build_servfail_response() {
-        // Arrange: Create test request
-        let mut req = Message::new(12345, hickory_proto::op::MessageType::Query, OpCode::Query);
-        req.metadata.recursion_desired = true;
-        let query = Query::query(Name::from_str("example.com").unwrap(), RecordType::A);
-        req.add_query(query);
-
-        // Act: Build ServFail response
-        let result = engine_helpers::build_servfail_response(&req);
-
-        // Assert: Verify response
-        assert!(
-            result.is_ok(),
-            "Should successfully build ServFail response"
-        );
-        let bytes = result.unwrap();
-        assert!(!bytes.is_empty(), "Response should not be empty");
-
-        // Verify it's a valid DNS message
-        let msg = Message::from_bytes(&bytes).unwrap();
-        assert_eq!(msg.metadata.id, 12345, "TXID should be preserved");
-        assert_eq!(
-            msg.metadata.response_code,
-            ResponseCode::ServFail,
-            "Should be ServFail"
-        );
-        assert_eq!(
-            msg.metadata.op_code,
-            OpCode::Query,
-            "Should be Query opcode"
-        );
-        assert!(
-            msg.metadata.recursion_desired,
-            "RD flag should be preserved"
-        );
-        assert_eq!(msg.queries.len(), 1, "Should have one query");
-    }
-
-    #[test]
-    fn test_engine_helpers_build_refused_response() {
-        // Arrange: Create test request
-        let mut req = Message::new(54321, MessageType::Query, OpCode::Query);
-        let query = Query::query(Name::from_str("example.com").unwrap(), RecordType::A);
-        req.add_query(query);
-
-        // Act: Build Refused response
-        let result = engine_helpers::build_refused_response(&req);
-
-        // Assert: Verify response
-        assert!(result.is_ok(), "Should successfully build Refused response");
-        let bytes = result.unwrap();
-        assert!(!bytes.is_empty(), "Response should not be empty");
-
-        // Verify it's a valid DNS message
-        let msg = Message::from_bytes(&bytes).unwrap();
-        assert_eq!(msg.metadata.id, 54321, "TXID should be preserved");
-        assert_eq!(
-            msg.metadata.response_code,
-            ResponseCode::Refused,
-            "Should be Refused"
-        );
-        assert_eq!(msg.queries.len(), 1, "Should have one query");
-    }
-
-    #[test]
-    fn test_engine_helpers_build_servfail_vs_refused_different() {
-        // Arrange: Create test request
-        let mut req = Message::new(11111, MessageType::Query, OpCode::Query);
-        let query = Query::query(Name::from_str("test.com").unwrap(), RecordType::A);
-        req.add_query(query);
-
-        // Act: Build both response types
-        let servfail = engine_helpers::build_servfail_response(&req).unwrap();
-        let refused = engine_helpers::build_refused_response(&req).unwrap();
-
-        // Assert: Should produce different responses
-        assert_ne!(
-            servfail, refused,
-            "ServFail and Refused should be different"
-        );
-
-        // Verify different response codes
-        let sf_msg = Message::from_bytes(&servfail).unwrap();
-        let ref_msg = Message::from_bytes(&refused).unwrap();
-        assert_eq!(sf_msg.metadata.response_code, ResponseCode::ServFail);
-        assert_eq!(ref_msg.metadata.response_code, ResponseCode::Refused);
-    }
-
-    // ========================================================================
     // Original Engine Tests / 原有引擎测试
     // ========================================================================
     use std::net::Ipv4Addr;
@@ -4608,13 +4501,14 @@ mod tests {
         const LIMIT: usize = 4608;
         let engine = build_test_engine();
         let peer: SocketAddr = "127.0.0.1:5300".parse().expect("peer");
-        let packet = [0u8; 12];
+        let packet = query_for("a.test");
         let full = engine.handle_packet(&packet, peer);
-        let pre_parsed = engine.handle_packet_internal_with_pre_parsed(
-            &packet,
-            peer,
-            engine.pre_parsed("a.test".to_string(), 1, 1, 0, false, Arc::from("main")),
-        );
+        let Ok(Some(FastPathResponse::AsyncNeeded(pre_parsed))) =
+            engine.handle_packet_fast(&packet, peer)
+        else {
+            panic!("the fast path leaves a forward to the async path");
+        };
+        let pre_parsed = engine.handle_packet_internal_with_pre_parsed(&packet, peer, pre_parsed);
         for (entry, size) in [
             ("handle_packet", std::mem::size_of_val(&full)),
             ("pre-parsed", std::mem::size_of_val(&pre_parsed)),
@@ -4661,6 +4555,13 @@ mod tests {
         }
     }
 
+    /// 问 `qname` 的 `qtype` 的查询 / A query asking `qname` for `qtype`
+    fn query_packet(qname: &str, qtype: RecordType) -> Vec<u8> {
+        let mut query = Message::new(0xCAFE, MessageType::Query, OpCode::Query);
+        query.add_query(Query::query(Name::from_str(qname).unwrap(), qtype));
+        query.to_vec().unwrap()
+    }
+
     /// 来自 10.0.0.1、问 `qname` 的 `qtype` 的请求，包是 `packet` / A request from 10.0.0.1 asking
     /// `qname` for `qtype`, its packet being `packet`
     fn asked(
@@ -4678,27 +4579,27 @@ mod tests {
         )
     }
 
-    /// 在 `engine` 上为 `request`（解析出来是 `req`）执行 `actions` 的上下文，手上的应答是 `ctx_opt`
-    /// The context for running `actions` on `engine` for `request` (`req` once parsed), with
-    /// `ctx_opt` the answer in hand
+    /// 在 `engine` 上为 `request` 执行 `actions` 的上下文，手上的应答是 `ctx_opt`，转发记在 `trail` 里
+    /// The context for running `actions` on `engine` for `request`, with `ctx_opt` the answer
+    /// in hand and forwards noted in `trail`
     fn response_actions_context<'a>(
         engine: &'a Engine,
         request: &'a Request<'a>,
         actions: &'a [Action],
         ctx_opt: Option<ResponseContext>,
-        req: &'a Message,
+        trail: &'a mut EcsReach,
     ) -> ApplyResponseActionsContext<'a> {
         ApplyResponseActionsContext {
             engine,
             request,
             actions,
             ctx_opt,
-            req,
             packet: request.packet,
             pipeline_id: "pipeline",
             rule_name: "rule",
             remaining_jumps: 10,
-            trail: None,
+            trail,
+            rule_ecs: crate::ecs_scope::ForwardEcs::of(None, &request.requester.ecs_view()),
         }
     }
 
@@ -4707,14 +4608,14 @@ mod tests {
         // Arrange: Build test engine and response context
         let engine = build_test_engine();
         let ctx = build_response_context();
-        let req = Message::new(0, MessageType::Query, OpCode::Query);
         let actions = [Action::Allow];
-        let packet = [0u8];
+        let packet = query_packet("example.com", RecordType::A);
 
         // Act: Apply response actions with Allow action
         let asked = asked(&engine, "example.com", RecordType::A, &packet);
         let request = asked.request();
-        let ctx = response_actions_context(&engine, &request, &actions, Some(ctx), &req);
+        let mut trail = EcsReach::default();
+        let ctx = response_actions_context(&engine, &request, &actions, Some(ctx), &mut trail);
         let result = apply_response_actions(ctx)
             .await
             .expect("response actions allow should succeed");
@@ -4742,22 +4643,22 @@ mod tests {
     #[tokio::test]
     async fn response_actions_stop_at_allow() {
         let engine = build_test_engine();
-        let req = Message::new(0, MessageType::Query, OpCode::Query);
         let actions = [
             Action::Allow,
             Action::StaticIpResponse {
                 ip: "192.0.2.9".to_string(),
             },
         ];
-        let packet = [0u8];
+        let packet = query_packet("example.com", RecordType::A);
         let asked = asked(&engine, "example.com", RecordType::A, &packet);
         let request = asked.request();
+        let mut trail = EcsReach::default();
         let ctx = response_actions_context(
             &engine,
             &request,
             &actions,
             Some(build_response_context()),
-            &req,
+            &mut trail,
         );
         match apply_response_actions(ctx).await.expect("response actions") {
             ResponseActionResult::Upstream { ctx, .. } => {
@@ -4772,14 +4673,14 @@ mod tests {
         // Arrange: Build test engine, response context, and Continue action
         let engine = build_test_engine();
         let ctx = build_response_context();
-        let req = Message::new(0, MessageType::Query, OpCode::Query);
         let actions = [Action::Continue];
-        let packet = [0u8];
+        let packet = query_packet("example.com", RecordType::A);
 
         // Act: Apply response actions with Continue action
         let asked = asked(&engine, "example.com", RecordType::A, &packet);
         let request = asked.request();
-        let ctx = response_actions_context(&engine, &request, &actions, Some(ctx), &req);
+        let mut trail = EcsReach::default();
+        let ctx = response_actions_context(&engine, &request, &actions, Some(ctx), &mut trail);
         let result = apply_response_actions(ctx)
             .await
             .expect("response actions continue should succeed");
@@ -4801,14 +4702,14 @@ mod tests {
         // Arrange: Build test engine and response context with non-matching response matcher
         let engine = build_test_engine();
         let ctx = build_response_context();
-        let req = Message::new(0, MessageType::Query, OpCode::Query);
         let actions = [Action::Log { level: None }, Action::Allow];
-        let packet = [0u8];
+        let packet = query_packet("example.com", RecordType::A);
 
         // Act: Apply response actions with Allow action and non-matching matcher
         let asked = asked(&engine, "example.com", RecordType::A, &packet);
         let request = asked.request();
-        let ctx = response_actions_context(&engine, &request, &actions, Some(ctx), &req);
+        let mut trail = EcsReach::default();
+        let ctx = response_actions_context(&engine, &request, &actions, Some(ctx), &mut trail);
         let result = apply_response_actions(ctx)
             .await
             .expect("response actions allow should succeed even on miss");
@@ -4831,14 +4732,14 @@ mod tests {
     async fn response_actions_deny_returns_refused() {
         // Arrange: Build test engine with Deny action
         let engine = build_test_engine();
-        let req = Message::new(0, MessageType::Query, OpCode::Query);
         let actions = [Action::Deny];
-        let packet = [0u8];
+        let packet = query_packet("example.com", RecordType::A);
 
         // Act: Apply response actions with Deny action
         let asked = asked(&engine, "example.com", RecordType::A, &packet);
         let request = asked.request();
-        let ctx = response_actions_context(&engine, &request, &actions, None, &req);
+        let mut trail = EcsReach::default();
+        let ctx = response_actions_context(&engine, &request, &actions, None, &mut trail);
         let result = apply_response_actions(ctx)
             .await
             .expect("response actions deny should return static");
@@ -4860,17 +4761,20 @@ mod tests {
     async fn response_actions_static_ip_filters_answers_by_query_type() {
         // Arrange: Build test engine with a multi-address static IP response action
         let engine = build_test_engine();
-        let req = Message::new(0, MessageType::Query, OpCode::Query);
         let actions = [Action::StaticIpResponse {
             ip: "192.0.2.1,2001:db8::1,192.0.2.2".to_string(),
         }];
-        let packet = [0u8];
-
         let run = async |qtype: RecordType| {
-            let asked = asked(&engine, "example.com", qtype, &packet);
+            let asked = asked(
+                &engine,
+                "example.com",
+                qtype,
+                &query_packet("example.com", qtype),
+            );
             let request = asked.request();
+            let mut trail = EcsReach::default();
             apply_response_actions(response_actions_context(
-                &engine, &request, &actions, None, &req,
+                &engine, &request, &actions, None, &mut trail,
             ))
             .await
         };
@@ -4928,19 +4832,15 @@ mod tests {
     #[tokio::test]
     async fn response_actions_static_cname_returns_configured_alias() {
         let engine = build_test_engine();
-        let mut req = Message::new(0xCAFE, MessageType::Query, OpCode::Query);
-        req.add_query(Query::query(
-            Name::from_str("alias.example").unwrap(),
-            RecordType::A,
-        ));
         let actions = [Action::StaticCnameResponse {
             target: "origin.example.".to_string(),
             ttl: Some(60),
         }];
-        let packet = req.to_vec().unwrap();
+        let packet = query_packet("alias.example", RecordType::A);
         let asked = asked(&engine, "alias.example", RecordType::A, &packet);
         let request = asked.request();
-        let ctx = response_actions_context(&engine, &request, &actions, None, &req);
+        let mut trail = EcsReach::default();
+        let ctx = response_actions_context(&engine, &request, &actions, None, &mut trail);
 
         match apply_response_actions(ctx).await.expect("static cname") {
             ResponseActionResult::Static { bytes, rcode, .. } => {
@@ -5052,7 +4952,7 @@ mod tests {
             edns: false,
             ecs: None,
         };
-        let looked_up = phases::check_cache_logged(
+        let looked_up = phases::check_cache(
             &engine,
             &phases::CacheLookupContext {
                 flags: crate::proto_utils::QueryFlags::RECURSIVE,
@@ -5412,11 +5312,20 @@ mod tests {
                 crate::engine::static_ips(ips).unwrap()
             };
             let old = || {
-                build_fast_static_response(q.tx_id, text, q.qtype, q.qclass, rcode, &records)
-                    .map(|reply| {
-                        crate::proto_utils::reply_as_asked(fast_client_reply(reply, subnet), packet)
-                    })
-                    .expect("what can be written can be built")
+                let built = super::super::response::hickory_static_reply(
+                    packet,
+                    text,
+                    qtype,
+                    DNSClass::from(q.qclass),
+                    rcode,
+                    &records,
+                )
+                .expect("what can be written can be built");
+                shaped_static_reply(
+                    crate::proto_utils::reply_as_asked(built, packet),
+                    packet,
+                    subnet,
+                )
             };
             for written in [
                 write_static_reply(
@@ -5676,29 +5585,27 @@ mod tests {
         matched_rules: Option<&[&str]>,
         decided_by_rule: bool,
     ) -> u64 {
-        let key = crate::engine::rules::calculate_rule_hash(
+        let pipeline_id: Arc<str> = Arc::from("main");
+        let question = crate::engine::rules::RuleQuestion::new(
             engine.state.load().cache_namespace("main"),
-            "main",
+            &pipeline_id,
             "ip.test",
             RecordType::A,
             DNSClass::IN,
-            &RequesterKey::NONE,
+            RequesterKey::NONE,
         );
+        let key = question.key;
         engine.rule_cache.insert(
             key,
             Arc::new(RuleCacheRecord {
-                entry: RuleCacheEntry {
-                    pipeline_id: Arc::from("main"),
-                    qname: "ip.test".as_bytes().into(),
-                    qtype: u16::from(RecordType::A),
-                    qclass: u16::from(DNSClass::IN),
-                    requester: RequesterKey::NONE,
-                    decision: Decision::Static {
+                entry: RuleCacheEntry::new(
+                    &question,
+                    Decision::Static {
                         rcode: ResponseCode::NXDomain,
                         answers: Vec::new(),
                     },
                     expires_at,
-                },
+                ),
                 matched_rules: matched_rules
                     .map(|rules| rules.iter().map(|rule| Arc::from(*rule)).collect()),
                 decided_by_rule,
@@ -5912,6 +5819,64 @@ mod tests {
         );
     }
 
+    /// 两个请求同时问 `stale.com`，缓存里都没有；先到的那个转发，上游不应答。这期间别人往同一个槽位写进一份新鲜的应答（同时
+    /// 在问、inflight 键不同的请求拿到的，或者后台刷新拿到的），转发失败以后照常交出它，开不开 serve_stale 都一样，等着的那个
+    /// 也拿到同一份。以前只认过期的，两个请求都拿 SERVFAIL
+    /// Two requests for `stale.com` at once, neither found in the cache; the earlier one
+    /// forwards and the upstream never answers. Meanwhile someone else writes a fresh answer
+    /// into the same slot (a request asking at once under another inflight key, or a background
+    /// refresh), which goes out as usual once the forward fails, serve_stale on or off, and the
+    /// waiting one gets the same. Only a stale one used to count, both requests getting SERVFAIL
+    #[tokio::test]
+    async fn a_failed_forward_answers_with_a_fresh_answer_cached_meanwhile() {
+        use crate::engine::test_support::{ask, first_a, upstream};
+        use hickory_proto::op::{MessageType, OpCode, Query};
+        use hickory_proto::rr::rdata::A;
+        use hickory_proto::rr::{Name, RData, Record};
+
+        for serve_stale in [false, true] {
+            let silent = upstream(|_| Vec::new()).await;
+            let engine = engine_from_json(serde_json::json!({
+                "settings": {
+                    "default_upstream": silent.address,
+                    "upstream_timeout_ms": 300,
+                    "enable_tcp_fallback": false,
+                    "serve_stale": serve_stale
+                },
+                "pipelines": []
+            }));
+            let fresh = std::net::Ipv4Addr::new(192, 0, 2, 67);
+            let name = Name::from_ascii("stale.com.").unwrap();
+            let mut answer = Message::new(0, MessageType::Response, OpCode::Query);
+            answer.add_query(Query::query(name.clone(), RecordType::A));
+            answer.add_answer(Record::from_rdata(name, 300, RData::A(A(fresh))));
+            let entry = Arc::new(CacheEntry {
+                bytes: Bytes::from(answer.to_vec().unwrap()),
+                inserted_at: Instant::now(),
+                original_ttl: 300,
+                ..(*stale_entry("default")).clone()
+            });
+            let slot = stale_com_keys(&engine).slot;
+            // RD 置位，和 `QueryFlags::RECURSIVE` 一样 / RD set, as in `QueryFlags::RECURSIVE`
+            let mut packet = stale_com_query();
+            packet[2] = 0x01;
+            let peer = |last| SocketAddr::from(([10, 0, 0, last], 53000));
+            let (one, two, ()) = tokio::join!(
+                ask(&engine, &packet, peer(1)),
+                ask(&engine, &packet, peer(2)),
+                async {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    engine.cache_insert(slot, entry);
+                }
+            );
+            assert_eq!(
+                [first_a(&one), first_a(&two)],
+                [Some(fresh); 2],
+                "serve_stale {serve_stale}"
+            );
+        }
+    }
+
     /// 只有 `stale.com` 一条过期应答的引擎，`settings` 决定 serve_stale 的几个设置；连同查它用的上下文
     /// An engine holding one expired answer for `stale.com`, `settings` setting the
     /// serve_stale options; with the context to look it up
@@ -5974,7 +5939,7 @@ mod tests {
             let state = engine.state.load_full();
             let context = stale_com_lookup(&state, &peer, slot);
             assert_eq!(
-                phases::check_stale_cache_logged(&engine, &context, &mut Default::default())
+                phases::check_cache_after_failure(&engine, &context, &mut Default::default())
                     .is_some(),
                 served,
                 "expire_ttl {expire_ttl}: the fallback"
@@ -5986,7 +5951,7 @@ mod tests {
             engine.cache_insert(slot, stale_entry("default"));
             assert_eq!(
                 matches!(
-                    phases::check_cache_logged(&engine, &context, &mut Default::default()),
+                    phases::check_cache(&engine, &context, &mut Default::default()),
                     phases::Looked::Answered(_)
                 ),
                 served,
@@ -6018,11 +5983,11 @@ mod tests {
                 let state = engine.state.load_full();
                 let context = stale_com_lookup(&state, &peer, slot);
                 let served = if fallback {
-                    phases::check_stale_cache_logged(&engine, &context, &mut Default::default())
+                    phases::check_cache_after_failure(&engine, &context, &mut Default::default())
                         .is_some()
                 } else {
                     matches!(
-                        phases::check_cache_logged(&engine, &context, &mut Default::default()),
+                        phases::check_cache(&engine, &context, &mut Default::default()),
                         phases::Looked::Answered(_)
                     )
                 };
@@ -6077,14 +6042,14 @@ mod tests {
             };
             engine.cache_insert(dedupe_hash, entry.clone());
             assert_eq!(
-                phases::check_stale_cache_logged(&engine, &context, &mut Default::default())
+                phases::check_cache_after_failure(&engine, &context, &mut Default::default())
                     .is_some(),
                 served,
                 "{rcode}: the fallback"
             );
             assert_eq!(
                 matches!(
-                    phases::check_cache_logged(&engine, &context, &mut Default::default()),
+                    phases::check_cache(&engine, &context, &mut Default::default()),
                     phases::Looked::Answered(_)
                 ),
                 served,
@@ -6367,30 +6332,47 @@ mod tests {
         );
     }
 
+    /// `test_p` 里 `qname` 的 A 查询、请求方判定为 `requester` 的规则缓存问题 / The rule cache question
+    /// of an A query for `qname` in `test_p`, the requester judged as `requester`
+    fn rule_question<'a>(
+        pipeline_id: &'a Arc<str>,
+        qname: &'a str,
+        requester: RequesterKey,
+    ) -> crate::engine::rules::RuleQuestion<'a> {
+        crate::engine::rules::RuleQuestion::new(
+            0,
+            pipeline_id,
+            qname,
+            RecordType::A,
+            DNSClass::IN,
+            requester,
+        )
+    }
+
+    fn no_records() -> Decision {
+        Decision::Static {
+            rcode: ResponseCode::NoError,
+            answers: vec![],
+        }
+    }
+
     #[test]
     fn test_rule_cache_entry_matches_respects_the_requester_key() {
         let pipeline_id: Arc<str> = Arc::from("test_p");
         let qname = "example.com";
-        let qtype = RecordType::A;
-        let qclass = DNSClass::IN;
-        let entry = |requester| RuleCacheEntry {
-            pipeline_id: pipeline_id.clone(),
-            qname: qname.as_bytes().into(),
-            qtype: u16::from(qtype),
-            qclass: u16::from(qclass),
-            requester,
-            decision: Decision::Static {
-                rcode: ResponseCode::NoError,
-                answers: vec![],
-            },
-            expires_at: None,
+        let entry = |requester| {
+            RuleCacheEntry::new(
+                &rule_question(&pipeline_id, qname, requester),
+                no_records(),
+                None,
+            )
         };
         let class = |class| RequesterKey {
             class: Some(class),
             ..RequesterKey::NONE
         };
         let matches = |entry: &RuleCacheEntry, key: RequesterKey| {
-            entry.matches("test_p", qname, qtype, qclass, &key)
+            entry.answers(&rule_question(&pipeline_id, qname, key), Instant::now())
         };
 
         // An entry without requester facts matches only a key without them
@@ -6410,26 +6392,18 @@ mod tests {
     /// its last character is no match
     #[test]
     fn test_rule_cache_entry_matches_only_its_whole_name() {
+        let pipeline_id: Arc<str> = Arc::from("test_p");
         let long = format!("{}.example", "a".repeat(60));
         for name in ["short.example", long.as_str()] {
             let entry = RuleCacheEntry::new(
-                Arc::from("test_p"),
-                name,
-                RecordType::A,
-                DNSClass::IN,
-                RequesterKey::NONE,
-                Decision::Static {
-                    rcode: ResponseCode::NoError,
-                    answers: vec![],
-                },
+                &rule_question(&pipeline_id, name, RequesterKey::NONE),
+                no_records(),
+                None,
             );
             let matches = |asked: &str| {
-                entry.matches(
-                    "test_p",
-                    asked,
-                    RecordType::A,
-                    DNSClass::IN,
-                    &RequesterKey::NONE,
+                entry.answers(
+                    &rule_question(&pipeline_id, asked, RequesterKey::NONE),
+                    Instant::now(),
                 )
             };
             assert!(matches(name));
@@ -6440,49 +6414,20 @@ mod tests {
 
     #[test]
     fn test_rule_cache_expiration() {
-        // Arrange: Define test data
         let pipeline_id: Arc<str> = Arc::from("test_p");
-        let qname = "expire.com";
-        let qtype = RecordType::A;
-        let qclass = DNSClass::IN;
-        let decision = Decision::Static {
-            rcode: ResponseCode::NoError,
-            answers: vec![],
-        };
+        let question = rule_question(&pipeline_id, "expire.com", RequesterKey::NONE);
+        let now = Instant::now();
 
-        // Arrange: Expired entry
-        let entry_expired = RuleCacheEntry {
-            pipeline_id: pipeline_id.clone(),
-            qname: qname.as_bytes().into(),
-            qtype: u16::from(qtype),
-            qclass: u16::from(qclass),
-            requester: RequesterKey::NONE,
-            decision: decision.clone(),
-            expires_at: Some(Instant::now() - Duration::from_secs(1)),
-        };
-
-        // Act & Assert: Expired entry should not match
+        let expired =
+            RuleCacheEntry::new(&question, no_records(), Some(now - Duration::from_secs(1)));
         assert!(
-            !entry_expired.matches("test_p", qname, qtype, qclass, &RequesterKey::NONE),
+            !expired.answers(&question, now),
             "Expired entry should not match"
         );
 
-        // Arrange: Fresh entry
-        let entry_fresh = RuleCacheEntry {
-            pipeline_id: pipeline_id.clone(),
-            qname: qname.as_bytes().into(),
-            qtype: u16::from(qtype),
-            qclass: u16::from(qclass),
-            requester: RequesterKey::NONE,
-            decision,
-            expires_at: Some(Instant::now() + Duration::from_secs(60)),
-        };
-
-        // Act & Assert: Fresh entry should match
-        assert!(
-            entry_fresh.matches("test_p", qname, qtype, qclass, &RequesterKey::NONE),
-            "Fresh entry should match"
-        );
+        let fresh =
+            RuleCacheEntry::new(&question, no_records(), Some(now + Duration::from_secs(60)));
+        assert!(fresh.answers(&question, now), "Fresh entry should match");
     }
 
     /// 测试 DNS 响应缓存键包含 QCLASS

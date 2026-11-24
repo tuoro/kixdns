@@ -139,21 +139,14 @@ pub(crate) fn decision_detail(decision: &Decision) -> DecisionDetail<'_> {
 
 /// Transport to attribute to a forward decision: `None` when any listed
 /// address carries its own `scheme://` prefix (the prefix wins when the
-/// query is sent), otherwise the configured transport, UDP by default. This
-/// mirrors what `forward_upstream` will actually select.
-/// 转发决策应报告的传输：任一地址带前缀时为 None（发送时前缀优先），否则为配置的传输，默认 UDP。
-pub(crate) fn reported_transport(
-    upstream: &str,
-    transport: Option<Transport>,
-) -> Option<Transport> {
-    if upstream
+/// query is sent), otherwise the decision's transport. This mirrors what
+/// `forward_upstream` will actually select.
+/// 转发决策应报告的传输：任一地址带前缀时为 None（发送时前缀优先），否则为决策的传输。
+pub(crate) fn reported_transport(upstream: &str, transport: Transport) -> Option<Transport> {
+    (!upstream
         .split(',')
-        .any(|addr| has_transport_prefix(addr.trim()))
-    {
-        None
-    } else {
-        Some(transport.unwrap_or(Transport::Udp))
-    }
+        .any(|addr| has_transport_prefix(addr.trim())))
+    .then_some(transport)
 }
 
 /// Report the decision a pipeline reached. `rule` is the deciding rule, or
