@@ -12,7 +12,7 @@ use tracing::debug;
 use super::Engine;
 use super::concurrency::GaveUp;
 use super::transport::UdpExchange;
-use crate::config::{Transport, parse_upstream_addr, split_upstreams};
+use crate::config::{ForwardTarget, Transport, parse_upstream_addr};
 use crate::observe::{
     UpstreamAttempt, UpstreamOutcome, UpstreamResult, UpstreamSkipReason, UpstreamSkipped,
 };
@@ -212,7 +212,7 @@ pub(crate) struct PoolKeys {
 pub(crate) fn upstreams(
     cfg: &crate::matcher::RuntimePipelineConfig,
 ) -> rustc_hash::FxHashSet<(&str, Transport)> {
-    let default = cfg.settings.default_upstream.as_str();
+    let default = &cfg.settings.default_upstream;
     let forwards = cfg
         .pipelines
         .iter()
@@ -223,13 +223,13 @@ pub(crate) fn upstreams(
                 upstream,
                 transport,
                 ..
-            } => Some((upstream.as_deref().unwrap_or(default), *transport)),
+            } => Some((upstream.as_ref().unwrap_or(default), *transport)),
             _ => None,
         });
     std::iter::once((default, None))
         .chain(forwards)
         .flat_map(|(upstreams, transport)| {
-            split_upstreams(upstreams).map(move |upstream| {
+            upstreams.pre_split_upstreams.iter().map(move |upstream| {
                 parse_upstream_addr(upstream, transport.unwrap_or(Transport::Udp))
             })
         })
@@ -405,9 +405,8 @@ pub async fn forward_upstream(
     engine: &Engine,
     settings: &crate::config::GlobalSettings,
     packet: &[u8],
-    upstream: &str,
+    target: &ForwardTarget,
     transport: Transport,
-    pre_split_upstreams: Option<&std::sync::Arc<Vec<std::sync::Arc<str>>>>,
     observed: Observed<'_>,
     asker: Option<std::net::IpAddr>,
 ) -> anyhow::Result<(Bytes, Arc<str>)> {
@@ -416,7 +415,7 @@ pub async fn forward_upstream(
         (Some(client), Some(flow)) => {
             match engine
                 .permit_manager
-                .ask(flow, client, upstream, timeout_dur)
+                .ask(flow, client, &target.upstream, timeout_dur)
             {
                 Some(asking) => Some(asking),
                 None => return Err(UpstreamFailure::withheld(Withheld::NotAsked)),
@@ -436,10 +435,9 @@ pub async fn forward_upstream(
     let mut forward = std::pin::pin!(forward_upstream_as_is(
         engine,
         &packet,
-        upstream,
+        &target.pre_split_upstreams,
         timeout_dur,
         transport,
-        pre_split_upstreams,
         observed,
         settings.enable_tcp_fallback,
     ));
@@ -538,25 +536,13 @@ pub(crate) fn is_failure_reply_packet(reply: &[u8]) -> bool {
 async fn forward_upstream_as_is(
     engine: &Engine,
     packet: &[u8],
-    upstream: &str,
+    upstreams: &[Arc<str>],
     timeout_dur: Duration,
     default_transport: Transport,
-    pre_split_upstreams: Option<&std::sync::Arc<Vec<std::sync::Arc<str>>>>,
     observed: Observed<'_>,
     tcp_fallback: bool,
 ) -> anyhow::Result<(Bytes, Arc<str>)> {
-    // 使用预分割数据或动态分割 / Use pre-split data or dynamic splitting
-    // 使用 Arc<str> 避免克隆 / Use Arc<str> to avoid cloning
-    let upstreams: Upstreams = if let Some(pre_split) = pre_split_upstreams {
-        pre_split.iter().cloned().collect()
-    } else if !upstream.contains(',') {
-        // 单个上游：直接转发 / Single upstream: direct forward
-        smallvec::smallvec![std::sync::Arc::from(upstream)]
-    } else {
-        split_upstreams(upstream)
-            .map(std::sync::Arc::from)
-            .collect()
-    };
+    let upstreams: Upstreams = upstreams.iter().cloned().collect();
     // 剩下一个上游时，它走下面只有一个上游的那条路，和只写了这一个上游一样
     // With one upstream left it takes the single-upstream path below, as if it were the
     // only one written
@@ -1500,7 +1486,7 @@ mod tests {
     /// 测试引擎的设置 / The settings of a test engine
     fn test_settings(enable_tcp_fallback: bool) -> GlobalSettings {
         GlobalSettings {
-            default_upstream: "127.0.0.1:0".to_string(),
+            default_upstream: "127.0.0.1:0".into(),
             enable_tcp_fallback,
             udp_pool_size: 1,
             tcp_pool_size: 1,
@@ -1529,7 +1515,7 @@ mod tests {
     #[tokio::test]
     async fn a_reply_seen_later_than_the_upstreams_timeout_is_not_noted() {
         let settings = GlobalSettings {
-            default_upstream: "127.0.0.1:0".to_string(),
+            default_upstream: "127.0.0.1:0".into(),
             flow_control_enabled: true,
             ..GlobalSettings::default()
         };
@@ -2120,9 +2106,8 @@ mod tests {
                     ..test_settings(false)
                 },
                 &packet,
-                &upstream,
+                &ForwardTarget::new(&upstream),
                 Transport::Udp,
-                None,
                 None,
                 None,
             )
@@ -2177,9 +2162,8 @@ mod tests {
                     ..test_settings(false)
                 },
                 &packet,
-                &upstreams.map(String::as_str).join(","),
+                &ForwardTarget::new(&upstreams.map(String::as_str).join(",")),
                 Transport::Udp,
-                None,
                 None,
                 None,
             )
@@ -2219,9 +2203,8 @@ mod tests {
                     ..test_settings(fallback)
                 },
                 &packet,
-                &addr.to_string(),
+                &ForwardTarget::new(&addr.to_string()),
                 Transport::Udp,
-                None,
                 None,
                 None,
             )

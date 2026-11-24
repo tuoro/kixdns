@@ -501,7 +501,7 @@ async fn an_unreadable_mmdb_is_read_again_only_once_it_changes() {
             json!({ "geoip_db_path": mmdb.to_str().unwrap() }),
             json!({ "type": "geoip_country", "country_codes": ["JP"] }),
         );
-        cfg.settings.default_upstream = upstream.to_string();
+        cfg.settings.default_upstream = upstream.into();
         cfg
     };
     // 状态里的 GeoIP 数据，读了一遍就是新的一份 / The GeoIP data in the state, a new one for every read
