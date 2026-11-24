@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
-use crate::config::{Action, Transport};
+use crate::config::{Action, ForwardTarget, Transport};
 use crate::engine::rules::{Decision, ResponseActionResult, RuleCacheRecord};
 use crate::observe::{
     DecisionDetail, DecisionKind, DecisionMade, EngineObserver, RequestContext, RequestOutcome,
@@ -109,21 +109,23 @@ pub(crate) fn decision_detail(decision: &Decision) -> DecisionDetail<'_> {
             target, transport, ..
         } => DecisionDetail::Forward {
             upstream: target.upstream(),
-            transport: reported_transport(target.upstream(), *transport),
+            transport: reported_transport(target, *transport),
         },
         Decision::Jump { pipeline } => DecisionDetail::Jump { pipeline },
     }
 }
 
-/// Transport to attribute to a forward decision: `None` when any listed
-/// address carries its own `scheme://` prefix (the prefix wins when the
-/// query is sent), otherwise the decision's transport. This mirrors what
-/// `forward_upstream` will actually select.
-/// 转发决策应报告的传输：任一地址带前缀时为 None（发送时前缀优先），否则为决策的传输。
-pub(crate) fn reported_transport(upstream: &str, transport: Transport) -> Option<Transport> {
-    (!upstream
-        .split(',')
-        .any(|addr| crate::config::split_scheme(addr.trim()).is_some()))
+/// 转发决策应报告的传输：`target` 拆好的任一地址带前缀时为 None（发送时前缀优先），否则为决策的传输。
+/// 和 forward_upstream 发送时选的一致，看的是同一份拆好的地址
+/// Transport to attribute to a forward decision: `None` when any address
+/// `target` is split into carries its own `scheme://` prefix (the prefix wins
+/// when the query is sent), otherwise the decision's transport. This mirrors
+/// what `forward_upstream` selects as it sends, from the same split addresses
+fn reported_transport(target: &ForwardTarget, transport: Transport) -> Option<Transport> {
+    (!target
+        .upstreams()
+        .iter()
+        .any(|addr| crate::config::split_scheme(addr).is_some()))
     .then_some(transport)
 }
 

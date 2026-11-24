@@ -413,10 +413,7 @@ pub async fn forward_upstream(
     let timeout_dur = Duration::from_millis(settings.upstream_timeout_ms);
     let asking = match (asker, &engine.flow_control_state) {
         (Some(client), Some(flow)) => {
-            match engine
-                .permit_manager
-                .ask(flow, client, target.upstream(), timeout_dur)
-            {
+            match engine.permit_manager.ask(flow, client, target, timeout_dur) {
                 Some(asking) => Some(asking),
                 None => return Err(UpstreamFailure::withheld(Withheld::NotAsked)),
             }
@@ -492,16 +489,16 @@ where
     Ok(forwarded)
 }
 
-/// 等别的请求正在做的、给 `upstream` 的同一个转发（`wait`），`client` 是替谁等的，`limit` 是上游的时限。开了流控时还看卡没卡住：
+/// 等别的请求正在做的、给 `target` 的同一个转发（`wait`），`client` 是替谁等的，`limit` 是上游的时限。开了流控时还看卡没卡住：
 /// 卡住了、这台设备留着等的又已经够多时不等了，算上游失败；别的都不管（见 `PermitManager::join`）
-/// Waits on the same forward to `upstream` another request is making (`wait`), `client` being
+/// Waits on the same forward to `target` another request is making (`wait`), `client` being
 /// whom it waits for and `limit` the upstream's timeout. With flow control on it is also seen to
 /// for being stuck: stuck with enough of this device's kept waiting already it waits no more,
 /// which counts as the upstream failing; nothing else is looked at (see `PermitManager::join`)
 pub(crate) async fn wait_for_another<T>(
     engine: &Engine,
     client: std::net::IpAddr,
-    upstream: &str,
+    target: &ForwardTarget,
     limit: Duration,
     wait: impl Future<Output = T>,
 ) -> anyhow::Result<T> {
@@ -512,7 +509,7 @@ pub(crate) async fn wait_for_another<T>(
     // Flow control's wait is allocated on its own: only a query waiting on another's has use for
     // it, and held in the callers every query waiting on an upstream would reserve room for it
     Box::pin(async move {
-        let mut joining = engine.permit_manager.join(flow, client, upstream, limit);
+        let mut joining = engine.permit_manager.join(flow, client, target, limit);
         let wait = std::pin::pin!(wait);
         joining
             .wait(wait)
@@ -1536,7 +1533,8 @@ mod tests {
             Bytes::from(reply.to_vec().expect("encode reply"))
         };
         let (upstream, limit) = ("198.51.100.1:53", Duration::from_millis(900));
-        let stuck_after = || engine.permit_manager.stuck_after(upstream, limit);
+        let target = ForwardTarget::new(upstream);
+        let stuck_after = || engine.permit_manager.stuck_after(&target, limit);
         // 每 8 次收发量一次：16 次里一定有量到的 / One exchange in 8 is timed: of 16, some are
         for _ in 0..16 {
             let seen_late = async {

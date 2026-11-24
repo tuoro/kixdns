@@ -729,7 +729,7 @@ impl<'a> Forwarding<'a> {
             let answer = match crate::engine::upstream::wait_for_another(
                 engine,
                 request.peer.ip(),
-                self.decision.target.upstream(),
+                self.decision.target,
                 request.state.pipeline.upstream_timeout(),
                 waiting,
             )

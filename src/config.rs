@@ -281,6 +281,15 @@ impl ForwardTarget {
         &self.upstreams
     }
 
+    /// 拆好的各个上游各自的地址（去掉前缀），`PermitManager::note_answer_took` 就是按它记的 / The
+    /// address (short of its prefix) of each upstream split, which is what
+    /// `PermitManager::note_answer_took` notes by
+    pub(crate) fn addresses(&self) -> impl Iterator<Item = &str> {
+        self.upstreams
+            .iter()
+            .map(|upstream| parse_upstream_addr(upstream, Transport::Udp).0)
+    }
+
     /// 拆得出至少一个地址 / Splits into at least one address
     pub(crate) fn names_an_address(&self) -> bool {
         !self.upstreams.is_empty()
@@ -2105,13 +2114,6 @@ fn upstream_problem(upstream: &str, default_transport: Transport) -> Option<Stri
     crate::engine::transport::check_upstream_address(address, transport)
         .err()
         .map(|error| format!("upstream \"{upstream}\" is not usable: {error:#}"))
-}
-
-/// 一串上游各自的地址（去掉前缀），`PermitManager::note_answer_took` 就是按它记的 / The address
-/// (short of its prefix) of each of a list of upstreams, which is what
-/// `PermitManager::note_answer_took` notes by
-pub(crate) fn upstream_addresses(upstreams: &str) -> impl Iterator<Item = &str> {
-    split_upstreams(upstreams).map(|upstream| parse_upstream_addr(upstream, Transport::Udp).0)
 }
 
 /// 作答上游的名字（`udp:1.1.1.1:53`，见 `engine::upstream::upstream_label`）里的传输和地址，传输名照
