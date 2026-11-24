@@ -1176,13 +1176,19 @@ pub fn compile(cfg: PipelineConfig) -> Result<RuntimePipelineConfig> {
     Ok(runtime)
 }
 
-/// Validate configuration text exactly as the server loads it: JSON parsing,
-/// normalisation, runtime compilation (matchers, regexes, CIDRs, timeout
-/// sanity) and the listener checks done at startup
-/// ([`GlobalSettings::listeners`]: bind addresses and DoH TLS material).
-/// Errors carry their cause chain; JSON syntax errors include the line and
-/// column. / 按服务器加载配置的方式校验文本：JSON 解析、规范化、运行时编译以及
-/// 启动时的监听检查（绑定地址与 DoH TLS 材料）。错误带完整原因链；JSON 语法错误包含行列位置。
+/// 按热重载的方式校验配置文本（见 [`compile`]）：JSON 解析、配置问题（见 [`problems`]，启动时只记错误、照旧加载，
+/// 这里和重载一样拒绝）、运行时编译（匹配器、正则、网段、超时）以及监听地址和 DoH 的前提（见
+/// [`GlobalSettings::listeners`]：写了证书和私钥的路径）。不读证书、不绑端口：证书读不了、端口绑不上，到启动时才
+/// 知道，那时 DNS 照常答，入站 DoH 不开，控制通道 `config` 结果的 `doh_error` 写着原因。错误带完整原因链；JSON 语法
+/// 错误包含行列位置
+/// Validate configuration text as a hot reload takes it (see [`compile`]): JSON parsing, the
+/// configuration problems (see [`problems`], which startup only logs and loads as before, refused
+/// here as on a reload), runtime compilation (matchers, regexes, CIDRs, timeouts) and the
+/// listener addresses and DoH prerequisites (see [`GlobalSettings::listeners`]: paths written
+/// for the certificate and key). No certificate is read and no port bound: one that cannot be
+/// read, or a port that cannot be bound, shows at startup, when DNS answers as usual without
+/// inbound DoH and the control channel's `config` result gives the reason as `doh_error`.
+/// Errors carry their cause chain; JSON syntax errors include the line and column
 pub fn validate(raw: &str) -> Result<ValidationReport> {
     let cfg = parse_config(raw)?;
     let version = cfg.version.clone();
