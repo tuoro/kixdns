@@ -1945,9 +1945,13 @@ pub async fn serve_admin(
         let stream = match listener.accept().await {
             Ok((stream, _)) => stream,
             Err(err) => {
-                // Never end the loop on an accept error (see accept_retry_delay)
-                // 接受出错不退出循环（见 accept_retry_delay）
-                tracing::warn!(error = %err, "control socket accept failed, retrying");
+                // 接受出错不退出循环，记法和 TCP 监听器一样（见 `listeners::tcp::run_tcp`）/ Never end the loop
+                // on an accept error, logged as the TCP listener logs it (see `listeners::tcp::run_tcp`)
+                crate::warn_sparse!(
+                    event = "control_socket_accept_failed",
+                    error = %err,
+                    "control socket accept failed, retrying"
+                );
                 tokio::time::sleep(crate::socket_utils::accept_retry_delay(&err)).await;
                 continue;
             }

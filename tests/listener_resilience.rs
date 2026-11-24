@@ -3,12 +3,12 @@
 //! Runs the real binary under a low descriptor limit, uses up its descriptors
 //! with DNS-over-TCP connections, has the DoH listener and the control socket
 //! hit the same accept error, then lets the connections go. Every listener must
-//! answer again, and the TCP and DoH listeners, meeting the error every 100 ms
-//! meanwhile, log it once in a while rather than each time.
+//! answer again, and the TCP and DoH listeners and the control socket, meeting
+//! the error every 100 ms meanwhile, log it once in a while rather than each time.
 //!
 //! 监听口熬得过接受出错：在压低的句柄上限下跑真的程序，用 DNS over TCP 连接把句柄用光，让 DoH
-//! 监听口和控制通道也碰上同一个接受错误，再把连接放掉，每个监听口都要能再应答；这期间 TCP 和 DoH
-//! 监听口每 100 ms 碰上一次这个错误，隔一阵才记一条，不是每次都记。
+//! 监听口和控制通道也碰上同一个接受错误，再把连接放掉，每个监听口都要能再应答；这期间 TCP、DoH
+//! 监听口和控制通道每 100 ms 碰上一次这个错误，隔一阵才记一条，不是每次都记。
 #![cfg(unix)]
 
 use std::io::{Read, Write};
@@ -198,10 +198,12 @@ async fn listeners_answer_again_after_running_out_of_descriptors() {
         &(Ipv4Addr::LOCALHOST, doh_port).into(),
         Duration::from_millis(500),
     );
-    let control_probe = UnixStream::connect(&control);
+    // 连上几个，控制通道每接受一个都碰上这个错误 / Several connect, and the control socket meets
+    // the error on accepting each
+    let control_probes: Vec<_> = (0..5).map(|_| UnixStream::connect(&control)).collect();
     tokio::time::sleep(Duration::from_millis(300)).await;
     drop(doh_probe);
-    drop(control_probe);
+    drop(control_probes);
     drop(held);
 
     assert!(
@@ -224,4 +226,5 @@ async fn listeners_answer_again_after_running_out_of_descriptors() {
     let logged = |what: &str| log.lines().filter(|line| line.contains(what)).count();
     assert_eq!(logged("tcp accept failed"), 1, "{log}");
     assert!(logged("DoH accept failed") <= 1, "{log}");
+    assert!(logged("control socket accept failed") <= 1, "{log}");
 }
