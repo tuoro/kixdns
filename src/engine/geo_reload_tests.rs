@@ -1018,6 +1018,67 @@ async fn geo_data_warnings_say_what_is_missing_or_unreadable() {
     assert_eq!(engine.geo_data_warnings(), Vec::<String>::new());
 }
 
+/// 数据文件经符号链接改指到监视不上的地方（目录不存在）以后，Geo 数据的问题里说它在那里监视不上，指回监视得上的地方以后
+/// 这句话去掉，和配置文件的 `watch_error` 一样。说的是这一个文件：别的文件监视得好好的，不会把它去掉
+/// Once a data file is pointed, through a symlink, somewhere that cannot be watched (a
+/// directory that does not exist), the Geo data's problems say it cannot be watched there, and
+/// once it points back somewhere watchable the sentence goes, as the configuration file's
+/// `watch_error` does. It speaks of that one file: another file being watched well does not
+/// take it away
+#[cfg(unix)]
+#[tokio::test]
+async fn a_data_file_leading_where_nothing_can_be_watched_is_reported() {
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir().unwrap();
+    let (conf, good) = (dir.path().join("conf"), dir.path().join("good"));
+    std::fs::create_dir(&conf).unwrap();
+    std::fs::create_dir(&good).unwrap();
+    std::fs::write(
+        good.join("first.dat"),
+        geosite_dat(&[("ads", "first.test")]),
+    )
+    .unwrap();
+    let (first, last) = (conf.join("first.dat"), dir.path().join("last.dat"));
+    symlink(good.join("first.dat"), &first).unwrap();
+    std::fs::write(&last, geosite_dat(&[("cn", "cn1.test")])).unwrap();
+    let point_at = |target: &Path| {
+        let tmp = conf.join("first.dat.tmp");
+        symlink(target, &tmp).unwrap();
+        std::fs::rename(&tmp, &first).unwrap();
+    };
+    let engine = engine(geosite_config_any_of(&[&first, &last], &["ads", "cn"]));
+    assert_eq!(engine.geo_data_warnings(), Vec::<String>::new());
+
+    point_at(&dir.path().join("missing").join("first.dat"));
+    let said = format!(
+        "GeoSite data file {} cannot be watched where it now leads",
+        first.display()
+    );
+    let unwatched = || {
+        engine
+            .geo_data_warnings()
+            .iter()
+            .any(|sentence| sentence.starts_with(&said))
+    };
+    wait_for("the status says first.dat cannot be watched", unwatched).await;
+
+    // last.dat 照常监视、读进来，first.dat 那句留着 / last.dat is watched and read in as
+    // usual, and first.dat's sentence stays
+    replace(&last, &geosite_dat(&[("cn", "cn2.test")]));
+    wait_for("last.dat is read in", || {
+        engine.geo().geosite.matches("cn", "x.cn2.test")
+    })
+    .await;
+    assert!(unwatched(), "{:?}", engine.geo_data_warnings());
+
+    point_at(&good.join("first.dat"));
+    wait_for("the sentence goes once first.dat is watched again", || {
+        engine.geo_data_warnings().is_empty()
+    })
+    .await;
+    assert!(engine.geo().geosite.matches("ads", "x.first.test"));
+}
+
 /// 配置了却不存在、读不了的 Geo 数据文件和 MMDB 记成错误：默认日志级别是 error，记成 warn 的话没开面板时谁也看不到。
 /// 以前都记成 warn
 /// Geo data files and an MMDB that are configured yet not there or unreadable are logged as
