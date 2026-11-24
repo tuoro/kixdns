@@ -10,11 +10,12 @@ on:
 permissions:
   contents: write
 
-# PR 上新的提交取消旧的检查；推到 main 的每次都跑完
-# On a pull request a new commit cancels the older checks; every push to main runs to the end
+# 同一分支上新的推送取消旧的运行：PR 只看最新的提交，main 上也只有最新那次的产物有用
+# A newer push to the same branch cancels the older run: a pull request is judged on its
+# newest commit, and on main only the newest build's artifacts are of any use
 concurrency:
-  group: build-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   # 正式构建出的是发版用的二进制，只在推到 main 和手动触发时跑；PR 上由 cross-check 只编译、不出产物
