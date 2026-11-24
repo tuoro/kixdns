@@ -964,37 +964,63 @@ impl GlobalSettings {
 
     /// Parse the listener addresses and check the DoH prerequisites the way
     /// server startup does; a configuration that fails here cannot be served.
-    /// Both the server and [`validate`] call this. Each error starts with the
-    /// setting it is about, as `settings.bind_udp: "localhost:53" …`.
+    /// Startup and [`compile`] both call this. The error lists every setting
+    /// that fails (see [`Problems`]), each starting with the setting it is
+    /// about, as `settings.bind_udp: "localhost:53" …`.
     /// 按服务器启动的方式解析监听地址并检查 DoH 前置条件；此处失败的配置无法启动。
-    /// 服务器与 [`validate`] 都调用它。每个错误开头写着说的是哪个设置，如 `settings.bind_udp: "localhost:53" …`。
-    pub fn listeners(&self) -> anyhow::Result<ListenerConfig> {
+    /// 启动和 [`compile`] 都调用它。错误列出每个不对的设置（见 [`Problems`]），每条开头写着说的是哪个设置，
+    /// 如 `settings.bind_udp: "localhost:53" …`。
+    pub fn listeners(&self) -> Result<ListenerConfig, Problems> {
         let address = |setting: &str, value: &str| {
-            value.parse::<SocketAddr>().with_context(|| {
-                format!("settings.{setting}: \"{value}\" is not an IP address and port")
+            value.parse::<SocketAddr>().map_err(|err| {
+                format!("settings.{setting}: \"{value}\" is not an IP address and port: {err}")
             })
         };
-        let udp = address("bind_udp", &self.bind_udp)?;
-        let tcp = address("bind_tcp", &self.bind_tcp)?;
-        let doh = match &self.bind_doh {
-            Some(bind_doh) => {
-                let required = |setting: &str, value: &Option<String>| {
-                    value.clone().with_context(|| {
-                        format!(
-                            "settings.{setting}: not set, though settings.bind_doh is \"{bind_doh}\" and DoH needs it"
-                        )
-                    })
-                };
-                Some(DohListenerConfig {
-                    bind: address("bind_doh", bind_doh)?,
-                    tls_cert: required("doh_tls_cert", &self.doh_tls_cert)?,
-                    tls_key: required("doh_tls_key", &self.doh_tls_key)?,
-                    path: self.doh_path.clone(),
+        let udp = address("bind_udp", &self.bind_udp);
+        let tcp = address("bind_tcp", &self.bind_tcp);
+        let doh = self.bind_doh.as_deref().map(|bind_doh| {
+            let required = |setting: &str, value: &Option<String>| {
+                value.clone().ok_or_else(|| {
+                    format!(
+                        "settings.{setting}: not set, though settings.bind_doh is \"{bind_doh}\" and DoH needs it"
+                    )
                 })
+            };
+            (
+                address("bind_doh", bind_doh),
+                required("doh_tls_cert", &self.doh_tls_cert),
+                required("doh_tls_key", &self.doh_tls_key),
+            )
+        });
+        match (udp, tcp, doh) {
+            (Ok(udp), Ok(tcp), None) => Ok(ListenerConfig {
+                udp,
+                tcp,
+                doh: None,
+            }),
+            (Ok(udp), Ok(tcp), Some((Ok(bind), Ok(tls_cert), Ok(tls_key)))) => Ok(ListenerConfig {
+                udp,
+                tcp,
+                doh: Some(DohListenerConfig {
+                    bind,
+                    tls_cert,
+                    tls_key,
+                    path: self.doh_path.clone(),
+                }),
+            }),
+            (udp, tcp, doh) => {
+                let doh = doh
+                    .into_iter()
+                    .flat_map(|(bind, cert, key)| [bind.err(), cert.err(), key.err()]);
+                Err(Problems(
+                    [udp.err(), tcp.err()]
+                        .into_iter()
+                        .chain(doh)
+                        .flatten()
+                        .collect(),
+                ))
             }
-            None => None,
-        };
-        Ok(ListenerConfig { udp, tcp, doh })
+        }
     }
 
     /// 不写 `request_timeout_ms` 时的整体超时（毫秒）：上游超时的两倍半，三分之一处重发、等满一段、失败了再用 TCP 等一段，
@@ -1027,18 +1053,21 @@ impl GlobalSettings {
     }
 
     /// 设置自身是否说得通：取值范围、相互之间的关系，以及只在启动时读、却得和建引擎时的前提一致的那几项。编译配置的第一步，
-    /// 启动、热重载和面板校验都经过这里。每个错误是一行英文，开头写着设置和它的值，如 `settings.cache_capacity: 0 …`，
-    /// 和 [`problems`] 的写法一样
+    /// 启动、热重载和面板校验都经过这里。错误列出每个说不通的设置（见 [`Problems`]），每条是一行英文，开头写着设置和它的值，
+    /// 如 `settings.cache_capacity: 0 …`，和 [`problems`] 的写法一样
     /// Whether the settings make sense on their own: their ranges, how they relate, and the few read
     /// only at startup that must agree with what building the engine needs. The first step of
     /// compiling a configuration, which startup, hot reloads and panel validation all go through.
-    /// Each error is a line in English starting with the setting and its value, as
-    /// `settings.cache_capacity: 0 …`, written as [`problems`] are
-    pub fn validate(&self) -> anyhow::Result<()> {
+    /// The error lists every setting that makes no sense (see [`Problems`]), each a line in
+    /// English starting with the setting and its value, as `settings.cache_capacity: 0 …`,
+    /// written as [`problems`] are
+    pub fn validate(&self) -> Result<(), Problems> {
+        let mut found = Vec::new();
         // Validate cache_capacity configuration
         if self.cache_capacity == 0 {
-            anyhow::bail!(
+            found.push(
                 "settings.cache_capacity: 0 leaves the cache no room for any answer; it must be greater than 0"
+                    .to_owned(),
             );
         }
         // cache_max_ttl = 0 会让每条应答的缓存 TTL 归零，等于静默关掉缓存，
@@ -1046,8 +1075,9 @@ impl GlobalSettings {
         // cache_max_ttl = 0 clamps every entry's TTL to zero, silently disabling
         // the cache, which is no more a valid configuration than cache_capacity = 0.
         if self.cache_max_ttl == 0 {
-            anyhow::bail!(
+            found.push(
                 "settings.cache_max_ttl: 0 holds the TTL of every answer cached to 0, leaving the cache unused; it must be greater than 0"
+                    .to_owned(),
             );
         }
         // 阈值是条目 TTL 的百分比，刷新条件是剩余 TTL 低于它。取 100 时阈值等于
@@ -1059,10 +1089,10 @@ impl GlobalSettings {
         // above 100, every cache hit triggers a refresh and the upstream carries
         // the client's full load. Use cache_background_refresh to turn it off.
         if self.cache_refresh_threshold_percent >= 100 {
-            anyhow::bail!(
+            found.push(format!(
                 "settings.cache_refresh_threshold_percent: {} makes every cache hit refresh upstream; it must be below 100",
                 self.cache_refresh_threshold_percent
-            );
+            ));
         }
         // upstream_timeout_ms = 0 让每次上游请求在发出的同一刻就超时，任何查询
         // 都不可能拿到应答。它没有"不限时"的含义，那是 request_timeout_ms 留空
@@ -1071,8 +1101,9 @@ impl GlobalSettings {
         // is issued, so no query can ever be answered. It does not mean "no
         // limit"; leaving request_timeout_ms unset is what derives a budget.
         if self.upstream_timeout_ms == 0 {
-            anyhow::bail!(
+            found.push(
                 "settings.upstream_timeout_ms: 0 expires every upstream request as it is sent; it must be greater than 0"
+                    .to_owned(),
             );
         }
         // 只在启动时读的设置，校验得和建引擎时的前提一致：校验放过了、建引擎时才出错的值，热重载和面板保存都会
@@ -1086,17 +1117,17 @@ impl GlobalSettings {
         // `hold_to_limits`)
         let shards = self.dashmap_shards;
         if shards != 0 && !(shards.is_power_of_two() && shards >= 2) {
-            anyhow::bail!(
+            found.push(format!(
                 "settings.dashmap_shards: {shards} is neither 0 (the default) nor a power of two from 2 to {MAX_DASHMAP_SHARDS}"
-            );
+            ));
         }
         let doq_idle = self.doq_connection_idle_timeout_seconds;
         if doq_idle > 0
             && quinn::IdleTimeout::try_from(std::time::Duration::from_secs(doq_idle)).is_err()
         {
-            anyhow::bail!(
+            found.push(format!(
                 "settings.doq_connection_idle_timeout_seconds: {doq_idle} is more than QUIC can carry"
-            );
+            ));
         }
 
         // Validate request_timeout >= upstream_timeout
@@ -1104,12 +1135,12 @@ impl GlobalSettings {
         if let Some(request_timeout) = self.request_timeout_ms
             && request_timeout < self.upstream_timeout_ms
         {
-            anyhow::bail!(
+            found.push(format!(
                 "settings.request_timeout_ms: {request_timeout} is less than settings.upstream_timeout_ms ({upstream}); it must be at least that",
                 upstream = self.upstream_timeout_ms
-            );
+            ));
         }
-        Ok(())
+        Problems::refuse(found)
     }
 }
 
@@ -1381,24 +1412,53 @@ pub struct ValidationReport {
 }
 
 /// 一份配置编译成运行时配置，热重载、面板的校验和试用都走这里，拒掉的和启动时会让内核起不来的一样：会悄悄做成
-/// 别的事的写法（见 [`problems`]，一条不落地放在错误 [`Problems`] 里）、编译不了的匹配器和正则，以及监听地址和 DoH 的
-/// 前提（见 [`GlobalSettings::listeners`]）。以前热重载不查监听地址，`bind_udp` 写错了照样重载成功，等到重启内核才起不来。
-/// 错误开头就写着是哪个设置或匹配器（`settings.bind_udp: …`、`pipelines[0].rules[2].matchers[1]: …`），不另加前缀，
-/// 和启动时起不来的错误一样。启动不走这里：那时 [`problems`] 记成错误、照样加载
+/// 别的事的写法（见 [`problems`]）、说不通的设置（见 [`GlobalSettings::validate`]）、编译不了的匹配器和正则，以及监听地址和
+/// DoH 的前提（见 [`GlobalSettings::listeners`]）。拒掉时错误是一个 [`Problems`]，这些原因一条不落、一次列全。以前热重载
+/// 不查监听地址，`bind_udp` 写错了照样重载成功，等到重启内核才起不来；一次只报一个设置错误，几处写错要保存好几次才知道。
+/// 每条开头就写着是哪个设置或匹配器（`settings.bind_udp: …`、`pipelines[0].rules[2].matchers[1]: …`），不另加前缀，
+/// 和启动时起不来的错误一样。启动时 [`problems`] 记成错误、照样加载，见 [`compile_at_startup`]
 /// A configuration compiled into its runtime form, which hot reload and the panel's validation
 /// and trial all go through, refusing what would stop the kernel at startup: what silently does
-/// something else (see [`problems`], every one of them in the error, a [`Problems`]), matchers
-/// and regexes that do not compile, and the listener addresses and DoH prerequisites (see
-/// [`GlobalSettings::listeners`]). Hot reload used not to check the listeners, so a mistyped
-/// `bind_udp` reloaded fine and the kernel then failed to start at the next restart. An error
-/// starts with the setting or matcher it is about (`settings.bind_udp: …`,
-/// `pipelines[0].rules[2].matchers[1]: …`) with no prefix added, as one stopping startup does.
-/// Startup does not come here: there [`problems`] are logged as errors and loaded all the same
+/// something else (see [`problems`]), settings that make no sense (see
+/// [`GlobalSettings::validate`]), matchers and regexes that do not compile, and the listener
+/// addresses and DoH prerequisites (see [`GlobalSettings::listeners`]). When refused the error is
+/// a [`Problems`] listing every one of these reasons at once. Hot reload used not to check the
+/// listeners, so a mistyped `bind_udp` reloaded fine and the kernel then failed to start at the
+/// next restart; and one settings error was reported at a time, several mistakes taking as many
+/// saves to learn of. Each starts with the setting or matcher it is about (`settings.bind_udp:
+/// …`, `pipelines[0].rules[2].matchers[1]: …`) with no prefix added, as one stopping startup
+/// does. At startup [`problems`] are logged as errors and loaded all the same, see
+/// [`compile_at_startup`]
 pub fn compile(cfg: PipelineConfig) -> Result<RuntimePipelineConfig> {
-    refuse_problems(&cfg)?;
-    let runtime = RuntimePipelineConfig::from_config(cfg)?;
-    runtime.settings.listeners()?;
+    let found = problems(&cfg);
+    let (runtime, _) = compile_refusing(cfg, found)?;
     Ok(runtime)
+}
+
+/// 启动时编译配置，连同要绑的监听地址：和 [`compile`] 一样一次列全拒掉的原因，只是 [`problems`] 不在里面，由调用方记成
+/// 错误、照样加载（超过上限的设置按上限用），已经在用的配置升级以后照样起得来
+/// The configuration compiled at startup, with the listeners to bind: every reason for refusing
+/// it listed at once as by [`compile`], save that [`problems`] are not among them, being logged as
+/// errors by the caller and loaded all the same (a setting over its limit held to it), so a
+/// configuration in use still starts after an upgrade
+pub fn compile_at_startup(cfg: PipelineConfig) -> Result<(RuntimePipelineConfig, ListenerConfig)> {
+    Ok(compile_refusing(cfg, Vec::new())?)
+}
+
+/// 编译 `cfg`，`refused` 已经有的原因之后再列上设置、匹配器和监听地址的（见 [`compile`]），有一条就拒掉
+/// `cfg` compiled, the reasons of its settings, matchers and listeners listed after those
+/// `refused` holds already (see [`compile`]), refused on any one
+fn compile_refusing(
+    cfg: PipelineConfig,
+    mut refused: Vec<String>,
+) -> Result<(RuntimePipelineConfig, ListenerConfig), Problems> {
+    let listeners = cfg.settings.listeners();
+    let runtime = Problems::gather(&mut refused, RuntimePipelineConfig::from_config(cfg));
+    let listeners = Problems::gather(&mut refused, listeners);
+    match (runtime, listeners) {
+        (Some(runtime), Some(listeners)) if refused.is_empty() => Ok((runtime, listeners)),
+        _ => Err(Problems(refused)),
+    }
 }
 
 /// 按热重载的方式校验配置文本（见 [`compile`]）：JSON 解析、配置问题（见 [`problems`]，启动时只记错误、照样加载，
@@ -1889,23 +1949,42 @@ impl<'de> Visitor<'de> for Unread<'_> {
     }
 }
 
-/// 一份配置因为 [`problems`] 被拒（见 [`refuse_problems`]）：那些问题，每条一句。显示成用 `; ` 连起来的一句；要逐条列出的
+/// 一份配置被拒的原因，每条一句，一次列全（见 [`compile`]）：[`problems`]、说不通的设置（见 [`GlobalSettings::validate`]）、
+/// 监听地址和 DoH 的前提（见 [`GlobalSettings::listeners`]）、编译不了的匹配器。显示成用 `; ` 连起来的一句；要逐条列出的
 /// （控制通道校验的回答和 `config` 结果的 `last_reload`）用 [`Problems::of`] 从错误里取出来
-/// A configuration refused for its [`problems`] (see [`refuse_problems`]): those problems, a
-/// sentence each. It displays as one sentence, the problems joined by `; `; what lists them one
-/// by one (the control channel's validation answer and the `config` result's `last_reload`)
-/// takes them out of the error with [`Problems::of`]
+/// Why a configuration is refused, a sentence each and all of them at once (see [`compile`]):
+/// its [`problems`], settings that make no sense (see [`GlobalSettings::validate`]), the
+/// listener addresses and DoH prerequisites (see [`GlobalSettings::listeners`]), matchers that do
+/// not compile. It displays as one sentence, the reasons joined by `; `; what lists them one by
+/// one (the control channel's validation answer and the `config` result's `last_reload`) takes
+/// them out of the error with [`Problems::of`]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Problems(pub Vec<String>);
 
 impl Problems {
-    /// `error` 是因为这些问题拒掉配置时的那些问题，别的错误时为空 / The problems `error` refused a
+    /// `error` 是拒掉配置时列出的那些原因，别的错误时为空 / The reasons `error` refused a
     /// configuration for, empty for any other error
     pub fn of(error: &anyhow::Error) -> &[String] {
         error
             .downcast_ref::<Self>()
             .map(|problems| problems.0.as_slice())
             .unwrap_or_default()
+    }
+
+    /// `found` 一条都没有时为 Ok，否则为列着它们的 Err / Ok with nothing `found`, otherwise an
+    /// Err listing it all
+    pub(crate) fn refuse(found: Vec<String>) -> Result<(), Self> {
+        if found.is_empty() {
+            Ok(())
+        } else {
+            Err(Self(found))
+        }
+    }
+
+    /// `checked` 拒掉的原因记进 `found`，交回它检查出来的东西，拒掉时为 None / Notes the reasons
+    /// `checked` was refused for in `found`, handing back what it checked out, None when refused
+    pub(crate) fn gather<T>(found: &mut Vec<String>, checked: Result<T, Self>) -> Option<T> {
+        checked.map_err(|Self(more)| found.extend(more)).ok()
     }
 }
 
@@ -1916,17 +1995,6 @@ impl std::fmt::Display for Problems {
 }
 
 impl std::error::Error for Problems {}
-
-/// [`problems`] 有一条就失败，列出全部（见 [`Problems`]）/ Fail on any of [`problems`], listing
-/// them all (see [`Problems`])
-pub fn refuse_problems(cfg: &PipelineConfig) -> Result<()> {
-    let found = problems(cfg);
-    if found.is_empty() {
-        Ok(())
-    } else {
-        Err(Problems(found).into())
-    }
-}
 
 /// 一条规则里几个 forward 的 ecs 写得不一样：它们合成一次转发，只能发一个 ECS，所以一个也不发
 /// A rule whose forwards write different ecs: they merge into one forward, which can send
@@ -2409,9 +2477,9 @@ fn rule_problems(
                 report(format!("cname target \"{target}\" is not a domain name"));
             }
             Action::StaticTxtResponse { text, .. } | Action::ReplaceTxtResponse { text, .. } => {
-                // 不知道会问什么名字，按最短的根名字算 / What will be asked is unknown, so the
-                // shortest name, the root, is taken
-                if let Some(problem) = txt_size_problem(text, 1) {
+                // 按最长的名字算（见 `txt_size_problem`）/ Reckoned with the longest name (see
+                // `txt_size_problem`)
+                if let Some(problem) = txt_size_problem(text) {
                     report(problem);
                 }
             }
@@ -3305,6 +3373,68 @@ mod validation_tests {
                 .expect_err("refused");
             assert!(format!("{err:#}").contains(cause), "{err:#}");
         }
+    }
+
+    /// 一次校验列出全部拒掉的原因（见 `Problems`）：配置问题、说不通的设置、监听地址和 DoH 的前提、编译不了的匹配器，
+    /// 按这个顺序、每条一项。启动时配置问题照样加载，别的一样一次列全、不让启动。以前设置一错就停，min_tll 拼错、
+    /// cache_capacity 和 upstream_timeout_ms 写成 0、bind_udp 写成 localhost:53 的配置要保存四次才知道全部
+    /// One validation lists every reason for refusing (see `Problems`): the configuration
+    /// problems, settings that make no sense, the listener addresses and DoH prerequisites,
+    /// matchers that do not compile, in this order and an entry each. At startup the problems
+    /// load all the same, and the rest is listed all at once too and refuses to start. The first
+    /// settings error used to stop it, so a configuration with min_tll misspelt, cache_capacity and
+    /// upstream_timeout_ms written 0 and bind_udp written localhost:53 took four saves to learn it all
+    #[test]
+    fn one_validation_lists_every_reason_at_once() {
+        let config = serde_json::json!({
+            "settings": {
+                "min_tll": 60,
+                "cache_capacity": 0,
+                "upstream_timeout_ms": 0,
+                "bind_udp": "localhost:53",
+                "bind_tcp": "0.0.0.0",
+                "bind_doh": "0.0.0.0:443"
+            },
+            "pipelines": [{ "id": "main", "rules": [rule(
+                "broken",
+                serde_json::json!([
+                    { "type": "domain_regex", "value": "(" },
+                    { "type": "domain_regex", "value": "[" }
+                ]),
+                serde_json::json!([{ "type": "allow" }])
+            )] }]
+        });
+        let refused = validate(&config.to_string()).expect_err("refused");
+        let reasons = super::Problems::of(&refused);
+        let starts: Vec<&str> = reasons
+            .iter()
+            .map(|reason| {
+                reason
+                    .split_once(": ")
+                    .map_or(reason.as_str(), |(at, _)| at)
+            })
+            .collect();
+        assert_eq!(
+            starts,
+            [
+                "settings.min_tll",
+                "settings.cache_capacity",
+                "settings.upstream_timeout_ms",
+                "pipelines[0].rules[0].matchers[0]",
+                "pipelines[0].rules[0].matchers[1]",
+                "settings.bind_udp",
+                "settings.bind_tcp",
+                "settings.doh_tls_cert",
+                "settings.doh_tls_key",
+            ],
+            "{reasons:#?}"
+        );
+        assert_eq!(format!("{refused:#}"), reasons.join("; "));
+
+        let at_startup =
+            super::compile_at_startup(super::parse_config(&config.to_string()).expect("parses"))
+                .expect_err("does not start");
+        assert_eq!(super::Problems::of(&at_startup), &reasons[1..]);
     }
 
     /// 设置本身说不通时，错误是一行英文，开头写着设置和它的值，和配置问题的写法一样：监听地址、DoH 的前提、取值范围和

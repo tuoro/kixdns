@@ -6,7 +6,6 @@ use hickory_proto::rr::{
 };
 use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
 use std::net::IpAddr;
-use tracing::warn;
 
 use crate::matcher::advanced_rule::{StaticAnswer, StaticRecords};
 use crate::proto_utils::received_ttl;
@@ -218,33 +217,27 @@ const MAX_TXT_SEGMENT: usize = 255;
 /// (RFC 1035 section 4.2.2)
 const MAX_MESSAGE: usize = 65535;
 
-/// 名字编码以后的长度：每个标签多一个长度字节，最后是根标签的一个字节
-/// A name's length once encoded: one length byte more per label, and the root label's one
-/// byte at the end
-pub(crate) fn name_wire_len(name: &Name) -> usize {
-    name.iter().map(|label| label.len() + 1).sum::<usize>() + 1
-}
+/// 一个名字编码以后最长 255 字节（RFC 1035 第 2.3.4 节）/ A name is at most 255 bytes once
+/// encoded (RFC 1035 section 2.3.4)
+const MAX_NAME: usize = 255;
 
-/// 问 `name_len` 字节长的名字时，一条静态 TXT 的 RDATA 最多能有多长：报文去掉报文头 12，问题段（名字加
-/// 类型、类别 4），这条记录的名字（压缩成指针 2）和类型、类别、TTL、RDATA 长度 10，再给交给客户端时可能
-/// 补上的 OPT 11 和它回显的 ECS 选项（最长 4 + 4 + 16）留出地方。所以不管客户端带不带 EDNS，应答都装得下
-/// How long a static TXT's RDATA can be when a name `name_len` bytes long is asked: the
+/// 一条静态 TXT 的 RDATA 最多能有多长：按最长的名字（[`MAX_NAME`]）算，报文去掉报文头 12，问题段（名字加类型、类别 4），
+/// 这条记录的名字（压缩成指针 2）和类型、类别、TTL、RDATA 长度 10，再给交给客户端时可能补上的 OPT 11 和它回显的 ECS
+/// 选项（最长 4 + 4 + 16）留出地方。所以不管问什么名字、客户端带不带 EDNS，应答都装得下
+/// How long a static TXT's RDATA can be, reckoned with the longest name ([`MAX_NAME`]): the
 /// message less the header (12), the question (the name plus type and class, 4), this
 /// record's name (compressed to a pointer, 2) and its type, class, TTL and RDATA length
 /// (10), keeping room for the OPT a client may get (11) and the ECS option it echoes (at
-/// most 4 + 4 + 16). The answer then fits whether the client asked with EDNS or not
-fn txt_room(name_len: usize) -> usize {
-    MAX_MESSAGE.saturating_sub(12 + name_len + 4 + 2 + 10 + 11 + 24)
-}
+/// most 4 + 4 + 16). The answer then fits whatever name is asked, with EDNS or without
+const TXT_ROOM: usize = MAX_MESSAGE - (12 + MAX_NAME + 4 + 2 + 10 + 11 + 24);
 
-/// TXT 内容放不进问 `name_len` 字节长的名字时的应答时说明原因：一段超过 255 字节，或者 RDATA（每段的内容
-/// 加一个长度字节）超过 [`txt_room`]。配置检查不知道会问什么名字，按最短的根名字（1 字节）算：这时还装不下，
-/// 问什么都装不下
-/// Why TXT content does not fit the answer for a name `name_len` bytes long, when it does
-/// not: a segment over 255 bytes, or RDATA (each segment's content plus one length byte)
-/// over [`txt_room`]. The configuration check does not know what will be asked and takes
-/// the shortest name, the root (1 byte): what does not fit then fits no question at all
-pub(crate) fn txt_size_problem(text: &[String], name_len: usize) -> Option<String> {
+/// TXT 内容放不进应答时说明原因：一段超过 255 字节，或者 RDATA（每段的内容加一个长度字节）超过 [`TXT_ROOM`]。配置检查
+/// 报出它（见 `config::problems`），编应答时编成 SERVFAIL（见 `StaticAnswer::txt`），所以编好的 TXT 问什么都装得下
+/// Why TXT content does not fit an answer, when it does not: a segment over 255 bytes, or
+/// RDATA (each segment's content plus one length byte) over [`TXT_ROOM`]. The configuration
+/// check reports it (see `config::problems`) and the answer is compiled to SERVFAIL (see
+/// `StaticAnswer::txt`), so a TXT compiled fits whatever is asked
+pub(crate) fn txt_size_problem(text: &[String]) -> Option<String> {
     if let Some(segment) = text.iter().find(|segment| segment.len() > MAX_TXT_SEGMENT) {
         return Some(format!(
             "a TXT segment of {} bytes is longer than {MAX_TXT_SEGMENT}",
@@ -254,10 +247,9 @@ pub(crate) fn txt_size_problem(text: &[String], name_len: usize) -> Option<Strin
     let rdata = text.iter().fold(0usize, |total, segment| {
         total.saturating_add(segment.len() + 1)
     });
-    let room = txt_room(name_len);
-    (rdata > room).then(|| {
+    (rdata > TXT_ROOM).then(|| {
         format!(
-            "TXT content takes {rdata} bytes in its record (one length byte per segment), more than the {room} that fit in an answer"
+            "TXT content takes {rdata} bytes in its record (one length byte per segment), more than the {TXT_ROOM} that fit in an answer"
         )
     })
 }
@@ -301,25 +293,18 @@ impl StaticRecords {
     }
 
     /// 给问 `qname` 的 `qtype`、`qclass` 的查询的记录，都指回问题名：地址只给问的地址族（ANY 都给），TXT 只答 TXT 和 ANY
-    /// 查询，别的类型回 NODATA；只给 IN 和 ANY 类的问题（见 [`has_static_records`]）。问题名读不出来的，和装不进这个名字的
-    /// 应答的 TXT（见 [`txt_size_problem`]），不管问什么都回 SERVFAIL
+    /// 查询，别的类型回 NODATA；只给 IN 和 ANY 类的问题（见 [`has_static_records`]）。问题名读不出来的，不管问什么都回
+    /// SERVFAIL。TXT 问什么名字都装得下：装不下的编成了 SERVFAIL（见 [`txt_size_problem`]）
     /// The records for a query asking `qname` for `qtype` in `qclass`, each owned by the question
     /// name: addresses of the family asked alone (both for ANY), a TXT for TXT and ANY queries
     /// alone, NODATA for other types; only for questions of class IN and ANY (see
-    /// [`has_static_records`]). A question name that cannot be read, or a TXT that does not fit
-    /// the answer for this name (see [`txt_size_problem`]), is SERVFAIL whatever is asked
+    /// [`has_static_records`]). A question name that cannot be read is SERVFAIL whatever is
+    /// asked. A TXT fits whatever name is asked: one that does not was compiled to SERVFAIL (see
+    /// [`txt_size_problem`])
     fn of(&self, qname: &str, qtype: RecordType, qclass: DNSClass) -> (ResponseCode, Vec<Record>) {
         let Some(name) = crate::proto_utils::name_from_text(qname) else {
             return (ResponseCode::ServFail, Vec::new());
         };
-        // 装不下的先报：和读不出来的名字一样，不看问的是什么 / What does not fit is reported first: like a
-        // name that cannot be read, whatever is asked
-        if let Self::Txt { text, .. } = self
-            && let Some(problem) = txt_size_problem(text, name_wire_len(&name))
-        {
-            warn!(qname = %qname, %problem, "static TXT answer does not fit a message");
-            return (ResponseCode::ServFail, Vec::new());
-        }
         if !has_static_records(qclass) {
             return (ResponseCode::NoError, Vec::new());
         }

@@ -179,9 +179,11 @@ struct ActiveConfig {
     loaded_at_unix: u64,
     last_reload_success: bool,
     last_reload_error: Option<String>,
-    /// 上一次重载因为配置有问题被拒时的那些问题（见 `config::Problems`），每条截到 [`MAX_ERROR_LENGTH`]，一条不落；
-    /// `last_reload_error` 是它们连起来的一句，截到同样长，问题多了就列不全。重载成功或者因为别的原因失败时为空
-    /// The problems the last reload was refused for (see `config::Problems`), each cut to
+    /// 上一次重载拒掉配置的原因（见 `config::Problems`：配置问题、说不通的设置、编译不了的匹配器），每条截到
+    /// [`MAX_ERROR_LENGTH`]，一条不落；`last_reload_error` 是它们连起来的一句，截到同样长，原因多了就列不全。重载成功
+    /// 或者因为别的原因失败时为空
+    /// What the last reload refused the configuration for (see `config::Problems`: its problems,
+    /// settings that make no sense, matchers that do not compile), each cut to
     /// [`MAX_ERROR_LENGTH`], none left out; `last_reload_error` is them joined into one sentence and
     /// cut to the same length, which leaves some out when there are many. Empty when the reload
     /// succeeded or failed for another reason
@@ -1477,6 +1479,9 @@ fn render_flow_control(output: &mut String, engine: &Engine) {
     }
 }
 
+/// 传输写成面板认得的短名：和它在配置里的写法（serde 的名字，比如 `tcp_udp`）一样，测试钉着两边不走样
+/// A transport in the short name the panel reads: the way the configuration writes it (its
+/// serde name, `tcp_udp` say), a test keeping the two from drifting apart
 pub(crate) fn transport_label(transport: crate::config::Transport) -> &'static str {
     use crate::config::Transport;
     match transport {
@@ -2279,11 +2284,12 @@ fn request_invalid(what: &str, error: impl std::fmt::Display) -> Rejection {
     )
 }
 
-/// 配置用不了：422，`message` 是错误连同原因链，截到 [`MAX_ERROR_LENGTH`]；因为配置有问题被拒时，`problems` 逐条列出
-/// 那些问题（见 `config::Problems`），每条截到同样长，一条不落，别的错误时为空
+/// 配置用不了：422，`message` 是错误连同原因链，截到 [`MAX_ERROR_LENGTH`]；编译时被拒的，`problems` 逐条列出拒掉的
+/// 原因（见 `config::Problems`：配置问题、说不通的设置、编译不了的匹配器），每条截到同样长，一条不落，别的错误时为空
 /// A configuration that cannot be used: 422, `message` the error with its cause chain, cut to
-/// [`MAX_ERROR_LENGTH`]; refused for its problems (see `config::Problems`), `problems` lists them
-/// one by one, each cut to the same length and none left out, empty for any other error
+/// [`MAX_ERROR_LENGTH`]; when compiling refused it, `problems` lists the reasons one by one (see
+/// `config::Problems`: its problems, settings that make no sense, matchers that do not compile),
+/// each cut to the same length and none left out, empty for any other error
 fn config_invalid(error: &anyhow::Error) -> Rejection {
     let mut body = error_json(
         "config_invalid",
@@ -2942,6 +2948,21 @@ mod tests {
         MAX_METRIC_SERIES_PER_MAP, PanelMetrics, QUERY_STATS_BUCKET_SECONDS, QUERY_STATS_BUCKETS,
         QUERY_STATS_KEPT, QueryStats, QueryStatsBucket, TopStat,
     };
+
+    /// 面板认得的传输名就是配置里的写法（serde 的名字）：每种传输都一样，配置改了名字或者添了传输，这里跟着失败
+    /// The transport names the panel reads are the way the configuration writes them (their
+    /// serde names): alike for every transport, so renaming one in the configuration, or adding
+    /// one, fails here until the panel follows
+    #[test]
+    fn transport_labels_are_the_serde_names() {
+        for transport in crate::config::Transport::ALL {
+            assert_eq!(
+                serde_json::to_value(transport).unwrap(),
+                super::transport_label(transport),
+                "{transport:?}"
+            );
+        }
+    }
 
     #[derive(Clone, Default)]
     struct SharedBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);

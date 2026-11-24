@@ -241,7 +241,6 @@ use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberI
 use kixdns::config::load_config_with_source;
 use kixdns::engine::Engine;
 use kixdns::listeners::BoundListeners;
-use kixdns::matcher::RuntimePipelineConfig;
 use kixdns::observe::{EngineObserver, TracingObserver};
 #[cfg(unix)]
 use kixdns::panel::PanelMetrics;
@@ -421,13 +420,12 @@ async fn run_dns_server(
     for problem in &problems {
         error!(%problem, "configuration problem, loaded all the same; a reload or a save from the panel refuses it");
     }
-    // 错误开头就写着是哪个设置或匹配器，和重载、校验时一样（见 `config::compile`）/ An error starts
-    // with the setting or matcher it is about, as on a reload and in validation (see
-    // `config::compile`)
-    let cfg = RuntimePipelineConfig::from_config(cfg)?;
-    // Listener addresses and DoH prerequisites, checked exactly as
-    // config::validate does / 监听地址与 DoH 前置条件，检查方式与 config::validate 一致
-    let listeners = cfg.settings.listeners()?;
+    // 说不通的设置、编译不了的匹配器、监听地址和 DoH 的前提一次列全，每条开头就写着是哪个设置或匹配器，和重载、校验时一样
+    // （见 `config::compile_at_startup`）/ Settings that make no sense, matchers that do not compile,
+    // and the listener addresses and DoH prerequisites are listed all at once, each starting with
+    // the setting or matcher it is about, as on a reload and in validation (see
+    // `config::compile_at_startup`)
+    let (cfg, listeners) = kixdns::config::compile_at_startup(cfg)?;
     let bind_addr = listeners.udp;
     let bind_tcp = listeners.tcp;
 
