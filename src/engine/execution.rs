@@ -5703,7 +5703,7 @@ mod tests {
 
     fn put_rule_answer(
         engine: &Engine,
-        expires_at: Option<Instant>,
+        expires_at: Instant,
         matched_rules: Option<&[&str]>,
         decided_by_rule: bool,
     ) -> u64 {
@@ -5772,7 +5772,12 @@ mod tests {
             (Some(&["first"][..]), false, false),
             (None, true, false),
         ] {
-            put_rule_answer(&engine, None, rules, decided_by_rule);
+            put_rule_answer(
+                &engine,
+                Instant::now() + RULE_CACHE_MAX_AGE,
+                rules,
+                decided_by_rule,
+            );
             let answered = engine.handle_packet_fast(&ip_test_query(), peer);
             assert!(matches!(answered, Some(FastPathResponse::Direct(_))));
             let (seen, decided) = observer.0.lock().unwrap().pop().unwrap();
@@ -5788,13 +5793,13 @@ mod tests {
     async fn the_fast_path_leaves_an_expired_rule_cache_entry_in_place() {
         let engine = rule_cache_engine(Arc::new(RuleAnswers::default()));
         let peer = SocketAddr::from(([10, 0, 0, 1], 53000));
-        let expired = Some(Instant::now() - Duration::from_secs(1));
+        let expired = Instant::now() - Duration::from_secs(1);
         let key = put_rule_answer(&engine, expired, Some(&["block"]), true);
         let answered = engine.handle_packet_fast(&ip_test_query(), peer);
         assert!(matches!(answered, Some(FastPathResponse::AsyncNeeded(_))));
         assert!(engine.rule_cache.get(key).is_some());
 
-        let valid = Some(Instant::now() + Duration::from_secs(60));
+        let valid = Instant::now() + RULE_CACHE_MAX_AGE;
         let key = put_rule_answer(&engine, valid, Some(&["block"]), true);
         let answered = engine.handle_packet_fast(&ip_test_query(), peer);
         assert!(matches!(answered, Some(FastPathResponse::Direct(_))));
@@ -5808,7 +5813,12 @@ mod tests {
     async fn the_fast_path_does_not_answer_from_an_entry_for_another_name() {
         let engine = rule_cache_engine(Arc::new(RuleAnswers::default()));
         let peer = SocketAddr::from(([10, 0, 0, 1], 53000));
-        let key = put_rule_answer(&engine, None, Some(&["block"]), true);
+        let key = put_rule_answer(
+            &engine,
+            Instant::now() + RULE_CACHE_MAX_AGE,
+            Some(&["block"]),
+            true,
+        );
         let mut record = engine.rule_cache.get(key).unwrap();
         Arc::make_mut(&mut record).entry.qname = "other.test".as_bytes().into();
         engine.rule_cache.insert(key, record);
@@ -6485,7 +6495,7 @@ mod tests {
             RuleCacheEntry::new(
                 &rule_question(&pipeline_id, qname, requester),
                 no_records(),
-                None,
+                Instant::now() + RULE_CACHE_MAX_AGE,
             )
         };
         let class = |class| RequesterKey {
@@ -6519,7 +6529,7 @@ mod tests {
             let entry = RuleCacheEntry::new(
                 &rule_question(&pipeline_id, name, RequesterKey::NONE),
                 no_records(),
-                None,
+                Instant::now() + RULE_CACHE_MAX_AGE,
             );
             let matches = |asked: &str| {
                 entry.answers(
@@ -6539,15 +6549,13 @@ mod tests {
         let question = rule_question(&pipeline_id, "expire.com", RequesterKey::NONE);
         let now = Instant::now();
 
-        let expired =
-            RuleCacheEntry::new(&question, no_records(), Some(now - Duration::from_secs(1)));
+        let expired = RuleCacheEntry::new(&question, no_records(), now - Duration::from_secs(1));
         assert!(
             !expired.answers(&question, now),
             "Expired entry should not match"
         );
 
-        let fresh =
-            RuleCacheEntry::new(&question, no_records(), Some(now + Duration::from_secs(60)));
+        let fresh = RuleCacheEntry::new(&question, no_records(), now + RULE_CACHE_MAX_AGE);
         assert!(fresh.answers(&question, now), "Fresh entry should match");
     }
 

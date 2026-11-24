@@ -151,8 +151,9 @@ pub struct RuleCacheEntry {
     /// 决策是为哪个请求方做的（以键区分到的程度为限）
     pub requester: RequesterKey,
     pub decision: Decision,
-    /// Expiration time based on DNS TTL / 基于 DNS TTL 的过期时间
-    pub expires_at: Option<Instant>,
+    /// 过期的时刻：写入以后 [`RULE_CACHE_MAX_AGE`] / When it expires: [`RULE_CACHE_MAX_AGE`]
+    /// after it was written
+    pub expires_at: Instant,
 }
 
 /// Rule cache value: the cached decision plus the request-phase rules whose
@@ -171,18 +172,19 @@ pub struct RuleCacheRecord {
     pub decided_by_rule: bool,
 }
 
-/// 规则缓存里的决策最多用这么久，不论决策本身的 TTL。键已经跟着配置和 Geo 数据走（命名空间见
-/// `EngineInner::at_geo`，请求方的判定见 `RequesterScope`），这个上限让一条决策过一阵就重新求值，只问过一次的
-/// 名字占着的地方也由清扫收回
-/// The longest a rule cache decision serves, whatever its own TTL. The keys already follow
-/// the configuration and the Geo data (the namespaces see `EngineInner::at_geo`, the
-/// judgement of the requester `RequesterScope`); this bound has a decision evaluated again
+/// 规则缓存里的每个决策都用这么久。决策只取决于配置、Geo 数据和规则对请求方的判定，键已经跟着它们走（命名空间见
+/// `EngineInner::at_geo`，请求方的判定见 `RequesterScope`）；静态应答记录的 TTL 是写给客户端的，规则下次求值给的还是
+/// 同一份，不必照它过期。这个时限让一条决策过一阵就重新求值，只问过一次的名字占着的地方也由清扫收回
+/// How long every rule cache decision serves. A decision depends on the configuration, the Geo
+/// data and how the rules judge the requester alone, and the keys already follow them (the
+/// namespaces see `EngineInner::at_geo`, the judgement of the requester `RequesterScope`); the
+/// TTL of a static answer's records is written for the client, the rules giving the same answer
+/// when evaluated again, and is nothing to expire by. This limit has a decision evaluated again
 /// after a while, and the room a name asked once takes is reclaimed by the sweep
 pub(crate) const RULE_CACHE_MAX_AGE: Duration = Duration::from_secs(60);
 
-/// 每条记录计重 1；`expires_at` 已经含了 `RULE_CACHE_MAX_AGE`，按它判断过期
-/// Each record weighs 1; `expires_at` already includes `RULE_CACHE_MAX_AGE`, so it
-/// decides when a record is outlived
+/// 每条记录计重 1，到 `expires_at` 就过期（见 [`RULE_CACHE_MAX_AGE`]）
+/// Each record weighs 1 and is outlived at `expires_at` (see [`RULE_CACHE_MAX_AGE`])
 impl Cached for Arc<RuleCacheRecord> {
     fn weight(&self) -> u32 {
         1
@@ -243,7 +245,7 @@ impl RuleCacheEntry {
     pub(crate) fn new(
         question: &RuleQuestion<'_>,
         decision: Decision,
-        expires_at: Option<Instant>,
+        expires_at: Instant,
     ) -> Self {
         Self {
             pipeline_id: Arc::clone(question.pipeline_id),
@@ -271,7 +273,7 @@ impl RuleCacheEntry {
     /// 在 `now` 这一刻还有效 / Still valid at `now`
     #[inline]
     pub fn is_valid_at(&self, now: Instant) -> bool {
-        self.expires_at.is_none_or(|expires| now <= expires)
+        now <= self.expires_at
     }
 }
 

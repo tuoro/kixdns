@@ -1,6 +1,6 @@
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use hickory_proto::op::ResponseCode;
 use hickory_proto::rr::{DNSClass, RecordType};
@@ -20,7 +20,6 @@ use super::core::Engine;
 use super::observation::{
     Observed, decision_kind, report_decision, report_matched_rules, report_rule_cache_hit,
 };
-use super::response::least_ttl;
 use super::rules::Decision;
 use super::rules::{RULE_CACHE_MAX_AGE, RuleCacheEntry, RuleCacheRecord, RuleQuestion};
 use super::types::EngineInner;
@@ -180,9 +179,14 @@ impl Engine {
             .filter(|record| record.entry.answers(question, now))
     }
 
-    /// 把求值给 `question` 作出的决定存进规则缓存；`matched_rules` 是求值时命中的规则，只在有观察者时记下
-    /// Store the decision evaluating made for `question` in the rule cache; `matched_rules` are
-    /// the rules that matched on the way, kept only with an observer
+    /// 把求值给 `question` 作出的决定存进规则缓存，留 [`RULE_CACHE_MAX_AGE`]：静态应答、跳转、转发都一样，带回答检查的
+    /// 转发也是，检查看的是每次上游给的应答，规则缓存只替请求阶段记下由哪条规则去转发。`matched_rules` 是求值时命中的
+    /// 规则，只在有观察者时记下
+    /// Store the decision evaluating made for `question` in the rule cache, for
+    /// [`RULE_CACHE_MAX_AGE`]: static answers, jumps and forwards alike, one with an answer check
+    /// too, the check reading each answer the upstream gives and the rule cache only standing in
+    /// for the request phase naming the rule that forwards. `matched_rules` are the rules that
+    /// matched on the way, kept only with an observer
     pub(crate) fn insert_rule_cache(
         &self,
         question: &RuleQuestion<'_>,
@@ -190,31 +194,7 @@ impl Engine {
         matched_rules: Option<&[Arc<str>]>,
         decided_by_rule: bool,
     ) {
-        let ttl = match &decision {
-            Decision::Static { answers, .. } => {
-                least_ttl(answers).map(|ttl| Duration::from_secs(u64::from(ttl)))
-            }
-            // 转发和跳转本身不过期，只受 `RULE_CACHE_MAX_AGE` 限制。带回答检查的转发也一样：检查看的是每次上游给的应答，
-            // 规则缓存只替请求阶段记下由哪条规则去转发。以前它按 min_ttl 过期，默认的 0 让它从不进规则缓存，正则每次重算
-            // Forwards and jumps do not expire of themselves and are bounded by
-            // `RULE_CACHE_MAX_AGE` alone. So is a forward with an answer check: the check reads
-            // each answer the upstream gives, and the rule cache only stands in for the request
-            // phase naming the rule that forwards. It used to expire by min_ttl, kept out of the
-            // rule cache at the default 0 and its regexes evaluated every time
-            Decision::Forward { .. } | Decision::Jump { .. } => None,
-        };
-
-        // If TTL is 0, do not cache / 如果 TTL 为 0，则不缓存
-        if let Some(d) = ttl
-            && d.as_secs() == 0
-        {
-            return;
-        }
-
-        let now = Instant::now();
-        let longest = now + RULE_CACHE_MAX_AGE;
-        let expires_at = Some(ttl.map_or(longest, |ttl| (now + ttl).min(longest)));
-
+        let expires_at = Instant::now() + RULE_CACHE_MAX_AGE;
         self.rule_cache.insert(
             question.key,
             Arc::new(RuleCacheRecord {
@@ -877,13 +857,13 @@ mod rule_cache_policy_tests {
         assert!(matches!(ask("example.com"), Decision::Forward { .. }));
     }
 
-    /// 本身不过期的决策（静态回答、没有应答阶段规则的转发）和 TTL 更长的跳转，在规则缓存里都只用
-    /// `RULE_CACHE_MAX_AGE`
-    /// Decisions that do not expire of themselves (static answers, forwards without
-    /// response-phase rules) and jumps with a longer TTL all serve from the rule cache for
-    /// `RULE_CACHE_MAX_AGE` at most
+    /// 每个决策在规则缓存里都用 `RULE_CACHE_MAX_AGE`：静态回答、跳转、转发都一样，静态回答的记录 TTL 比它短、是 0
+    /// 也一样，规则下次求值给的还是同一份
+    /// Every decision serves from the rule cache for `RULE_CACHE_MAX_AGE`: static answers, jumps
+    /// and forwards alike, a static answer whose records' TTL is shorter, or 0, too, the rules
+    /// giving the same answer when evaluated again
     #[tokio::test]
-    async fn no_decision_outlives_the_rule_cache_max_age() {
+    async fn every_decision_lasts_the_rule_cache_max_age() {
         let engine = engine_from(serde_json::json!({
             "settings": { "default_upstream": "127.0.0.1:9" },
             "pipelines": [
@@ -894,6 +874,16 @@ mod rule_cache_policy_tests {
                             "name": "block",
                             "matchers": [{ "type": "domain_suffix", "value": "ads.example" }],
                             "actions": [{ "type": "static_response", "rcode": "NXDOMAIN" }]
+                        },
+                        {
+                            "name": "short",
+                            "matchers": [{ "type": "domain_suffix", "value": "short.example" }],
+                            "actions": [{ "type": "static_cname_response", "target": "a.test.", "ttl": 5 }]
+                        },
+                        {
+                            "name": "uncached",
+                            "matchers": [{ "type": "domain_suffix", "value": "zero.example" }],
+                            "actions": [{ "type": "static_cname_response", "target": "a.test.", "ttl": 0 }]
                         },
                         {
                             "name": "elsewhere",
@@ -927,7 +917,13 @@ mod rule_cache_policy_tests {
         let pipeline = &state.pipeline.pipelines[0];
         assert!(pipeline.matches_regex);
         let before = Instant::now();
-        for name in ["ads.example", "jump.example", "example.com"] {
+        for name in [
+            "ads.example",
+            "short.example",
+            "zero.example",
+            "jump.example",
+            "example.com",
+        ] {
             let request = RuleEvaluationContext::new(
                 "127.0.0.1".parse().unwrap(),
                 name,
@@ -948,7 +944,7 @@ mod rule_cache_policy_tests {
                 Decision::Jump { .. } => "jump",
                 Decision::Forward { .. } => "forward",
             });
-            let expires = record.entry.expires_at.expect("every decision expires");
+            let expires = record.entry.expires_at;
             assert!(
                 expires >= before + RULE_CACHE_MAX_AGE && expires <= after + RULE_CACHE_MAX_AGE,
                 "a {} decision serves {:?}",
@@ -957,7 +953,7 @@ mod rule_cache_policy_tests {
             );
         }
         kinds.sort_unstable();
-        assert_eq!(kinds, ["forward", "jump", "static"]);
+        assert_eq!(kinds, ["forward", "jump", "static", "static", "static"]);
     }
 
     /// 规则和默认上游的决策共用配置加载时算好的那份上游名字，每次决策不再各分配一份
@@ -1040,8 +1036,11 @@ mod rule_cache_policy_tests {
             let before = Instant::now();
             engine.apply_rules(&state, &state.pipeline.pipelines[0], &request);
             engine.rule_cache.values().first().map(|record| {
-                let expires = record.entry.expires_at.expect("every decision expires");
-                expires.saturating_duration_since(before).as_secs_f64()
+                record
+                    .entry
+                    .expires_at
+                    .saturating_duration_since(before)
+                    .as_secs_f64()
             })
         };
         let longest = RULE_CACHE_MAX_AGE.as_secs_f64();
@@ -1202,7 +1201,7 @@ mod rule_cache_policy_tests {
         );
         let mut record = engine.rule_cache.get(key).expect("cached");
         let expired = Instant::now() - std::time::Duration::from_secs(1);
-        Arc::make_mut(&mut record).entry.expires_at = Some(expired);
+        Arc::make_mut(&mut record).entry.expires_at = expired;
         engine.rule_cache.insert(key, record);
         let count = engine.rule_cache.access_count(key).unwrap();
         assert!(count > 0);
