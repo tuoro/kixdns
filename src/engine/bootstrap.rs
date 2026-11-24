@@ -11,7 +11,6 @@
 //! never given any waits. An upstream written as an IP needs no resolving
 
 use std::net::{IpAddr, SocketAddr};
-use std::pin::pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,17 +26,13 @@ use tracing::debug;
 
 use super::transport::{UdpClient, UdpExchange};
 
-/// 问一次 bootstrap 最多等多久。从没问到过的名字，建连要等它问完，而建连一共只有 `transport::CONNECT_BUDGET`
-/// （5 秒），剩下的留给 TCP 和 TLS 握手
-/// How long one asking of bootstrap waits at most. For a name never given any addresses the
-/// connect waits for the asking, and a connect has `transport::CONNECT_BUDGET` (5 seconds) in
-/// all, the rest of which the TCP and TLS handshakes need
+/// 问一次 bootstrap 最多等多久：A 和 AAAA 同时问，各自最多等这么久。从没问到过的名字，建连要等它问完，而建连一共只有
+/// `transport::CONNECT_BUDGET`（5 秒），剩下的留给 TCP 和 TLS 握手
+/// How long one asking of bootstrap waits at most: A and AAAA are asked at once, each waited
+/// for this long at most. For a name never given any addresses the connect waits for the asking,
+/// and a connect has `transport::CONNECT_BUDGET` (5 seconds) in all, the rest of which the TCP
+/// and TLS handshakes need
 const ASK_BUDGET: Duration = Duration::from_secs(2);
-
-/// A 和 AAAA 有一种先答出了地址，另一种最多再等多久（RFC 8305 §3 的 Resolution Delay）
-/// With A or AAAA answered with addresses first, how long the other is waited for at most (the
-/// Resolution Delay of RFC 8305 §3)
-const RESOLUTION_DELAY: Duration = Duration::from_millis(50);
 
 /// 上游主机名的解析：经 `bootstrap` 的服务器，或者系统的解析器 / Resolving upstream host names: through the
 /// `bootstrap` servers, or by the system resolver
@@ -156,12 +151,9 @@ impl Through {
     fn ask(self: &Arc<Self>, host: &str) -> Asking {
         let (through, host) = (Arc::clone(self), Box::<str>::from(host));
         let asking: Asking = async move {
-            let asked = timeout(ASK_BUDGET, through.ask_servers(&host))
-                .await
-                .unwrap_or_else(|_| Err(anyhow::anyhow!("no answer in time")))
-                .map_err(|error| {
-                    Arc::<str>::from(format!("bootstrap gave no address for {host}: {error:#}"))
-                });
+            let asked = through.ask_servers(&host).await.map_err(|error| {
+                Arc::<str>::from(format!("bootstrap gave no address for {host}: {error:#}"))
+            });
             if let Err(error) = &asked {
                 debug!(%error, "bootstrap asking failed");
             }
@@ -208,29 +200,26 @@ impl Through {
         ))
     }
 
-    /// 向 `server` 问 A 和 AAAA 记录（`queries` 是这两个查询），给出地址和各自的 TTL。一种先答出了地址，
-    /// 另一种只是添头：最多再等 [`RESOLUTION_DELAY`]，没答上来、出了错都不要了，不为它丢掉已经答了的那种
-    /// Asks `server` for the A and AAAA records (`queries` being those two queries),
-    /// giving the addresses with their TTLs. With one answered with addresses first, the other is
-    /// a bonus: waited for [`RESOLUTION_DELAY`] at most, and left out unanswered or failed, never
-    /// costing the one answered
+    /// 向 `server` 问 A 和 AAAA 记录（`queries` 是这两个查询），给出地址和各自的 TTL。两种同时问、都等到答上，各自最多
+    /// 等 [`ASK_BUDGET`]：晚答上的那种照样记下，到时还没答上、出了错的那种不要了，不为它丢掉答了的那种
+    /// Asks `server` for the A and AAAA records (`queries` being those two queries), giving the
+    /// addresses with their TTLs. Both are asked at once and each is waited for until answered,
+    /// [`ASK_BUDGET`] at most: one answered late is kept all the same, and one still unanswered
+    /// by then or failed is left out, never costing the one answered
     async fn ask_server(
         &self,
         server: &str,
         [a, aaaa]: &[Vec<u8>; 2],
     ) -> anyhow::Result<Vec<(IpAddr, u32)>> {
-        let (a, aaaa) = (
-            pin!(self.records(server, a)),
-            pin!(self.records(server, aaaa)),
-        );
-        let (first, other) = futures::future::select(a, aaaa).await.factor_first();
-        let mut given = first?;
-        let other = other.into_inner();
-        if given.is_empty() {
-            given = other.await?;
-        } else if let Ok(Ok(more)) = timeout(RESOLUTION_DELAY, other).await {
-            given.extend(more);
-        }
+        let records = |query| async move {
+            timeout(ASK_BUDGET, self.records(server, query))
+                .await
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("{server} gave no answer in time")))
+        };
+        let given: Vec<_> = match futures::future::join(records(a), records(aaaa)).await {
+            (Err(error), Err(_)) => return Err(error),
+            (a, aaaa) => a.into_iter().chain(aaaa).flatten().collect(),
+        };
         anyhow::ensure!(!given.is_empty(), "{server} answered no A or AAAA record");
         Ok(given)
     }
@@ -429,16 +418,17 @@ mod tests {
         assert_eq!(addresses.unwrap().len(), 2);
     }
 
-    /// 只答 A、不答 AAAA 的服务器（或者反过来）给的地址照用，不等丢了的那个。以前两种都要答，等满整个时限后失败
+    /// 只答 A、不答 AAAA 的服务器（或者反过来）给的地址照用：不答的那种等到时限就不等了，这次问不因它失败
     /// From a server answering A and never AAAA (or the other way round) the addresses it gives
-    /// are used without waiting for the one lost. Both used to be needed, failing once the whole
-    /// time limit was out
+    /// are used: the one unanswered is given up on at the time limit, and the asking does not
+    /// fail for it
     #[tokio::test]
     async fn one_family_answered_is_enough() {
-        for (answered, expected) in [
+        let cases = [
             (RecordType::A, "127.0.0.1:853"),
             (RecordType::AAAA, "[::1]:853"),
-        ] {
+        ]
+        .map(|(answered, expected)| async move {
             let server = upstream(move |query| {
                 if query.queries[0].query_type() == answered {
                     loopback_addresses(query, 300)
@@ -448,16 +438,49 @@ mod tests {
             })
             .await;
             let addresses = timeout(
-                Duration::from_secs(1),
+                ASK_BUDGET + Duration::from_secs(1),
                 through(&server.address).addresses("upstream.test", 853),
             )
             .await
-            .expect("well within the time limit");
+            .expect("given by the time limit");
             assert_eq!(
                 addresses.unwrap(),
                 [expected.parse().unwrap()],
                 "{answered} answered"
             );
-        }
+        });
+        futures::future::join_all(cases).await;
+    }
+
+    /// AAAA 当场答、A 过了一阵才答：晚答上的那一族照样记下，建连连上 A 给的地址。AAAA 给的地址上没有人听，就像只有 ULA
+    /// 的主机连公网 IPv6 地址，马上失败
+    /// AAAA answered at once and A a while later: the family answered late is kept all the same,
+    /// and the connect reaches the address A gives. Nothing listens at the address AAAA gives, as
+    /// on a host with ULA only dialling a global IPv6 address, which fails at once
+    #[tokio::test]
+    async fn a_family_answered_late_is_kept() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = upstream(|query| {
+            let mut replies = loopback_addresses(query, 300);
+            if query.queries[0].query_type() == RecordType::A {
+                replies[0].0 = Duration::from_millis(200);
+            }
+            replies
+        })
+        .await;
+        let bootstrap = through(&server.address);
+        super::super::transport::connect_tcp(&bootstrap, &format!("upstream.test:{port}"))
+            .await
+            .expect("connected to the address A gives");
+        assert_eq!(
+            bootstrap.addresses("upstream.test", port).await.unwrap(),
+            [
+                SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port)),
+                SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port)),
+            ],
+            "both families kept"
+        );
+        assert_eq!(server.queries(), 2, "A and AAAA asked once");
     }
 }

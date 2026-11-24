@@ -177,35 +177,10 @@ impl ParsedGeoIp {
 /// [`GeoIpManager::fingerprints`])
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GeoIpFingerprints {
-    tags: FxHashMap<Arc<str>, u64>,
-    mmdb: Option<u64>,
-}
-
-impl GeoIpFingerprints {
-    /// 判断 `tag`（大写）用的数据的指纹，和判断时一样：有 MMDB 时国家代码看 MMDB（见
-    /// [`GeoIpManager::matches_any_tag`]），没有数据时为 None
-    /// The fingerprint of the data `tag` (uppercase) is judged by, as it is judged: with an
-    /// MMDB a country code goes by the MMDB (see [`GeoIpManager::matches_any_tag`]); None
-    /// without data
-    pub fn of(&self, tag: &str) -> Option<u64> {
-        match self.mmdb {
-            Some(mmdb) if is_country_tag(tag) => Some(mmdb),
-            _ => self.tags.get(tag).copied(),
-        }
-    }
-
-    /// 测试用：标签 `tags` 的网段各有这些指纹，没有 MMDB / For tests: the networks of tags `tags`
-    /// with these fingerprints, and no MMDB
-    #[cfg(test)]
-    pub(crate) fn of_tags(tags: &[(&str, u64)]) -> Self {
-        Self {
-            tags: tags
-                .iter()
-                .map(|&(tag, print)| (Arc::from(tag), print))
-                .collect(),
-            mmdb: None,
-        }
-    }
+    /// 每个标签（大写）的网段的 / Each tag's (uppercase) networks'
+    pub tags: FxHashMap<Arc<str>, u64>,
+    /// MMDB 的，没有 MMDB 时是 None / The MMDB's, None without one
+    pub mmdb: Option<u64>,
 }
 
 /// 默认的管理器没有 MMDB、也没有标签 / The default manager has no MMDB and no tags
