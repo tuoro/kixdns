@@ -297,10 +297,20 @@ pub struct Rule {
     pub merged_forward: Option<MergedForward>,
 }
 
+/// 请求匹配器：规则和 pipeline_select 用的是同一套，pipeline_select 另外认 `listener_label`
+/// A request matcher: rules and pipeline_select share the one set, pipeline_select also taking
+/// `listener_label`
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Matcher {
     Any,
+    /// 入口标签（启动参数 `--listener-label`），不分大小写。只有 pipeline_select 看得到是哪个入口收的查询，规则里
+    /// 写了编译不过 / The entry label (the `--listener-label` startup argument), ignoring case.
+    /// Only pipeline_select sees which entry took the query; written in a rule it does not
+    /// compile
+    ListenerLabel {
+        value: String,
+    },
     /// 匹配域名后缀，大小写不敏感。 / Match domain suffix, case insensitive
     DomainSuffix {
         value: String,
@@ -350,44 +360,10 @@ pub enum Matcher {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum PipelineSelectorMatcher {
-    /// 入口标签匹配（来自启动参数 listener_label）。 / Entry label matching (from listener_label startup parameter)
-    ListenerLabel { value: String },
-    /// 客户端IP CIDR。 / Client IP CIDR
-    ClientIp { cidr: String },
-    /// 请求域名后缀。 / Request domain suffix
-    DomainSuffix { value: String },
-    /// 请求域名本身，不含子域名。 / The request domain itself, not its subdomains
-    DomainExact { value: String },
-    /// 请求域名正则。 / Request domain regex
-    DomainRegex { value: String },
-    /// 任意请求（总是匹配）。 / Any request (always matches)
-    Any,
-    /// 请求 QCLASS（如 IN/CH/HS）。 / Request QCLASS (e.g., IN/CH/HS)
-    Qclass { value: String },
-    /// 请求是否携带 EDNS。 / Whether request carries EDNS
-    EdnsPresent { expect: bool },
-    /// GeoSite 分类匹配（如 "cn", "google", "category-ads"）。 / GeoSite category matching (e.g., "cn", "google", "category-ads")
-    GeoSite { value: String },
-    /// GeoSite 否定匹配（匹配不在该分类的域名）。 / GeoSite negation matching (match domains NOT in category)
-    GeoSiteNot { value: String },
-    /// 匹配客户端 IP 的 GeoIP 国家代码或命名标签（大小写不敏感）。 / Match client IP GeoIP country code or named tag (case insensitive)
-    GeoipCountry {
-        #[serde(deserialize_with = "deserialize_string_or_vec")]
-        country_codes: Vec<String>,
-    },
-    /// 匹配客户端IP是否为私有IP（内网）。 / Match whether client IP is private (internal network)
-    GeoipPrivate { expect: bool },
-    /// 请求 QTYPE（如 A/AAAA/CNAME/TXT/MX 等）。 / Request QTYPE (e.g., A/AAAA/CNAME/TXT/MX, etc.)
-    Qtype { value: String },
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PipelineSelectRule {
     pub pipeline: String,
     #[serde(default)]
-    pub matchers: Vec<PipelineSelectorMatcherWithOp>,
+    pub matchers: Vec<MatcherWithOp>,
     #[serde(default = "default_match_operator")]
     pub matcher_operator: MatchOperator,
 }
@@ -398,14 +374,6 @@ pub struct MatcherWithOp {
     pub operator: MatchOperator,
     #[serde(flatten)]
     pub matcher: Matcher,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct PipelineSelectorMatcherWithOp {
-    #[serde(default = "default_match_operator")]
-    pub operator: MatchOperator,
-    #[serde(flatten)]
-    pub matcher: PipelineSelectorMatcher,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1275,13 +1243,13 @@ pub fn problems(cfg: &PipelineConfig) -> Vec<String> {
             found.push(format!("{place}: {problem}"));
         }
         for matcher in &select.matchers {
-            if let PipelineSelectorMatcher::DomainSuffix { value }
-            | PipelineSelectorMatcher::DomainRegex { value } = &matcher.matcher
+            if let Matcher::DomainSuffix { value } | Matcher::DomainRegex { value } =
+                &matcher.matcher
                 && value.is_empty()
             {
                 found.push(format!("{place}: {EMPTY_DOMAIN_MATCHER}"));
             }
-            if let PipelineSelectorMatcher::DomainExact { value } = &matcher.matcher
+            if let Matcher::DomainExact { value } = &matcher.matcher
                 && value.is_empty()
             {
                 found.push(format!("{place}: {EMPTY_EXACT_MATCHER}"));
@@ -1409,7 +1377,7 @@ pub fn warnings(cfg: &PipelineConfig) -> Vec<String> {
     }
     for (index, select) in cfg.pipeline_select.iter().enumerate() {
         if select.matchers.iter().any(|matcher| {
-            matches!(&matcher.matcher, PipelineSelectorMatcher::GeoipCountry { country_codes } if country_codes.is_empty())
+            matches!(&matcher.matcher, Matcher::GeoipCountry { country_codes } if country_codes.is_empty())
         }) {
             found.push(format!("pipeline_select {}: {NO_COUNTRY_CODE}", index + 1));
         }
@@ -1851,7 +1819,7 @@ fn rule_problems(
 
 #[cfg(test)]
 mod tests {
-    use super::{Matcher, PipelineSelectorMatcher, ResponseMatcher};
+    use super::{Matcher, ResponseMatcher};
 
     #[test]
     fn geoip_country_codes_accept_string_or_array() {
@@ -1863,11 +1831,11 @@ mod tests {
         };
         assert_eq!(country_codes, ["cloudflare"]);
 
-        let PipelineSelectorMatcher::GeoipCountry { country_codes } =
+        let Matcher::GeoipCountry { country_codes } =
             serde_json::from_str(r#"{"type":"geoip_country","country_codes":"CN, cloudflare"}"#)
-                .expect("pipeline selector should accept a comma-separated string")
+                .expect("request matcher should accept a comma-separated string")
         else {
-            panic!("unexpected pipeline selector matcher variant");
+            panic!("unexpected request matcher variant");
         };
         assert_eq!(country_codes, ["CN", "cloudflare"]);
 
@@ -2799,6 +2767,38 @@ mod validation_tests {
                 "{error}"
             );
         }
+    }
+
+    /// listener_label 只有 pipeline_select 认：写在规则里编译不过，报出写在哪；写在 pipeline_select 里照常。两边读的是
+    /// 同一套请求匹配器
+    /// listener_label is pipeline_select's alone: written in a rule it does not compile, naming
+    /// where it is written; in pipeline_select it compiles as usual. Both read the one set of
+    /// request matchers
+    #[test]
+    fn a_listener_label_compiles_in_pipeline_select_only() {
+        let label = serde_json::json!([{ "type": "listener_label", "value": "lan" }]);
+        let any = serde_json::json!([{ "type": "any" }]);
+        let config = |select: &serde_json::Value, matchers: &serde_json::Value| {
+            serde_json::json!({
+                "settings": { "default_upstream": "1.1.1.1:53" },
+                "pipeline_select": [{ "pipeline": "main", "matchers": select }],
+                "pipelines": [{ "id": "main", "rules": [
+                    rule("r", matchers.clone(), serde_json::json!([{ "type": "allow" }]))
+                ] }]
+            })
+            .to_string()
+        };
+        validate(&config(&label, &any)).expect("pipeline_select reads listener_label");
+        let refused = format!(
+            "{:#}",
+            validate(&config(&any, &label)).expect_err("a rule cannot read it")
+        );
+        assert!(
+            refused.contains(
+                "pipelines[0].rules[0].matchers[0]: listener_label works in pipeline_select only"
+            ),
+            "{refused}"
+        );
     }
 
     /// 默认上游写了几个时，编译配置时就拆好（各项去掉空白、空项跳过）；只有一个时不拆
