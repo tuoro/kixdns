@@ -21,7 +21,7 @@ use hickory_proto::op::{Message, MessageType, OpCode, Query};
 use hickory_proto::rr::{Name, RData, RecordType};
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
-use tokio::time::{Instant, timeout};
+use tokio::time::{Instant, timeout, timeout_at};
 use tracing::debug;
 
 use super::transport::{UdpClient, UdpExchange};
@@ -40,17 +40,21 @@ const ASK_BUDGET: Duration = Duration::from_secs(2);
 /// 一族地址（A 或 AAAA）这次没问到时，多久之后再问（见 [`Known::new`]）。这时这一族要么没有地址（头一回问），要么是上回
 /// 问到的；在只连得上一族的主机上（比如 IPv6 只有 ULA），少了能连的那一族上游就连不上，所以要短。也不必更短：解析器把一次
 /// 失败至少记 1 秒（RFC 9520 3.2），它举的例子从 5 秒起退避，再早问多半拿回同一个失败。再问在后台，最多 [`ASK_BUDGET`]，
-/// 谁也不等它，有建连要地址时才问，一个名字每 10 秒至多两个查询，所以不退避：一族一直问不到（AAAA 查询被丢掉的网络）
-/// 也就这点开销
+/// 谁也不等它，有建连要地址时才问，一个名字每 10 秒至多问一次：A、AAAA 各问每个服务器，每个至多发三份（见
+/// [`Through::records`]），也就是至多 6 × 服务器数个查询，所以不退避：一族一直问不到（AAAA 查询被丢掉的网络）也就这点开销。
+/// 问到过地址的名字后来一个地址也问不到（比如两族都答 NXDOMAIN）时也一样，留着上回的地址，这么久以后再问
 /// How long until a family of addresses (A or AAAA) not given this time is asked again (see
 /// [`Known::new`]). Until then that family has no addresses (asked the first time) or those last
 /// given; on a host reaching one family only (IPv6 with ULA only, say), the upstream cannot be
 /// reached without the family it can reach, so this is short. Nor is shorter any use: a resolver
 /// holds a failure for 1 second at least (RFC 9520 3.2), its example backing off from 5 seconds,
 /// and asking sooner would mostly get the same failure back. Asking again is in the background,
-/// [`ASK_BUDGET`] at most, nothing waiting on it, and only when a connect wants addresses, two
-/// queries per name per 10 seconds at most, so there is no backing off: a family never given (a
-/// network dropping AAAA queries) costs no more than that
+/// [`ASK_BUDGET`] at most, nothing waiting on it, and only when a connect wants addresses, once
+/// per name per 10 seconds at most: A and AAAA asked of every server, three copies each at most
+/// (see [`Through::records`]), so 6 × the servers' number of queries at most, and there is no
+/// backing off: a family never given (a network dropping AAAA queries) costs no more than that.
+/// A name once given addresses that later gets none at all (both families answering NXDOMAIN,
+/// say) is no different, keeping the last addresses and asked again after this long
 const ASK_AGAIN_AFTER: Duration = Duration::from_secs(10);
 
 /// 上游主机名的解析：经 `bootstrap` 的服务器，或者系统的解析器 / Resolving upstream host names: through the
@@ -87,14 +91,17 @@ struct Known {
 
 impl Known {
     /// 这次问到的两族（`asked`，A 在前）。没问到的那一族沿用 `last` 里这一族的地址，[`ASK_AGAIN_AFTER`] 之后再问；
-    /// 问到了的那一族（没有这一族的记录也算问到）用这次的地址，按它们里最短的 TTL。头一回问和后台再问都是这一条：头一回
-    /// 没有 `last`，没问到的那一族就先没有地址。一个地址也没有时是 Err
+    /// 问到了的那一族（没有这一族的记录也算问到）用这次的地址，按它们里最短的 TTL。这样凑不出一个地址时（两族都没有记录，
+    /// 或者没问到的那一族上回也没有地址），整张沿用 `last`，同样 [`ASK_AGAIN_AFTER`] 之后再问。头一回问和后台再问都是这一条：
+    /// 头一回没有 `last`，没问到的那一族就先没有地址，一个地址也没有时是 Err
     /// What this asking gave of the two families (`asked`, A first). A family not given keeps the
     /// addresses `last` has of it, asked again after [`ASK_AGAIN_AFTER`]; a family given (no
     /// record of it counting as given) takes this asking's addresses, by the shortest TTL among
-    /// them. Asking the first time and asking again in the background are the one rule: the first
-    /// time has no `last`, a family not given then having no addresses for now. Err with no
-    /// address at all
+    /// them. Coming to no address so (neither family having records, or the one not given having
+    /// none last time either), all of `last` is kept, asked again after [`ASK_AGAIN_AFTER`] too.
+    /// Asking the first time and asking again in the background are the one rule: the first time
+    /// has no `last`, a family not given then having no addresses for now, and no address at all
+    /// is an Err
     fn new(asked: [Family; 2], last: Option<&Known>) -> anyhow::Result<Self> {
         let (mut addresses, mut ttl, mut failures) = (Vec::new(), Duration::MAX, Vec::new());
         for (family, ipv6) in asked.into_iter().zip([false, true]) {
@@ -114,6 +121,12 @@ impl Known {
             }
         }
         if addresses.is_empty() {
+            if let Some(last) = last {
+                return Ok(Self {
+                    addresses: Arc::clone(&last.addresses),
+                    until: Instant::now() + ASK_AGAIN_AFTER,
+                });
+            }
             let why = match failures.is_empty() {
                 true => "no A or AAAA record".to_owned(),
                 false => failures.join("; "),
@@ -130,10 +143,10 @@ impl Known {
 }
 
 /// 一族地址这次问到的样子：地址和各自的 TTL（空的是没有这一族的记录）；Err 是没问到：每个服务器都出了错、答了失败应答
-/// （见 `upstream::is_failure_reply`）或者到时没答上
+/// （见 `upstream::is_failure_reply`）、到时没答上或者查询发不出去
 /// What one family of addresses came to this time: the addresses with their TTLs (none being no
 /// record of the family); Err when not given: every server failing, answering with a failure
-/// reply (see `upstream::is_failure_reply`) or not answering in time
+/// reply (see `upstream::is_failure_reply`), not answering in time or never sent the query
 type Family = anyhow::Result<Vec<(IpAddr, u32)>>;
 
 /// 问一次的结果，等着它的各拿一份 / One asking's outcome, a copy for each that waits on it
@@ -273,21 +286,17 @@ impl Through {
         Ok([a, aaaa])
     }
 
-    /// 同时向每个服务器问 `query`，先答上的那个的回答（见 [`Self::records`]），各自最多等 [`ASK_BUDGET`]。都没答上时
+    /// 同时向每个服务器问 `query`，先答上的那个的回答（见 [`Self::records`]，各自最多 [`ASK_BUDGET`]）。都没答上时
     /// 按先后列出每个服务器为什么没答上
     /// `query` asked of every server at once, the answer of the first to answer (see
-    /// [`Self::records`]), each waited for [`ASK_BUDGET`] at most. With none answering, why each
-    /// did not is listed, in the order they failed
+    /// [`Self::records`], [`ASK_BUDGET`] at most each). With none answering, why each did not is
+    /// listed, in the order they failed
     async fn first_answer(&self, query: &[u8]) -> anyhow::Result<Vec<(IpAddr, u32)>> {
         use futures::StreamExt;
         let mut asked: futures::stream::FuturesUnordered<_> = self
             .servers
             .iter()
-            .map(|server| async move {
-                timeout(ASK_BUDGET, self.records(server, query))
-                    .await
-                    .unwrap_or_else(|_| Err(anyhow::anyhow!("{server} gave no answer in time")))
-            })
+            .map(|server| self.records(server, query))
             .collect();
         let mut failed = Vec::new();
         while let Some(answer) = asked.next().await {
@@ -304,7 +313,8 @@ impl Through {
     /// （见 `upstream::hedge_timeout`）；前面发的照样等着，谁的回答先到用谁的（见 [`UdpExchange`]）：丢了一个包的查询
     /// 不用等满整个时限。一份发不出去也不让这次问失败，记下来，到了再发的时候照样再发，直到时限。UDP 转发（见
     /// `upstream::forward_udp_smart`）不一样：它一共只发两份，第一份发不出去就马上发第二份；这里一直按间隔再发，发不出去
-    /// 时马上再发只会空转
+    /// 时马上再发只会空转。到了时限还没有回答：发出去过的报 `no answer in 2000ms`，一份也没发出去的报最后一次为什么没发出去
+    /// （`query not sent: …`），比如没有到这个服务器的路由
     /// The addresses `server` answers `query` with, and their TTLs; Err for a failure reply (see
     /// `upstream::is_failure_reply`), told apart from an answer with no such record (none). A copy
     /// left unanswered for a third of the asking's time limit ([`ASK_BUDGET`]) has another sent,
@@ -314,20 +324,37 @@ impl Through {
     /// asking: it is logged, and another goes when the time to send again comes, up to the time
     /// limit. UDP forwarding (see `upstream::forward_udp_smart`) differs: it sends two copies in
     /// all, the second at once when the first cannot be sent; here copies keep going at the
-    /// interval, and sending again at once while sending fails would only spin
+    /// interval, and sending again at once while sending fails would only spin. With no answer by
+    /// the time limit, one with a copy sent reports `no answer in 2000ms`, and one with none sent
+    /// why the latest could not go (`query not sent: …`), no route to the server, say
     async fn records(&self, server: &str, query: &[u8]) -> anyhow::Result<Vec<(IpAddr, u32)>> {
+        let deadline = Instant::now() + ASK_BUDGET;
         let resend_after = super::upstream::hedge_timeout(ASK_BUDGET);
         let mut exchange = UdpExchange::new(&self.udp, query, server);
+        // 发出去过一份没有，和最后一次发不出去的原因 / Whether any copy went out, and why the latest
+        // could not
+        let (mut sent, mut not_sent) = (false, None);
         let reply = loop {
-            if let Err(error) = exchange.send(()).await {
-                debug!(server, %error, "bootstrap query not sent, sending again later");
+            match exchange.send(()).await {
+                Ok(()) => sent = true,
+                Err(error) => {
+                    debug!(server, %error, "bootstrap query not sent, sending again later");
+                    not_sent = Some(error);
+                }
             }
-            match timeout(resend_after, exchange.reply()).await {
+            let resend_at = (Instant::now() + resend_after).min(deadline);
+            match timeout_at(resend_at, exchange.reply()).await {
                 Ok(Some((reply, ()))) => break reply?,
                 // 一份也没在等（都没发出去）：到了时候再发 / No copy waited for (none went out): another goes
                 // when the time comes
-                Ok(None) => tokio::time::sleep(resend_after).await,
+                Ok(None) => tokio::time::sleep_until(resend_at).await,
                 Err(_) => {}
+            }
+            if Instant::now() >= deadline {
+                return Err(match not_sent {
+                    Some(error) if !sent => anyhow::anyhow!("{server}: query not sent: {error:#}"),
+                    _ => anyhow::anyhow!("{server}: no answer in {}ms", ASK_BUDGET.as_millis()),
+                });
             }
         };
         let reply = Message::from_vec(&reply)?;
@@ -529,6 +556,32 @@ mod tests {
         assert_eq!(addresses.unwrap().len(), 2);
     }
 
+    /// 到了时限还没有回答的服务器，和查询根本没发出去的分开报：发出去过的是「no answer in 2000ms」，一份也没发出去的说
+    /// 最后一次为什么没发出去（这里是 socket 的 ID 都被占着；常见的是 IPv6 的 bootstrap 服务器在没有 IPv6 路由的机器上）
+    /// A server with no answer by the time limit is told from one never sent the query: one with a
+    /// copy sent is "no answer in 2000ms", one with none sent says why the latest could not go
+    /// (every ID of the socket taken, here; an IPv6 bootstrap server on a host with no IPv6 route,
+    /// commonly)
+    #[tokio::test]
+    async fn a_server_not_answering_is_told_from_one_never_asked() {
+        let silent = upstream(|_| Vec::new()).await;
+        let unasked = loopback_bootstrap(300).await;
+        let udp = Arc::new(UdpClient::new(1).expect("UDP client"));
+        udp.hold_every_id_for_tests();
+        let (silent_err, unasked_err) = futures::future::join(
+            through(&silent.address).addresses("upstream.test", 853),
+            Bootstrap::new(&unasked.address, udp).addresses("upstream.test", 853),
+        )
+        .await;
+        let silent_err = format!("{:#}", silent_err.expect_err("no answer"));
+        let no_answer = format!("{}: no answer in 2000ms", silent.address);
+        assert_eq!(silent_err.matches(&no_answer).count(), 2, "{silent_err}");
+        let unasked_err = format!("{:#}", unasked_err.expect_err("never asked"));
+        let not_sent = format!("{}: query not sent: udp pool exhausted", unasked.address);
+        assert_eq!(unasked_err.matches(&not_sent).count(), 2, "{unasked_err}");
+        assert_eq!(unasked.queries(), 0, "nothing reached the server");
+    }
+
     /// 只答 A、不答 AAAA 的服务器（或者反过来）给的地址照用：不答的那种等到时限就不等了，这次问不因它失败
     /// From a server answering A and never AAAA (or the other way round) the addresses it gives
     /// are used: the one unanswered is given up on at the time limit, and the asking does not
@@ -673,6 +726,49 @@ mod tests {
         ] {
             assert_eq!(err.matches(&failure).count(), 2, "{failure} in {err}");
         }
+    }
+
+    /// 问到过地址的名字后来两族都答 NXDOMAIN：上回的地址照用，[`ASK_AGAIN_AFTER`] 之后再问，这期间要地址的不另问
+    /// A name once given addresses that later has both families answer NXDOMAIN: the last
+    /// addresses stay in use, asked again after [`ASK_AGAIN_AFTER`], nothing wanting them
+    /// meanwhile asking again
+    #[tokio::test]
+    async fn a_name_given_no_address_any_more_keeps_its_last_ones_for_a_while() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let gone = Arc::new(AtomicBool::new(false));
+        let server = upstream({
+            let gone = Arc::clone(&gone);
+            move |query| match gone.load(Ordering::SeqCst) {
+                true => no_records(query, ResponseCode::NXDomain),
+                // TTL 为 0：下一次要时就在后台再问 / TTL 0: asked again in the background when next wanted
+                false => loopback_addresses(query, 0),
+            }
+        })
+        .await;
+        let bootstrap = through(&server.address);
+        let given = bootstrap.addresses("upstream.test", 853).await.unwrap();
+        gone.store(true, Ordering::SeqCst);
+        let now = bootstrap.addresses("upstream.test", 853).now_or_never();
+        assert_eq!(now.expect("at once").unwrap(), given);
+        let asked = asking(&bootstrap, "upstream.test").expect("asked again");
+        assert_eq!(asked.await.expect("the last addresses kept").len(), 2);
+        let queries = server.queries();
+        for _ in 0..3 {
+            let now = bootstrap.addresses("upstream.test", 853).now_or_never();
+            assert_eq!(now.expect("at once").unwrap(), given);
+        }
+        assert!(
+            asking(&bootstrap, "upstream.test").is_none(),
+            "not asked again yet"
+        );
+        assert_eq!(server.queries(), queries);
+        later_by(ASK_AGAIN_AFTER).await;
+        let now = bootstrap.addresses("upstream.test", 853).now_or_never();
+        assert_eq!(now.expect("at once").unwrap(), given);
+        assert!(
+            asking(&bootstrap, "upstream.test").is_some(),
+            "asked again by now"
+        );
     }
 
     /// 后台再问时 A 答了 SERVFAIL：A 上回问到的 127.0.0.1 留着，不换成只有 AAAA 的那半张
