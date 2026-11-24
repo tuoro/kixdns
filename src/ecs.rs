@@ -356,42 +356,42 @@ impl EcsKey {
     }
 
     /// The ECS option a query or reply carries: FAMILY, SOURCE PREFIX-LENGTH and
-    /// ADDRESS as sent. The address is cut to its first 16 octets and masked to
-    /// the prefix (RFC 7871 section 6 requires the bits beyond it to be zero, and
-    /// whatever they are, the subnet is the prefix's), so two options that name
-    /// the same subnet make equal keys.
-    /// 查询或应答携带的 ECS 选项：原样的 FAMILY、SOURCE PREFIX-LENGTH 和 ADDRESS。
-    /// 地址最多取前 16 个字节，并按前缀掩码（RFC 7871 第 6 节要求前缀之后的位为零；
+    /// ADDRESS as sent, the caller having checked that the family is 1 or 2, the prefix
+    /// within its bits and the address at most 16 octets (see `from_ip` and
+    /// `proto_utils::EcsOption::address_bits`). The address is masked to the prefix
+    /// (RFC 7871 section 6 requires the bits beyond it to be zero, and whatever they
+    /// are, the subnet is the prefix's), so two options that name the same subnet make
+    /// equal keys.
+    /// 查询或应答携带的 ECS 选项：原样的 FAMILY、SOURCE PREFIX-LENGTH 和 ADDRESS，地址族是 1 或 2、
+    /// 前缀不超过它的位数、地址不超过 16 个字节由调用方查过（见 `from_ip`、
+    /// `proto_utils::EcsOption::address_bits`）。地址按前缀掩码（RFC 7871 第 6 节要求前缀之后的位为零；
     /// 不管它们是什么，子网都由前缀决定），所以指同一个子网的两个选项得到相同的键。
     pub(crate) fn from_wire(family: u16, source_prefix: u8, address: &[u8]) -> Self {
         let mut addr = [0u8; 16];
-        let given = address.len().min(16);
-        addr[..given].copy_from_slice(&address[..given]);
-        let total_bits = match family {
-            1 => 32,
-            2 => 128,
-            _ => (given * 8) as u8,
-        };
-        let bits = source_prefix.min(total_bits);
-        mask_address(&mut addr, bits);
+        addr[..address.len()].copy_from_slice(address);
+        mask_address(&mut addr, source_prefix);
         Self {
             family,
             source_prefix,
             addr,
-            addr_len: (bits as usize).div_ceil(8) as u8,
+            addr_len: source_prefix.div_ceil(8),
         }
     }
 
-    /// 读不懂、或不完全符合 RFC 7871 第 6 节的 ECS 选项（地址族未知、前缀超长、地址长度不对、
-    /// 前缀之后的位不为零、查询里 SCOPE 不为 0、不止一个 ECS 选项）。透传客户端 ECS 的转发会把
-    /// 这样的选项原样发给上游，应答适用于谁说不准（`from_client_ip` 会去掉它）；键由选项的原始
-    /// 字节决定，不会和任何真实子网相等。
-    /// An ECS option that cannot be read, or does not follow RFC 7871 section 6 to
-    /// the letter (an unknown family, a prefix too long, the wrong address length,
-    /// bits set beyond the prefix, a nonzero SCOPE in a query, more than one ECS
-    /// option). A forward that passes the client's ECS on sends such an option as it
-    /// is, and whom the answer applies to is unclear (`from_client_ip` removes it);
-    /// its key comes from the option's raw bytes and never equals a real subnet.
+    /// 说不出是哪个子网的 ECS 选项：查询里 SCOPE 不为 0 的（它必须为 0，RFC 7871 第 6 节却没要求为此回
+    /// FORMERR，见 `proto_utils::query_subnet`），以及 `proto_utils::client_subnet` 读不出的报文和选项。
+    /// 从监听器进来的查询只会是前一种：地址不合规、不止一个 ECS 选项的当场回 FORMERR（见
+    /// `Engine::on_the_spot`），读不出的报文也到不了这里。透传客户端 ECS 的转发把这样的选项原样发给上游，
+    /// 应答适用于谁说不准（`from_client_ip` 会去掉它）；键由原始字节决定，不会和任何真实子网相等。
+    /// An ECS option that names no subnet one can tell: a nonzero SCOPE in a query (it
+    /// must be 0, but RFC 7871 section 6 asks no FORMERR for it, see
+    /// `proto_utils::query_subnet`), and a message or option `proto_utils::client_subnet`
+    /// cannot read. A query from a listener can only be the first: one with an improper
+    /// address or more than one ECS option is answered FORMERR on the spot (see
+    /// `Engine::on_the_spot`), and a message that cannot be read does not get here either.
+    /// A forward that passes the client's ECS on sends such an option as it is, and whom
+    /// the answer applies to is unclear (`from_client_ip` removes it); its key comes from
+    /// the raw bytes and never equals a real subnet.
     pub(crate) fn opaque(raw: &[u8]) -> Self {
         let mut addr = [0u8; 16];
         for (half, seed) in addr.chunks_mut(8).zip([1u8, 2u8]) {
