@@ -19,7 +19,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::net::TcpStream;
-use tokio::time::timeout_at;
 use tracing::warn;
 use webpki_roots::TLS_SERVER_ROOTS;
 
@@ -31,8 +30,8 @@ const ATTEMPT_DELAY: Duration = Duration::from_millis(250);
 /// 用 `attempt` 连上 `addresses` 里的一个（RFC 8305 第 4、5 节）：地址按族交替排开，第一个地址那一族在前；起一个尝试，
 /// 它过了 [`ATTEMPT_DELAY`] 还没连上、或者失败了，就接着起下一个，先连上的那个用，别的放弃；都失败时按失败的先后列出每个
 /// 地址和它的失败，日志里看得出连过哪些。到了建连的期限 `deadline`（见 [`Connect::attempt`]）还没连上时，已经失败的照列，
-/// 还在连的记成「多久没回应」：黑洞地址、丢掉的 SYN、不回的 DoQ 握手都是这样，原因里看得出是哪些地址。TCP、DoT、直连的
-/// DoH 和 DoQ 都这样连：前面的地址不回应时，后面的不用等到建连的时限才轮到
+/// 还在连的记成「多久没回应」：黑洞地址、丢掉的 SYN、不回的 TLS 或 DoQ 握手都是这样，原因里看得出是哪些地址。TCP、DoT、
+/// 直连的 DoH 和 DoQ 都这样连，一个尝试连同握手（见 [`connect_tcp`]）：前面的地址不回应时，后面的不用等到建连的时限才轮到
 /// Connects through `attempt` to one of `addresses` (RFC 8305 sections 4 and 5): the addresses
 /// alternate by family, the first address's family first; one attempt is started, and once it is
 /// not through after [`ATTEMPT_DELAY`], or has failed, the next one is, the first to connect
@@ -40,9 +39,10 @@ const ATTEMPT_DELAY: Duration = Duration::from_millis(250);
 /// in the order they failed, so a log shows what was dialled. Not through by the connect's
 /// `deadline` (see [`Connect::attempt`]), those failed are reported as ever and those still
 /// connecting as unanswered for so long: so for an address that is a black hole, a SYN dropped, a
-/// DoQ handshake never answered, the cause shows which addresses they were. TCP, DoT, direct DoH
-/// and DoQ all connect so: with an early address not answering, the later ones have their turn
-/// well within the connect's time limit
+/// TLS or DoQ handshake never answered, the cause shows which addresses they were. TCP, DoT,
+/// direct DoH and DoQ all connect so, an attempt taking in the handshake (see [`connect_tcp`]):
+/// with an early address not answering, the later ones have their turn well within the
+/// connect's time limit
 pub(super) async fn staggered<T, F>(
     addresses: Vec<SocketAddr>,
     deadline: tokio::time::Instant,
@@ -111,16 +111,25 @@ fn interleaved(addresses: Vec<SocketAddr>) -> Vec<SocketAddr> {
 }
 
 /// 连上写成 `主机:端口` 的地址（TCP、DoT 上游，直连的 DoH 上游）：主机名交给 `bootstrap` 解析，几个地址错开着连
-/// （见 [`staggered`]），最晚连到建连的期限 `deadline`，连上的那条再调好（见 [`tune_stream_socket`]）
+/// （见 [`staggered`]），最晚连到建连的期限 `deadline`。连一个地址是一整个尝试：TCP 连上、调好（见
+/// [`tune_stream_socket`]），再在上面做 `handshake`（DoT、DoH 的 TLS 握手，TCP 原样交出），所以握手不回应的地址和 SYN
+/// 不回应的一样，过了 [`ATTEMPT_DELAY`] 就连下一个，到期时原因里写着它
 /// Connects to an address written as `host:port` (TCP and DoT upstreams, a direct DoH one): the
 /// host name goes to `bootstrap`, several addresses are connected to staggered (see
-/// [`staggered`]) up to the connect's `deadline`, and the one connected is tuned (see
-/// [`tune_stream_socket`])
-pub(in crate::engine) async fn connect_tcp(
+/// [`staggered`]) up to the connect's `deadline`. Connecting to one address is one whole
+/// attempt: TCP connected and tuned (see [`tune_stream_socket`]), then `handshake` on it (the
+/// TLS handshake of DoT and DoH, TCP handing the stream on as it is), so an address not answering
+/// the handshake is as one not answering the SYN, the next dialled after [`ATTEMPT_DELAY`] and
+/// the cause at the deadline naming it
+pub(in crate::engine) async fn connect_tcp<T, F>(
     bootstrap: &Bootstrap,
     address: &str,
     deadline: tokio::time::Instant,
-) -> anyhow::Result<TcpStream> {
+    handshake: impl Fn(TcpStream) -> F,
+) -> anyhow::Result<T>
+where
+    F: Future<Output = anyhow::Result<T>>,
+{
     let addresses = match address.parse::<SocketAddr>() {
         Ok(address) => vec![address],
         Err(_) => {
@@ -132,12 +141,13 @@ pub(in crate::engine) async fn connect_tcp(
                 .await?
         }
     };
-    let stream = staggered(addresses, deadline, |address| async move {
-        Ok(TcpStream::connect(address).await?)
+    let handshake = &handshake;
+    staggered(addresses, deadline, |socket| async move {
+        let stream = TcpStream::connect(socket).await?;
+        tune_stream_socket(&stream, address);
+        handshake(stream).await
     })
-    .await?;
-    tune_stream_socket(&stream, address);
-    Ok(stream)
+    .await
 }
 
 /// TCP 连接的保活，TCP、DoT 和 DoH（直连的和经 reqwest 的）都一样：这么久没有收发就探一次，没回应隔这么久再探，探到系统定的
@@ -152,9 +162,9 @@ pub(in crate::engine) async fn connect_tcp(
 pub(super) const KEEPALIVE_TIME: Duration = Duration::from_secs(5);
 pub(super) const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(2);
 
-/// 刚建好的 TCP 连接（DoT、直连的 DoH 在握手之前也是）：关掉 Nagle，打开保活（见 [`KEEPALIVE_TIME`]）
-/// A freshly connected TCP stream (DoT's and a direct DoH one's too, before their handshakes):
-/// Nagle off and the keepalive on (see [`KEEPALIVE_TIME`])
+/// 刚连上的 TCP 连接（DoT、直连的 DoH 在握手之前）：关掉 Nagle，打开保活（见 [`KEEPALIVE_TIME`]）
+/// A freshly connected TCP stream (DoT's and a direct DoH one's before their handshakes): Nagle
+/// off and the keepalive on (see [`KEEPALIVE_TIME`])
 fn tune_stream_socket(stream: &TcpStream, upstream: &str) {
     let _ = stream.set_nodelay(true);
     let sock = SockRef::from(stream);
@@ -220,8 +230,10 @@ pub(in crate::engine) struct Connect {
     /// for each waiting on it; kept once through, until the next query asking for a connection has
     /// looked at what it gave
     attempt: Option<Attempt>,
-    /// 退避到什么时候，下一次失败退避多久 / Backing off until when, and for how long after the next failure
-    retry_at: Option<tokio::time::Instant>,
+    /// 上一次建连失败了：它的失败，退避到什么时候；上一次成功了是 None / The last connect having failed:
+    /// its failure, and backing off until when; None after a success
+    backing_off: Option<(ConnectFailed, tokio::time::Instant)>,
+    /// 下一次失败退避多久 / How long to back off after the next failure
     backoff: Duration,
 }
 
@@ -255,22 +267,24 @@ impl Default for Connect {
     fn default() -> Self {
         Self {
             attempt: None,
-            retry_at: None,
+            backing_off: None,
             backoff: CONNECT_BACKOFF,
         }
     }
 }
 
 impl Connect {
-    /// 在建的那一次；没有就用 `make` 起一次，退避期间是 Err。`make` 拿到这次建连的期限（[`CONNECT_BUDGET`] 以后），
-    /// 连地址的那一步自己按它收尾（见 [`staggered`]），说得出连过哪些地址；到期还没建完的（解析名字、TLS 握手卡住）在这里
-    /// 截住。上一次建完了的，先照它的结果定退避：成功了不退避，失败了从失败的那一刻起退避
+    /// 在建的那一次；没有就用 `make` 起一次，退避期间是 Err，说着上一次为什么失败、多久以前。`make` 拿到这次建连的期限
+    /// （[`CONNECT_BUDGET`] 以后），每一步自己按它收尾、说清卡在哪：解析名字有自己更短的时限（见
+    /// `bootstrap::ASK_BUDGET`），连地址连同握手到期时说得出连过哪些地址（见 [`staggered`]）。上一次建完了的，先照它的
+    /// 结果定退避：成功了不退避，失败了从失败的那一刻起退避
     /// The connect under way; with none, one started with `make`, except while backing off, which
-    /// is an Err. `make` is given the connect's deadline ([`CONNECT_BUDGET`] from now), by which
-    /// the step dialling addresses ends on its own (see [`staggered`]), telling which addresses it
-    /// dialled; one not through by then otherwise (resolving the name, a TLS handshake stuck) is
-    /// cut off here. One through already sets the backing off first by what it gave: none after a
-    /// success, and after a failure counted from when it failed
+    /// is an Err telling why the last one failed and how long ago. `make` is given the connect's
+    /// deadline ([`CONNECT_BUDGET`] from now), by which each step ends on its own, saying where it
+    /// stuck: resolving the name has a shorter limit of its own (see `bootstrap::ASK_BUDGET`), and
+    /// dialling addresses, handshakes included, tells at the deadline which addresses it dialled
+    /// (see [`staggered`]). One through already sets the backing off first by what it gave: none
+    /// after a success, and after a failure counted from when it failed
     pub(in crate::engine) fn attempt<F>(
         &mut self,
         make: impl FnOnce(tokio::time::Instant) -> F,
@@ -282,42 +296,32 @@ impl Connect {
             match attempt.peek() {
                 None => return Ok(attempt.clone()),
                 Some(Ok(())) => {
-                    self.retry_at = None;
+                    self.backing_off = None;
                     self.backoff = CONNECT_BACKOFF;
                 }
                 Some(Err(failed)) => {
-                    self.retry_at = Some(failed.at + self.backoff);
+                    self.backing_off = Some((failed.clone(), failed.at + self.backoff));
                     self.backoff = (self.backoff * 2).min(CONNECT_BACKOFF_AT_MOST);
                 }
             }
             self.attempt = None;
         }
-        if let Some(left) = self
-            .retry_at
-            .and_then(|at| at.checked_duration_since(tokio::time::Instant::now()))
+        let now = tokio::time::Instant::now();
+        if let Some((failed, until)) = &self.backing_off
+            && let Some(left) = until.checked_duration_since(now)
         {
             anyhow::bail!(
-                "connect failed lately, trying again in {}ms",
+                "connect failed {}ms ago: {failed}; trying again in {}ms",
+                now.duration_since(failed.at).as_millis(),
                 left.as_millis()
             );
         }
-        // 同一个期限：`timeout_at` 先看里面的，两边一起到期时交出的是连地址那一步自己的原因 / The one
-        // deadline: `timeout_at` looks at what it wraps first, so with both due at once the cause
-        // the dialling step gives is what comes out
-        let deadline = tokio::time::Instant::now() + CONNECT_BUDGET;
-        let made = timeout_at(deadline, make(deadline));
+        let made = make(now + CONNECT_BUDGET);
         let attempt = async move {
-            made.await
-                .unwrap_or_else(|_| {
-                    Err(anyhow::anyhow!(
-                        "connect timeout after {}ms",
-                        CONNECT_BUDGET.as_millis()
-                    ))
-                })
-                .map_err(|error| ConnectFailed {
-                    why: format!("{error:#}").into(),
-                    at: tokio::time::Instant::now(),
-                })
+            made.await.map_err(|error| ConnectFailed {
+                why: format!("{error:#}").into(),
+                at: tokio::time::Instant::now(),
+            })
         }
         .boxed()
         .shared();

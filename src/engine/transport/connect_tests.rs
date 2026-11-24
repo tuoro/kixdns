@@ -19,6 +19,25 @@ async fn backing_off_runs_on_tokio_clock() {
     assert!(connect.attempt(refused).is_ok(), "connects again past it");
 }
 
+/// 退避期间的错误说着上一次建连为什么失败、多久以前，还要等多久再连：拒绝、证书不对、RST 这样很快的失败几乎都落在
+/// 退避里，抽样记下的多半是这一句
+/// An error while backing off tells why the last connect failed and how long ago, and how long
+/// until the next: fast failures (refused, a bad certificate, a reset) mostly fall within the
+/// backing off, so this is mostly the line a sampled log keeps
+#[tokio::test(start_paused = true)]
+async fn backing_off_tells_why_the_last_connect_failed() {
+    let refused = |_| async { Err::<(), _>(anyhow::anyhow!("connect 192.0.2.1:853: refused")) };
+    let mut connect = Connect::default();
+    let attempt = connect.attempt(refused).expect("the first connect is made");
+    assert!(attempt.await.is_err());
+    tokio::time::advance(Duration::from_millis(100)).await;
+    let err = connect.attempt(refused).expect_err("backing off");
+    assert_eq!(
+        err.to_string(),
+        "connect failed 100ms ago: connect 192.0.2.1:853: refused; trying again in 150ms"
+    );
+}
+
 /// 连接活满最长时间、或者最晚的期限过后空闲满时限就用旧了，看哪个先到；中途来的查询把空闲往后推，用旧的时刻按单调时钟
 /// 算；都不限时一直不会用旧
 /// A connection is worn once it has lived its max age, or sat idle its limit past the latest
