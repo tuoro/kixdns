@@ -1,12 +1,11 @@
 //! 一条规则里的动作按写的顺序执行，先到的那个作数。几个 forward 合成一次转发（同时问所有上游）只在轮到 forward 时
-//! 才算：前面已经写了给出回应的动作时，规则给的就是那个回应。以前只要有两个以上 forward，完整路径就直接转发、不看
-//! 前面写了什么，而快速路径照第一个动作回静态应答：同一条规则，直接进它的规则组时回静态应答，跳转进来时却去转发。
+//! 才算：前面已经写了给出回应的动作时，规则给的就是那个回应。规则之间也一样只走一遍：continue 以后从被越过的规则的下一条
+//! 接着走，写在前面的规则不再执行一遍。
 //! The actions of a rule run in the order written and the first to decide stands. Several
 //! forwards merging into one (asking every upstream at once) counts only when a forward's turn
 //! comes: with an action that answers written before them, that answer is what the rule gives.
-//! With two or more forwards the full path used to forward whatever came before them, while the
-//! fast path answered the static first action: one rule gave the static answer to a request
-//! entering its pipeline directly and forwarded one that jumped in.
+//! The rules too are gone through once: after a continue evaluation resumes at the rule after
+//! the one continued past, the rules written before it not run a second time.
 
 use std::net::Ipv4Addr;
 use std::str::FromStr;
@@ -149,4 +148,43 @@ async fn a_log_written_before_the_forwards_logs_every_query() {
         .filter(|line| line.contains("matcher_log"))
         .count();
     assert_eq!(logged, 2);
+}
+
+/// continue 以后从被越过的规则的下一条接着走：写在前面、不作决定的规则不再执行一遍，它的 log 一个查询只记一次，不论后面
+/// continue 了几次
+/// After a continue evaluation resumes at the rule after the one continued past: a rule written
+/// before it that decides nothing runs no second time, its log recording a query once however
+/// many continues follow
+#[tokio::test]
+async fn a_log_before_the_continues_logs_a_query_once() {
+    let (warnings, _guard) = Warnings::capture();
+    let upstream = answering_upstream(UPSTREAM, 60).await;
+    let any = json!([{ "type": "any" }]);
+    let forward = json!([{ "type": "forward", "upstream": upstream.address }]);
+    let checked = |name: &str| {
+        json!({
+            "name": name, "matchers": any, "actions": forward,
+            "response_actions_on_match": [{ "type": "continue" }]
+        })
+    };
+    let engine = engine_from(json!({
+        "settings": counting_settings(json!({})),
+        "pipelines": [{ "id": "main", "rules": [
+            { "name": "log", "matchers": any, "actions": [{ "type": "log", "level": "warn" }] },
+            checked("first check"),
+            checked("second check"),
+            { "name": "forward", "matchers": any, "actions": forward },
+        ]}]
+    }));
+    assert_eq!(
+        first_a(&ask(&engine, &query(), peer()).await),
+        Some(UPSTREAM)
+    );
+    let logged = warnings
+        .lines()
+        .iter()
+        .filter(|line| line.contains("matcher_log"))
+        .count();
+    assert_eq!(logged, 1);
+    assert_eq!(upstream.queries(), 3, "each forward asked once");
 }

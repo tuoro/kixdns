@@ -35,11 +35,11 @@ pub enum Decision {
         pre_split_upstreams: Option<std::sync::Arc<Vec<std::sync::Arc<str>>>>,
         response_phase: Option<Arc<ResponsePhase>>,
         rule_name: Arc<str>,
-        /// 作出决策的规则在它的规则组里排第几（从 0 起）；没有规则作出决策时为 None。它 continue 以后按这个
-        /// 位置跳过它，不按名字：名字只是标签，两条规则可以同名
+        /// 作出决策的规则在它的规则组里排第几（从 0 起）；没有规则作出决策时为 None。它 continue 以后求值从这个
+        /// 位置的下一条接着走（见 `Route::resume_at`），不按名字找它：名字只是标签，两条规则可以同名
         /// The place in its pipeline (from 0) of the rule that decided; None when no rule did.
-        /// Once it continues it is skipped by this place, not by name: a name is a label, and
-        /// two rules may share one
+        /// Once it continues, evaluation resumes at the place after this one (see
+        /// `Route::resume_at`), not by its name: a name is a label, and two rules may share one
         rule_index: Option<usize>,
         /// 没写协议前缀的上游用的传输；写了前缀（`tcp://`、`https://` 这些）的照前缀（见 `upstream::forward_upstream`）
         /// The transport of an upstream written without a scheme; one written with a scheme

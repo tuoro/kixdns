@@ -73,11 +73,6 @@ pub fn select_pipeline<'a>(
 /// 没有 Pipeline 时用的名字 / The name used with no pipeline
 pub(crate) const NO_PIPELINE: &str = "default";
 
-/// 一个请求在当前规则组里已经 continue 过的规则，按它们在规则组里的位置记；一般只有一两条，不上堆
-/// The rules of the current pipeline a request has continued past, by their place in it;
-/// one or two as a rule, kept off the heap
-pub(crate) type Continued = SmallVec<[usize; 4]>;
-
 /// Immutable request state shared across rule evaluation and rule-cache insertion.
 pub struct RuleEvaluationContext<'a> {
     pub client_ip: IpAddr,
@@ -85,9 +80,12 @@ pub struct RuleEvaluationContext<'a> {
     pub qtype: RecordType,
     pub qclass: DNSClass,
     pub edns_present: bool,
-    /// 这次求值不看的规则，按它们在规则组里的位置（见 [`Continued`]）
-    /// The rules this evaluation leaves out, by their place in the pipeline (see [`Continued`])
-    pub skip_rules: Option<&'a [usize]>,
+    /// 从规则组里第几条规则（从 0 起）求值：continue 以后是被越过的那条规则的下一条，它之前的规则这个请求都已经求值过
+    /// （见 `Route::resume_at`）；0 是求值整个规则组
+    /// The place in the pipeline (from 0) of the rule evaluation starts at: after a continue the
+    /// one after the rule continued past, every rule before it evaluated for this request
+    /// already (see `Route::resume_at`); 0 to evaluate the whole pipeline
+    pub resume_at: usize,
     /// 后台刷新：求值整条 pipeline，不读规则缓存，照常写入决策
     /// A background refresh: the whole pipeline is evaluated, the rule cache is not read,
     /// and the decision is written as usual
@@ -104,7 +102,7 @@ impl<'a> RuleEvaluationContext<'a> {
         qtype: RecordType,
         qclass: DNSClass,
         edns_present: bool,
-        skip_rules: Option<&'a [usize]>,
+        resume_at: usize,
         background_refresh: bool,
     ) -> Self {
         Self {
@@ -113,7 +111,7 @@ impl<'a> RuleEvaluationContext<'a> {
             qtype,
             qclass,
             edns_present,
-            skip_rules,
+            resume_at,
             background_refresh,
             observed: None,
         }
@@ -239,7 +237,7 @@ impl Engine {
             qtype,
             qclass,
             edns_present,
-            skip_rules,
+            resume_at,
             background_refresh,
             ..
         } = *request;
@@ -256,14 +254,13 @@ impl Engine {
                 ecs: None,
             },
         );
-        // With rules skipped (the ones a continue passed), this evaluation does not
-        // give the pipeline's decision for the name, so it neither reads nor writes
-        // the rule cache. A background refresh evaluates the whole pipeline: it does
-        // not read the cache but still writes its decision.
-        // 跳过了规则（continue 越过的那些）时，这次求值得出的不是这个 pipeline 对这个
-        // 名字的决策，所以既不读也不写规则缓存。后台刷新求值的是整条 pipeline：不读
-        // 缓存，但照常写入决策。
-        let whole_pipeline = skip_rules.is_none_or(|set| set.is_empty());
+        // Resuming after a continue, this evaluation does not give the pipeline's decision
+        // for the name, so it neither reads nor writes the rule cache. A background refresh
+        // evaluates the whole pipeline: it does not read the cache but still writes its
+        // decision.
+        // continue 以后接着求值时，得出的不是这个 pipeline 对这个名字的决策，所以既不读也不写规则缓存。后台刷新求值的
+        // 是整条 pipeline：不读缓存，但照常写入决策。
+        let whole_pipeline = resume_at == 0;
         let allow_rule_cache_lookup = !background_refresh && whole_pipeline;
 
         if allow_rule_cache_lookup
@@ -360,7 +357,7 @@ impl Engine {
             qtype,
             qclass,
             edns_present,
-            skip_rules,
+            resume_at,
             ..
         } = *request;
         // 2. Candidate Selection: every pipeline is compiled with its configuration (see
@@ -387,12 +384,14 @@ impl Engine {
         let geo = GeoManagers::new(&self.geoip_manager, &self.geosite_manager);
 
         'rules: for idx in candidate_indices {
+            // continue 越过的规则和它之前的都已经求值过 / The rule a continue passed and those
+            // before it have been evaluated already
+            if idx < resume_at {
+                continue;
+            }
             // 候选出自这个 pipeline 自己的索引，同一份配置里编译出来的 / The candidates come from this
             // pipeline's own index, compiled from the same configuration
             let rule = &pipeline.rules[idx];
-            if skip_rules.is_some_and(|set| set.contains(&idx)) {
-                continue;
-            }
             let req_match = eval_match_chain(
                 &rule.matchers,
                 |m| m.operator,
@@ -672,35 +671,33 @@ mod continued_rule_cache_tests {
         }
     }
 
-    /// continue 之后，决策循环跳过越过的规则重新求值。那时得出的决策不是这个
-    /// pipeline 对这个名字的决策：以前它被写进规则缓存，在缓存过期前（最长 60 秒）
-    /// 之后的请求都直接从 `next` 开始，不经过 `first`。
-    /// After a continue, the decision loop evaluates the pipeline again without the
-    /// rules it passed. The decision it reaches then is not the pipeline's decision
-    /// for the name: it used to be written to the rule cache, so until that entry
-    /// expired (up to 60 s) later requests started at `next` and skipped `first`.
+    /// continue 之后，决策循环从越过的规则后面接着求值。那时得出的决策不是这个 pipeline 对这个名字的决策，不进规则缓存：
+    /// 进了的话，在缓存过期前（最长 60 秒）之后的请求都直接从 `next` 开始，不经过 `first`。
+    /// After a continue, the decision loop resumes evaluating after the rule it passed. The
+    /// decision it reaches then is not the pipeline's decision for the name and stays out of
+    /// the rule cache: written there, later requests would start at `next` and skip `first`
+    /// until that entry expired (up to 60 s).
     #[tokio::test]
     async fn a_decision_reached_after_a_continue_is_not_cached() {
         let engine = engine();
         let state = engine.state.load_full();
         let pipeline = &state.pipeline.pipelines[0];
-        let continued = [0usize];
-        let request = |skip_rules| {
+        let request = |resume_at| {
             RuleEvaluationContext::new(
                 "127.0.0.1".parse().unwrap(),
                 "example.com",
                 RecordType::A,
                 DNSClass::IN,
                 false,
-                skip_rules,
+                resume_at,
                 false,
             )
         };
 
-        let after_continue = engine.apply_rules(&state, pipeline, &request(Some(&continued[..])));
+        let after_continue = engine.apply_rules(&state, pipeline, &request(1));
         assert_eq!(rule_of(&after_continue), "next");
 
-        let fresh = engine.apply_rules(&state, pipeline, &request(None));
+        let fresh = engine.apply_rules(&state, pipeline, &request(0));
         assert_eq!(
             rule_of(&fresh),
             "first",
@@ -796,7 +793,7 @@ mod rule_cache_policy_tests {
                 RecordType::A,
                 DNSClass::IN,
                 false,
-                None,
+                0,
                 false,
             );
             engine.apply_rules(&state, pipeline, &request)
@@ -856,7 +853,7 @@ mod rule_cache_policy_tests {
                 RecordType::A,
                 DNSClass::IN,
                 false,
-                None,
+                0,
                 false,
             );
             engine.apply_rules(&state, plain, &request)
@@ -937,7 +934,7 @@ mod rule_cache_policy_tests {
                 RecordType::A,
                 DNSClass::IN,
                 false,
-                None,
+                0,
                 false,
             );
             engine.apply_rules(&state, pipeline, &request);
@@ -988,7 +985,7 @@ mod rule_cache_policy_tests {
                 RecordType::A,
                 DNSClass::IN,
                 false,
-                None,
+                0,
                 false,
             );
             match engine.apply_rules(&state, pipeline, &request) {
@@ -1037,7 +1034,7 @@ mod rule_cache_policy_tests {
                 RecordType::A,
                 DNSClass::IN,
                 false,
-                None,
+                0,
                 false,
             );
             let before = Instant::now();
@@ -1108,7 +1105,7 @@ mod rule_cache_policy_tests {
                 RecordType::A,
                 DNSClass::IN,
                 false,
-                None,
+                0,
                 false,
             );
             match engine.apply_rules(&state, pipeline, &request) {
@@ -1151,7 +1148,7 @@ mod rule_cache_policy_tests {
                 RecordType::A,
                 DNSClass::IN,
                 false,
-                None,
+                0,
                 false,
             );
             match engine.apply_rules(&state, plain, &request) {
@@ -1189,7 +1186,7 @@ mod rule_cache_policy_tests {
                 RecordType::A,
                 DNSClass::IN,
                 false,
-                None,
+                0,
                 false,
             );
             engine.apply_rules(&state, pipeline, &request);
