@@ -1411,23 +1411,22 @@ pub struct ValidationReport {
     pub warnings: Vec<String>,
 }
 
-/// 一份配置编译成运行时配置，热重载、面板的校验和试用都走这里，拒掉的和启动时会让内核起不来的一样：会悄悄做成
-/// 别的事的写法（见 [`problems`]）、说不通的设置（见 [`GlobalSettings::validate`]）、编译不了的匹配器和正则，以及监听地址和
-/// DoH 的前提（见 [`GlobalSettings::listeners`]）。拒掉时错误是一个 [`Problems`]，这些原因一条不落、一次列全。以前热重载
-/// 不查监听地址，`bind_udp` 写错了照样重载成功，等到重启内核才起不来；一次只报一个设置错误，几处写错要保存好几次才知道。
-/// 每条开头就写着是哪个设置或匹配器（`settings.bind_udp: …`、`pipelines[0].rules[2].matchers[1]: …`），不另加前缀，
-/// 和启动时起不来的错误一样。启动时 [`problems`] 记成错误、照样加载，见 [`compile_at_startup`]
+/// 一份配置编译成运行时配置，热重载、面板的校验和试用都走这里。拒掉的是会悄悄做成别的事的写法（见 [`problems`]），
+/// 以及启动时会让内核起不来的监听地址和 DoH 的前提（见 [`GlobalSettings::listeners`]）、说不通的设置（见
+/// [`GlobalSettings::validate`]）、编译不了的匹配器和正则。拒掉时错误是一个 [`Problems`]，这些原因照这个顺序一条不落、
+/// 一次列全：`bind_udp` 写错了重载当场就拒，不用等到重启内核起不来才知道；几处写错，保存一次就都知道。每条开头就写着
+/// 是哪个设置或匹配器（`settings.bind_udp: …`、`pipelines[0].rules[2].matchers[1]: …`），不另加前缀，和启动时起不来
+/// 的错误一样。启动时 [`problems`] 不拒绝，见 [`compile_at_startup`]
 /// A configuration compiled into its runtime form, which hot reload and the panel's validation
-/// and trial all go through, refusing what would stop the kernel at startup: what silently does
-/// something else (see [`problems`]), settings that make no sense (see
-/// [`GlobalSettings::validate`]), matchers and regexes that do not compile, and the listener
-/// addresses and DoH prerequisites (see [`GlobalSettings::listeners`]). When refused the error is
-/// a [`Problems`] listing every one of these reasons at once. Hot reload used not to check the
-/// listeners, so a mistyped `bind_udp` reloaded fine and the kernel then failed to start at the
-/// next restart; and one settings error was reported at a time, several mistakes taking as many
-/// saves to learn of. Each starts with the setting or matcher it is about (`settings.bind_udp:
-/// …`, `pipelines[0].rules[2].matchers[1]: …`) with no prefix added, as one stopping startup
-/// does. At startup [`problems`] are logged as errors and loaded all the same, see
+/// and trial all go through. It refuses what silently does something else (see [`problems`]),
+/// and what would stop the kernel at startup: the listener addresses and DoH prerequisites (see
+/// [`GlobalSettings::listeners`]), settings that make no sense (see
+/// [`GlobalSettings::validate`]), matchers and regexes that do not compile. When refused the
+/// error is a [`Problems`] listing every one of these reasons at once, in this order: a
+/// mistyped `bind_udp` is refused on the reload rather than found when a restart fails, and
+/// several mistakes take one save to learn of. Each starts with the setting or matcher it is
+/// about (`settings.bind_udp: …`, `pipelines[0].rules[2].matchers[1]: …`) with no prefix added,
+/// as one stopping startup does. At startup [`problems`] do not refuse it, see
 /// [`compile_at_startup`]
 pub fn compile(cfg: PipelineConfig) -> Result<RuntimePipelineConfig> {
     let found = problems(&cfg);
@@ -1435,26 +1434,33 @@ pub fn compile(cfg: PipelineConfig) -> Result<RuntimePipelineConfig> {
     Ok(runtime)
 }
 
-/// 启动时编译配置，连同要绑的监听地址：和 [`compile`] 一样一次列全拒掉的原因，只是 [`problems`] 不在里面，由调用方记成
-/// 错误、照样加载（超过上限的设置按上限用），已经在用的配置升级以后照样起得来
-/// The configuration compiled at startup, with the listeners to bind: every reason for refusing
-/// it listed at once as by [`compile`], save that [`problems`] are not among them, being logged as
-/// errors by the caller and loaded all the same (a setting over its limit held to it), so a
-/// configuration in use still starts after an upgrade
-pub fn compile_at_startup(cfg: PipelineConfig) -> Result<(RuntimePipelineConfig, ListenerConfig)> {
-    Ok(compile_refusing(cfg, Vec::new())?)
+/// 启动时编译配置，连同要绑的监听地址和它的 [`problems`]：[`problems`] 不拒绝，交给调用方记成错误、照样加载（超过上限的
+/// 设置按上限用），已经在用的配置升级以后照样起得来。别的原因拒掉时内核起不来，错误和 [`compile`] 的一样，[`problems`]
+/// 在前、一次列全，和重载被拒时列出的一条不差
+/// The configuration compiled at startup, with the listeners to bind and its [`problems`]: these
+/// do not refuse it, being handed to the caller to log as errors and loaded all the same (a
+/// setting over its limit held to it), so a configuration in use still starts after an upgrade.
+/// Refused for any other reason, the kernel does not start, and the error is the one [`compile`]
+/// gives, the [`problems`] first and all listed at once, as a refused reload lists them
+pub fn compile_at_startup(
+    cfg: PipelineConfig,
+) -> Result<(RuntimePipelineConfig, ListenerConfig, Vec<String>)> {
+    let found = problems(&cfg);
+    match compile_refusing(cfg, Vec::new()) {
+        Ok((runtime, listeners)) => Ok((runtime, listeners, found)),
+        Err(Problems(refused)) => Err(Problems([found, refused].concat()).into()),
+    }
 }
 
-/// 编译 `cfg`，`refused` 已经有的原因之后再列上设置、匹配器和监听地址的（见 [`compile`]），有一条就拒掉
-/// `cfg` compiled, the reasons of its settings, matchers and listeners listed after those
-/// `refused` holds already (see [`compile`]), refused on any one
+/// 编译 `cfg`，`refused` 已经有的原因之后依次列上监听地址、设置和匹配器的（见 [`Problems`]），有一条就拒掉
+/// `cfg` compiled, the reasons of its listeners, settings and matchers listed in turn after those
+/// `refused` holds already (see [`Problems`]), refused on any one
 fn compile_refusing(
     cfg: PipelineConfig,
     mut refused: Vec<String>,
 ) -> Result<(RuntimePipelineConfig, ListenerConfig), Problems> {
-    let listeners = cfg.settings.listeners();
+    let listeners = Problems::gather(&mut refused, cfg.settings.listeners());
     let runtime = Problems::gather(&mut refused, RuntimePipelineConfig::from_config(cfg));
-    let listeners = Problems::gather(&mut refused, listeners);
     match (runtime, listeners) {
         (Some(runtime), Some(listeners)) if refused.is_empty() => Ok((runtime, listeners)),
         _ => Err(Problems(refused)),
@@ -1491,8 +1497,9 @@ pub fn validate(raw: &str) -> Result<ValidationReport> {
 /// `AnyMatcher::written_empty`）、几个 pipeline 写了同一个 id、不是 IP 的静态 ECS 地址。以前这些都照常加载：
 /// 上游一直失败、rcode 变成 NXDOMAIN、静态应答变成 SERVFAIL、空后缀什么都匹配。
 ///
-/// 启动时记成错误、照样加载（超过上限的设置按上限用），已经在用的配置升级以后照样起得来；热重载和面板的校验
-/// （见 [`validate`]）拒绝它们，下一次改配置时就得改掉。
+/// 启动时记成错误、照样加载（超过上限的设置按上限用），已经在用的配置升级以后照样起得来；别的原因让内核起不来时，
+/// 它们和那些原因列在同一条错误里（见 [`compile_at_startup`]）。热重载和面板的校验（见 [`validate`]）拒绝它们，
+/// 下一次改配置时就得改掉。
 ///
 /// Ways of writing a configuration that silently do something else: an upstream
 /// address nothing can read, a misspelt rcode, an invalid static IP or CNAME target,
@@ -1503,8 +1510,9 @@ pub fn validate(raw: &str) -> Result<ValidationReport> {
 /// became SERVFAIL, the empty suffix matched everything.
 ///
 /// Startup only logs them and loads all the same (a setting over its limit held to it), so a
-/// configuration in use still starts after an upgrade; a reload and the panel's validation
-/// (see [`validate`]) refuse them, so the next change has to fix them.
+/// configuration in use still starts after an upgrade; when another reason stops the kernel,
+/// they are listed with it in the one error (see [`compile_at_startup`]). A reload and the
+/// panel's validation (see [`validate`]) refuse them, so the next change has to fix them.
 pub fn problems(cfg: &PipelineConfig) -> Vec<String> {
     let pipelines: rustc_hash::FxHashSet<&str> =
         cfg.pipelines.iter().map(|p| p.id.as_str()).collect();
@@ -1949,13 +1957,15 @@ impl<'de> Visitor<'de> for Unread<'_> {
     }
 }
 
-/// 一份配置被拒的原因，每条一句，一次列全（见 [`compile`]）：[`problems`]、说不通的设置（见 [`GlobalSettings::validate`]）、
-/// 监听地址和 DoH 的前提（见 [`GlobalSettings::listeners`]）、编译不了的匹配器。显示成用 `; ` 连起来的一句；要逐条列出的
-/// （控制通道校验的回答和 `config` 结果的 `last_reload`）用 [`Problems::of`] 从错误里取出来
-/// Why a configuration is refused, a sentence each and all of them at once (see [`compile`]):
-/// its [`problems`], settings that make no sense (see [`GlobalSettings::validate`]), the
-/// listener addresses and DoH prerequisites (see [`GlobalSettings::listeners`]), matchers that do
-/// not compile. It displays as one sentence, the reasons joined by `; `; what lists them one by
+/// 一份配置被拒的原因，每条一句，一次列全（见 [`compile`]），依次是 [`problems`]、监听地址和 DoH 的前提（见
+/// [`GlobalSettings::listeners`]）、说不通的设置（见 [`GlobalSettings::validate`]）、编译不了的匹配器：问题之后是设置的，
+/// 挨在一起，匹配器的在最后。显示成用 `; ` 连起来的一句；要逐条列出的（控制通道校验的回答和 `config` 结果的
+/// `last_reload`）用 [`Problems::of`] 从错误里取出来
+/// Why a configuration is refused, a sentence each and all of them at once (see [`compile`]), in
+/// turn its [`problems`], the listener addresses and DoH prerequisites (see
+/// [`GlobalSettings::listeners`]), settings that make no sense (see [`GlobalSettings::validate`])
+/// and matchers that do not compile: after the problems come the settings, together, and the
+/// matchers last. It displays as one sentence, the reasons joined by `; `; what lists them one by
 /// one (the control channel's validation answer and the `config` result's `last_reload`) takes
 /// them out of the error with [`Problems::of`]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3375,15 +3385,15 @@ mod validation_tests {
         }
     }
 
-    /// 一次校验列出全部拒掉的原因（见 `Problems`）：配置问题、说不通的设置、监听地址和 DoH 的前提、编译不了的匹配器，
-    /// 按这个顺序、每条一项。启动时配置问题照样加载，别的一样一次列全、不让启动。以前设置一错就停，min_tll 拼错、
-    /// cache_capacity 和 upstream_timeout_ms 写成 0、bind_udp 写成 localhost:53 的配置要保存四次才知道全部
+    /// 一次校验列出全部拒掉的原因（见 `Problems`）：配置问题、监听地址和 DoH 的前提、说不通的设置、编译不了的匹配器，
+    /// 按这个顺序、每条一项，min_tll 拼错、cache_capacity 和 upstream_timeout_ms 写成 0、bind_udp 写成 localhost:53 的
+    /// 配置保存一次就知道全部。启动时别的原因让它起不来，配置问题也列在那条错误里，和重载列出的一条不差
     /// One validation lists every reason for refusing (see `Problems`): the configuration
-    /// problems, settings that make no sense, the listener addresses and DoH prerequisites,
-    /// matchers that do not compile, in this order and an entry each. At startup the problems
-    /// load all the same, and the rest is listed all at once too and refuses to start. The first
-    /// settings error used to stop it, so a configuration with min_tll misspelt, cache_capacity and
-    /// upstream_timeout_ms written 0 and bind_udp written localhost:53 took four saves to learn it all
+    /// problems, the listener addresses and DoH prerequisites, settings that make no sense,
+    /// matchers that do not compile, in this order and an entry each, so a configuration with
+    /// min_tll misspelt, cache_capacity and upstream_timeout_ms written 0 and bind_udp written
+    /// localhost:53 takes one save to learn it all. At startup, which the rest refuses, the
+    /// problems are listed in that error too, just as a reload lists them
     #[test]
     fn one_validation_lists_every_reason_at_once() {
         let config = serde_json::json!({
@@ -3418,14 +3428,14 @@ mod validation_tests {
             starts,
             [
                 "settings.min_tll",
-                "settings.cache_capacity",
-                "settings.upstream_timeout_ms",
-                "pipelines[0].rules[0].matchers[0]",
-                "pipelines[0].rules[0].matchers[1]",
                 "settings.bind_udp",
                 "settings.bind_tcp",
                 "settings.doh_tls_cert",
                 "settings.doh_tls_key",
+                "settings.cache_capacity",
+                "settings.upstream_timeout_ms",
+                "pipelines[0].rules[0].matchers[0]",
+                "pipelines[0].rules[0].matchers[1]",
             ],
             "{reasons:#?}"
         );
@@ -3434,7 +3444,7 @@ mod validation_tests {
         let at_startup =
             super::compile_at_startup(super::parse_config(&config.to_string()).expect("parses"))
                 .expect_err("does not start");
-        assert_eq!(super::Problems::of(&at_startup), &reasons[1..]);
+        assert_eq!(super::Problems::of(&at_startup), reasons);
     }
 
     /// 设置本身说不通时，错误是一行英文，开头写着设置和它的值，和配置问题的写法一样：监听地址、DoH 的前提、取值范围和
