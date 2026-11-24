@@ -11,7 +11,6 @@ use hickory_proto::rr::{DNSClass, RecordType};
 use serde_json::{Value, json};
 
 use crate::engine::test_support::engine_from;
-use crate::matcher::advanced_rule::compile_pipelines;
 use crate::matcher::{RequestFacts, RuntimePipelineConfig, eval_match_chain};
 
 const LABELS: [&str; 9] = ["a", "b", "ex", "cn", "com", "google", "ads", "x", "a\\046b"];
@@ -137,9 +136,8 @@ async fn the_compiled_index_misses_no_rule_that_matches() {
         }))
         .expect("parse config");
         let runtime = RuntimePipelineConfig::from_config(config).expect("build runtime config");
-        let compiled = compile_pipelines(&runtime);
         let pipeline = &runtime.pipelines[0];
-        let index = &compiled[0].index;
+        let index = &pipeline.index;
         for _ in 0..40 {
             let qname = if rng.below(20) == 0 {
                 String::new()
@@ -205,7 +203,7 @@ fn a_rule_is_filed_under_its_most_selective_condition() {
     }))
     .expect("parse config");
     let runtime = RuntimePipelineConfig::from_config(config).expect("build runtime config");
-    let index = &compile_pipelines(&runtime)[0].index;
+    let index = &runtime.pipelines[0].index;
     let candidates = |name: &str| index.get_candidates(name, RecordType::A).to_vec();
     assert_eq!(candidates("other.test"), Vec::<usize>::new());
     assert_eq!(candidates("y.example"), Vec::<usize>::new());

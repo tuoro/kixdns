@@ -8,41 +8,8 @@ use smallvec::SmallVec;
 
 use crate::config::{Action, MatchOperator};
 use crate::engine::{make_static_cname_answer, make_static_ip_answer, static_ips};
-use crate::matcher::{
-    GeoManagers, RequestFacts, RuntimeMatcher, RuntimeMatcherWithOp, RuntimePipeline,
-    RuntimePipelineConfig, RuntimeRule,
-};
+use crate::matcher::{GeoManagers, RequestFacts, RuntimeMatcher, RuntimePipeline, RuntimeRule};
 use crate::matcher::{domain_suffix_index_key, eval_match_chain, parse_rcode};
-
-#[derive(Debug, Clone)]
-pub struct CompiledPipeline {
-    pub id: Arc<str>,
-    pub rules: Vec<CompiledRule>,
-    pub index: RuleIndex,
-    /// 能当场决定的（见 `CompiledRule::precomputed`）最后一条规则的位置，一条都没有时为 None。快速路径求值候选规则到
-    /// 这里为止：再往后不论哪条命中都只能交给完整路径，在快速路径上求值它们（正则、GeoIP）是白算一遍
-    /// Where the last rule that decides on the spot (see `CompiledRule::precomputed`) is, None
-    /// when there is none. The fast path evaluates candidate rules up to here: whichever matches
-    /// beyond it goes to the full path anyway, and evaluating them on the fast path (a regex,
-    /// GeoIP) was work done twice
-    pub last_precomputed: Option<usize>,
-}
-
-#[derive(Debug, Clone)]
-pub struct CompiledRule {
-    /// Rule name from the configuration, reported to observers on fast-path matches.
-    /// 配置中的规则名，快速路径命中时上报给观察者。
-    pub rule_name: Arc<str>,
-    /// 规则的匹配器，和完整规则路径共用同一份、同一个判断（`RuntimeMatcher::matches`，GeoIP、GeoSite 数据也一样读），两条
-    /// 路径对规则是否命中从不分歧。以前快速路径另有一份 `CompiledMatcher`，把每种匹配器重写了一遍，后来又复制一份
-    /// 完整规则的
-    /// The rule's matchers, shared with the full rule path and judged the same way
-    /// (`RuntimeMatcher::matches`, reading the GeoIP and GeoSite data alike), so the two paths never
-    /// disagree on whether a rule matches. The fast path used to keep a `CompiledMatcher` of its
-    /// own, every kind of matcher written out again, and then a copy of the full rule's
-    pub matchers: Arc<[RuntimeMatcherWithOp]>,
-    pub precomputed: Option<PrecomputedAction>,
-}
 
 /// 规则当场作出的决定：照配置写好的应答，或跳到另一个 pipeline，快速路径跟过去在那里接着查
 /// What a rule decides on the spot: an answer as the configuration writes it, or a jump to
@@ -130,6 +97,15 @@ pub struct RuleIndex {
 }
 
 impl RuleIndex {
+    /// `rules` 的索引，规则按它们的位置记 / The index of `rules`, each rule filed by its place
+    pub fn of(rules: &[RuntimeRule]) -> Self {
+        let mut index = Self::default();
+        for (idx, rule) in rules.iter().enumerate() {
+            index.add_rule(idx, rule);
+        }
+        index
+    }
+
     /// 「且」连起来的规则只在每个条件都成立时命中，记在哪个条件下都不会漏掉它；记在最挑的那个下，它当候选的次数最少：
     /// 先看精确的名字，再看后缀，最后看类型。以前记在第一个能记的条件下，写成「qtype A 且后缀 example.com」的规则，
     /// 每个 A 查询都要求值一遍
@@ -138,7 +114,7 @@ impl RuleIndex {
     /// fewest times: an exact name first, then a suffix, then a type. It used to be filed under
     /// the first condition that could be, and a rule written "qtype A and suffix example.com" was
     /// evaluated for every A query
-    pub fn add_rule(&mut self, rule_idx: usize, rule: &CompiledRule) {
+    fn add_rule(&mut self, rule_idx: usize, rule: &RuntimeRule) {
         let and_chain = rule
             .matchers
             .iter()
@@ -195,38 +171,11 @@ impl RuleIndex {
     }
 }
 
-pub fn compile_pipelines(cfg: &RuntimePipelineConfig) -> Vec<CompiledPipeline> {
-    cfg.pipelines.iter().map(compile_pipeline).collect()
-}
-
-fn compile_pipeline(p: &RuntimePipeline) -> CompiledPipeline {
-    let mut rules = Vec::with_capacity(p.rules.len());
-    let mut index = RuleIndex::default();
-
-    for (idx, rule) in p.rules.iter().enumerate() {
-        let compiled = compile_rule(rule);
-        index.add_rule(idx, &compiled);
-        rules.push(compiled);
-    }
-
-    CompiledPipeline {
-        id: p.id.clone(),
-        last_precomputed: rules.iter().rposition(|rule| rule.precomputed.is_some()),
-        rules,
-        index,
-    }
-}
-
-fn compile_rule(rule: &RuntimeRule) -> CompiledRule {
-    CompiledRule {
-        rule_name: rule.name.clone(),
-        matchers: Arc::clone(&rule.matchers),
-        precomputed: precompute_action(rule),
-    }
-}
-
-fn precompute_action(rule: &RuntimeRule) -> Option<PrecomputedAction> {
-    let answer = match rule.actions.first()? {
+/// 规则当场作出的决定：第一个动作是照配置写好的应答或跳转时就是它，别的（转发、先记日志的）为 None
+/// What a rule decides on the spot: its first action when that is an answer as the
+/// configuration writes it or a jump, None otherwise (a forward, one logging first)
+pub(super) fn precompute_action(actions: &[Action]) -> Option<PrecomputedAction> {
+    let answer = match actions.first()? {
         Action::StaticResponse { rcode } => PrecomputedAnswer::Static {
             rcode: parse_rcode(rcode)?,
         },
@@ -253,7 +202,7 @@ fn precompute_action(rule: &RuntimeRule) -> Option<PrecomputedAction> {
 /// and without Geo data.
 #[cfg(test)]
 pub(crate) fn fast_static_match(
-    pipeline: &CompiledPipeline,
+    pipeline: &RuntimePipeline,
     qname: &str,
     qtype: RecordType,
     qclass: DNSClass,
@@ -287,7 +236,7 @@ pub(crate) fn fast_static_match(
 /// caller who can answer from it need not make the records, and the name of that rule.
 /// 同 [`fast_static_match`]，但给出命中规则的动作而不是决策（能直接按动作回答的就不必做记录），以及规则名。
 pub(crate) fn fast_static_match_with_rule<'a>(
-    pipeline: &'a CompiledPipeline,
+    pipeline: &'a RuntimePipeline,
     facts: &RequestFacts<'_>,
     geo: GeoManagers<'_>,
 ) -> Option<(&'a PrecomputedAction, &'a str)> {
@@ -311,7 +260,7 @@ pub(crate) fn fast_static_match_with_rule<'a>(
             return rule
                 .precomputed
                 .as_ref()
-                .map(|action| (action, &*rule.rule_name));
+                .map(|action| (action, &*rule.name));
         }
     }
     None
