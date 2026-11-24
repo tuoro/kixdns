@@ -2048,18 +2048,20 @@ pub(crate) struct Route {
     /// have one budget, a response action's jump with the rule-level jumps after it another (see
     /// `Route::response_jumped`)
     jumps_left: usize,
-    /// 接下来的应答所依据的上游应答在缓存里能留多久：在这些键下回答检查做决定时据的每一份上游应答里最短的那个（见
-    /// `Route::went_by`），还没据过哪份应答时为 None。此后缓存的应答都不比它留得久，交出去的记录 TTL 也不比它长（见
-    /// `Route::cache`），规则给出的静态应答、转发拿到的应答都一样：哪一份到期了，上游都可能答得不一样，回答检查也就可能
-    /// 走另一条路，给出别的应答。请求阶段跳进别的 pipeline、换了键，又从 None 开始：那里给出的，直接进那里的请求也照样拿到
-    /// How long the upstream answers what answers next goes by may stay in the cache: the
-    /// least of every upstream answer an answer check decided on under these keys (see
-    /// `Route::went_by`), None while none has been gone by. No answer cached from here on stays
-    /// longer, nor does a record TTL going out run longer (see `Route::cache`), be it a static
-    /// answer the rules give or one a forward fetches: once any of them expires the upstream
-    /// may answer otherwise, and the checks may take another way to another answer. A
-    /// request-phase jump into another pipeline, changing the keys, starts again from None: what
-    /// is given there is given to the requests entering there directly too
+    /// 接下来的应答所依据的上游应答的 TTL：在这些键下回答检查做决定时据的每一份上游应答里最短的那个，每份都和记录的 TTL
+    /// 一样收进 min_ttl..=cache_max_ttl（见 `Route::went_by`），还没据过哪份应答时为 None。此后缓存的应答都不比它留得久，
+    /// 交出去的每条记录 TTL 也不比它长（见 `Route::cache`），规则给出的静态应答、转发拿到的应答都一样：哪一份到期了，上游都
+    /// 可能答得不一样，回答检查也就可能走另一条路，给出别的应答。请求阶段跳进别的 pipeline、换了键，又从 None 开始：那里
+    /// 给出的，直接进那里的请求也照样拿到
+    /// The TTL of the upstream answers what answers next goes by: the least of every upstream
+    /// answer an answer check decided on under these keys, each brought into
+    /// min_ttl..=cache_max_ttl as a record's TTL is (see `Route::went_by`), None while none has
+    /// been gone by. No answer cached from here on stays longer, nor does any record TTL going
+    /// out run longer (see `Route::cache`), be it a static answer the rules give or one a
+    /// forward fetches: once any of them expires the upstream may answer otherwise, and the
+    /// checks may take another way to another answer. A request-phase jump into another
+    /// pipeline, changing the keys, starts again from None: what is given there is given to the
+    /// requests entering there directly too
     answer_ttl: Option<u32>,
     /// 回答检查据上游失败做了决定（见 `Route::went_by`）：上游没有回答、miss 动作接手了，或者回答检查看到的是失败应答（见
     /// `upstream::is_failure_reply`）。此后规则给出的静态应答只是这一次请求的兜底，不是这个问题的应答，不缓存（见
@@ -2179,12 +2181,14 @@ impl Route {
         self.resume_at = rule + 1;
     }
 
-    /// 回答检查做了决定，据的是一份能在缓存里留 `ttl` 秒的上游回答（`Some(ttl)`）：记进 `answer_ttl`，此后缓存的应答最多
-    /// 留这么久；或者据的是上游失败（None）：记进 `fell_back`，此后规则给出的静态应答是兜底
-    /// An answer check decided, going by an upstream answer that may stay in the cache `ttl`
-    /// seconds (`Some(ttl)`): noted in `answer_ttl`, no answer cached from here on staying
-    /// longer; or going by an upstream failure (None): noted in `fell_back`, a static answer the
-    /// rules give from here on being a fallback
+    /// 回答检查做了决定，据的是一份 TTL 为 `ttl` 的上游回答（`Some(ttl)`，它自己的 TTL 收进 min_ttl..=cache_max_ttl，见
+    /// `phases::ttl_within`）：记进 `answer_ttl`，此后缓存的应答最多留这么久；或者据的是上游失败（None）：记进
+    /// `fell_back`，此后规则给出的静态应答是兜底
+    /// An answer check decided, going by an upstream answer of TTL `ttl` (`Some(ttl)`, its own
+    /// TTL brought into min_ttl..=cache_max_ttl, see `phases::ttl_within`): noted in
+    /// `answer_ttl`, no answer cached from here on staying longer; or going by an upstream
+    /// failure (None): noted in `fell_back`, a static answer the rules give from here on being a
+    /// fallback
     pub(crate) fn went_by(&mut self, ttl: Option<u32>) {
         match ttl {
             Some(ttl) => {
@@ -2220,17 +2224,19 @@ impl Route {
     }
 
     /// 在这条路线的键下为 `request` 缓存应答 `bytes`，适用于 trail 接受的请求方，给出交出去的那一份：留 `ttl` 秒，但不比
-    /// `answer_ttl` 久，为 0 时不写（见 `phases::ttl_to_cache`、[`Self::static_ttl`]）。`answer_ttl` 比 `ttl` 短时，比它
-    /// 长的记录 TTL 也一起封到它（见 `proto_utils::reply_within_ttls`）：交给客户端、等待者的和写进缓存的是同一份，客户端
-    /// 留它的时间和缓存一样长，条目的 TTL 也仍是记录里最小的那个。转发拿到的、规则给出的应答都经这里写，都受这个上限
+    /// `answer_ttl` 久，为 0 时不写（见 `phases::ttl_to_cache`、[`Self::static_ttl`]）。有 `answer_ttl` 时，比它长的记录
+    /// TTL 一律封到它（见 `proto_utils::reply_within_ttls`），不论记录里最短的那个比它短还是长：短 A 记录旁边的长 CNAME、
+    /// 没有 SOA 的否定应答带的别名都不例外。交给客户端、等待者的和写进缓存的是同一份，客户端留每条记录的时间都不比缓存长。
+    /// 转发拿到的、规则给出的应答都经这里写，都受这个上限
     /// Cache the answer `bytes` for `request` under this route's keys, for the requesters the
     /// trail admits, giving back the copy that goes out: for `ttl` seconds yet no longer than
     /// `answer_ttl`, nothing being cached at 0 (see `phases::ttl_to_cache`,
-    /// [`Self::static_ttl`]). With `answer_ttl` shorter than `ttl`, the record TTLs longer than
-    /// it are brought down to it as well (see `proto_utils::reply_within_ttls`): the client, the
-    /// waiters and the cache get the one copy, the client keeping it as long as the cache does,
-    /// and the entry's TTL is still the least of its records'. Answers forwards fetch and
-    /// answers the rules give are written here alike, under this bound alike
+    /// [`Self::static_ttl`]). With `answer_ttl` given, every record TTL longer than it is
+    /// brought down to it (see `proto_utils::reply_within_ttls`), whether the least of the
+    /// records' is shorter or longer: a long CNAME next to a short A record, or the aliases of a
+    /// negative answer without SOA, are no exception. The client, the waiters and the cache get
+    /// the one copy, the client keeping no record longer than the cache does. Answers forwards
+    /// fetch and answers the rules give are written here alike, under this bound alike
     pub(crate) fn cache(
         &self,
         engine: &Engine,
@@ -2241,10 +2247,11 @@ impl Route {
         ttl: u32,
     ) -> Bytes {
         let (bytes, ttl) = match self.answer_ttl {
-            Some(most) if most < ttl => {
-                (crate::proto_utils::reply_within_ttls(bytes, 0, most), most)
-            }
-            _ => (bytes, ttl),
+            Some(most) => (
+                crate::proto_utils::reply_within_ttls(bytes, 0, most),
+                ttl.min(most),
+            ),
+            None => (bytes, ttl),
         };
         if ttl > 0 {
             engine.insert_dns_cache_entry(

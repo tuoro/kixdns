@@ -328,21 +328,30 @@ fn serve_fresh(
     resp_bytes
 }
 
-/// 缓存留一份应答多久：它自己的 TTL（记录里最小的，否定应答用 SOA 的负缓存 TTL）收进
-/// `min_ttl..=cache_max_ttl`，和应答带的 TTL 一样（见 `forward_upstream`）；0 就不缓存。
-/// 它自己的 TTL 为 0 时不缓存：要么没有可依据的 TTL（没有 SOA 的否定应答，RFC 2308 第 4 节说不要
-/// 缓存），要么 min_ttl 为 0 时记录的 TTL 就是 0。
-/// How long the cache keeps an answer: its own TTL (the least of its records', the
-/// SOA negative TTL for a negative answer) brought into `min_ttl..=cache_max_ttl`,
-/// as the TTLs the answer carries are (see `forward_upstream`); 0 means not cached.
-/// An own TTL of 0 is not cached: either the answer gives no TTL to go by (a
-/// negative answer without SOA, which RFC 2308 section 4 says not to cache), or,
-/// with min_ttl 0, its records have TTL 0.
+/// 一份上游应答自己的 TTL（记录里最小的，否定应答用 SOA 的负缓存 TTL，没有 SOA 的为 0）收进
+/// `min_ttl..=cache_max_ttl`，和应答带的每条记录一样（见 `forward_upstream`）。回答检查据它做的决定按这个算（见
+/// `Route::went_by`），缓存它多久也从这里算（见 [`ttl_to_cache`]）
+/// An upstream answer's own TTL (the least of its records', the SOA negative TTL for a
+/// negative answer, 0 for one without SOA) brought into `min_ttl..=cache_max_ttl`, as every
+/// record the answer carries is (see `forward_upstream`). A decision an answer check takes on
+/// it goes by this (see `Route::went_by`), and how long it is cached comes from here too (see
+/// [`ttl_to_cache`])
+fn ttl_within(engine: &Engine, own_ttl: u64, min_ttl: Duration) -> u32 {
+    proto_utils::saturating_u64_to_u32(own_ttl.max(min_ttl.as_secs())).min(engine.ttl_cap())
+}
+
+/// 缓存留一份应答多久：它自己的 TTL 收进范围（见 [`ttl_within`]）；0 就不缓存。它自己的 TTL 为 0 时不缓存：要么没有可
+/// 依据的 TTL（没有 SOA 的否定应答，RFC 2308 第 4 节说不要缓存），要么 min_ttl 为 0 时记录的 TTL 就是 0
+/// How long the cache keeps an answer: its own TTL brought into the range (see
+/// [`ttl_within`]); 0 means not cached. An own TTL of 0 is not cached: either the answer gives
+/// no TTL to go by (a negative answer without SOA, which RFC 2308 section 4 says not to
+/// cache), or, with min_ttl 0, its records have TTL 0
 fn ttl_to_cache(engine: &Engine, own_ttl: u64, min_ttl: Duration) -> u32 {
     if own_ttl == 0 {
-        return 0;
+        0
+    } else {
+        ttl_within(engine, own_ttl, min_ttl)
     }
-    proto_utils::saturating_u64_to_u32(own_ttl.max(min_ttl.as_secs())).min(engine.ttl_cap())
 }
 
 /// How a reply served from the cache gets its TTLs / 从缓存给出的应答怎样设置 TTL
@@ -1101,16 +1110,18 @@ impl<'a> Forwarding<'a> {
 
     /// 执行 `actions`：带着回答检查看过的上游应答 `ctx`，或者上游失败以后不带。回答检查看到的是失败应答（见
     /// `upstream::is_failure_reply`）时和不带一样，算上游失败，那时给出的结果是兜底（刷新到不了那里，见 [`Self::settle`]、
-    /// [`Self::weigh`]）。据上游回答给出的、continue 或跳转以后给出的，不论静态应答还是转发拿到的，都不比这一路上回答检查
-    /// 据过的哪份回答在缓存里留得久（见 `Route::answer_ttl`）。上游失败以后给出的静态应答是兜底，不缓存，此后规则给出的静态
-    /// 应答也都不缓存；转发拿到的照常缓存，故障期间备用上游的回答也是这个问题的回答（见 `Route::fell_back`）
+    /// [`Self::weigh`]）。据上游回答给出的、continue 或跳转以后给出的，不论静态应答还是转发拿到的，在缓存里留的时间和交出去
+    /// 的记录 TTL 都不比这一路上回答检查据过的哪份回答的 TTL 长，那份回答的 TTL 和记录的一样收进 min_ttl..=cache_max_ttl（见
+    /// `Route::answer_ttl`）。上游失败以后给出的静态应答是兜底，不缓存，此后规则给出的静态应答也都不缓存；转发拿到的照常
+    /// 缓存，故障期间备用上游的回答也是这个问题的回答（见 `Route::fell_back`）
     /// Run `actions`: with the upstream answer `ctx` the answer check read, or without one after
     /// an upstream failure. A failure reply the check read (see `upstream::is_failure_reply`)
     /// counts as one without, an upstream failure, when what they give is a fallback (a refresh
     /// never gets there, see [`Self::settle`], [`Self::weigh`]). What is given by an upstream
     /// answer, or after a continue or a jump on it, be it a static answer or one a forward
-    /// fetched, stays in the cache no longer than any answer the checks on the way went by may
-    /// (see `Route::answer_ttl`). A static answer given after an upstream failure is a fallback
+    /// fetched, stays in the cache and carries record TTLs no longer than the TTL of any answer
+    /// the checks on the way went by, brought into min_ttl..=cache_max_ttl as a record's is (see
+    /// `Route::answer_ttl`). A static answer given after an upstream failure is a fallback
     /// and not cached, nor is any static answer the rules give after it; one a forward fetches
     /// is cached as usual, a backup upstream's answer during the failure answering the question
     /// all the same (see `Route::fell_back`)
@@ -1125,7 +1136,7 @@ impl<'a> Forwarding<'a> {
         self.route.went_by(
             ctx.as_ref()
                 .filter(|ctx| !is_failure_reply(ctx.msg.metadata.response_code))
-                .map(|ctx| ttl_to_cache(self.engine, extract_ttl(&ctx.msg), min_ttl)),
+                .map(|ctx| ttl_within(self.engine, extract_ttl(&ctx.msg), min_ttl)),
         );
         let ctx = rules::ApplyResponseActionsContext {
             engine: self.engine,
@@ -1575,14 +1586,20 @@ mod refresh_response_rule_tests {
     }
 
     /// 上游回答里每条记录的 TTL 都收进 min_ttl 到 cache_max_ttl 之间，缓存也照收过的存，客户端留一份
-    /// 回答的时间就和缓存一样长；两者冲突时以 cache_max_ttl 为准。此前 min_ttl 只决定存不存，条目还是
+    /// 回答的时间就和缓存一样长；两者冲突时以 cache_max_ttl 为准。回答检查之后响应动作转发拿到的回答，每条记录
+    /// 还不比回答检查据的那份回答的 TTL 长（见 `Route::cache`）：那份回答就来自同一个上游，记录里最短的是 5
+    /// 秒的那条，收进范围以后是 60、300 或 5。此前 min_ttl 只决定存不存，条目还是
     /// 照上游的 TTL 过期；cache_max_ttl 只限制条目存多久，客户端拿到的仍是上游的 TTL。
     /// The TTL of every record in an upstream answer is brought into min_ttl to
     /// cache_max_ttl and the cache keeps what was brought in, so a client keeps an
-    /// answer as long as the cache does; cache_max_ttl wins when the two cross.
-    /// min_ttl used to decide only whether an answer was cached, the entry still
-    /// expiring by the upstream's TTL; cache_max_ttl only bounded how long an entry
-    /// was kept, clients still getting the upstream's TTL.
+    /// answer as long as the cache does; cache_max_ttl wins when the two cross. An
+    /// answer a response action's forward gets after an answer check carries no record
+    /// longer than the TTL of the answer the check went by, either (see `Route::cache`):
+    /// that answer comes from the same upstream, the least of its records the one of 5
+    /// seconds, 60, 300 or 5 once brought into the range. min_ttl used to decide only
+    /// whether an answer was cached, the entry still expiring by the upstream's TTL;
+    /// cache_max_ttl only bounded how long an entry was kept, clients still getting the
+    /// upstream's TTL.
     #[tokio::test]
     async fn answers_carry_and_are_cached_with_ttls_within_min_ttl_and_cache_max_ttl() {
         let upstream = spawn_upstream_replying(|query, question| {
@@ -1614,6 +1631,11 @@ mod refresh_response_rule_tests {
         ];
         for (path, rule) in &rules {
             for (settings, carried, cached) in &cases {
+                let carried = if *path == "response action" {
+                    [*cached; 2]
+                } else {
+                    *carried
+                };
                 let engine =
                     engine_with(settings.clone(), json!([{ "id": "main", "rules": [rule] }]));
                 for round in ["miss", "hit"] {
@@ -1624,7 +1646,7 @@ mod refresh_response_rule_tests {
                     let ttls = record_ttls(&reply);
                     // 命中时减去已经缓存的秒数，跨过一秒的边界时少 1 / A hit takes off the seconds cached, 1 past a second boundary
                     assert!(
-                        ttls == *carried || ttls == carried.map(|ttl| ttl - 1),
+                        ttls == carried || ttls == carried.map(|ttl| ttl - 1),
                         "{path} {settings} {round}: {ttls:?}"
                     );
                 }

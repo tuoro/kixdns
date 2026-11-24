@@ -77,7 +77,7 @@ impl Engine {
             }
         } else {
             match proto_utils::header_reply(packet) {
-                Some(refused) => refused,
+                Some(reply) => reply,
                 None => return OnTheSpot::Drop,
             }
         };

@@ -1,7 +1,7 @@
-//! 应答的 EDNS 跟着查询走（见 `proto_utils::edns_as_asked`）：带 EDNS 的查询拿回 OPT，DO 位照抄；
+//! 应答的 EDNS 跟着查询走（见 `proto_utils::edns_as_asked_with`）：带 EDNS 的查询拿回 OPT，DO 位照抄；
 //! 不带的拿不到 OPT。静态回答、缓存命中、合并的在途查询和监听器自己构造的 SERVFAIL 都一样，
 //! RD、CD 位也照抄查询。
-//! The reply's EDNS follows the query (see `proto_utils::edns_as_asked`): a query with
+//! The reply's EDNS follows the query (see `proto_utils::edns_as_asked_with`): a query with
 //! EDNS gets an OPT back with its DO bit, one without gets none. So do static answers,
 //! answers from the cache, merged inflight queries and the SERVFAIL a listener builds,
 //! and the RD and CD bits are the query's too.
