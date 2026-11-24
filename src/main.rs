@@ -409,21 +409,13 @@ async fn run_dns_server(
     let watch = watcher::ConfigWatch::new(&config);
     let (cfg, config_source) = load_config_with_source(&config).context("load initial config")?;
     let version = cfg.version.clone();
-    // 起不来时问题和让它起不来的原因一次列全在那条致命错误里（见 `config::Problems`），每条开头就写着是哪个设置或匹配器，
-    // 和重载、校验时一样（见 `config::compile_at_startup`）
-    // When it cannot start, the problems and the reasons it cannot are listed all at once in the
-    // fatal error (see `config::Problems`), each starting with the setting or matcher it is about,
-    // as on a reload and in validation (see `config::compile_at_startup`)
+    // 配置让它起不来时，问题和让它起不来的原因一次列全在那条致命错误里（见 `config::Problems`），每条开头就写着是哪个设置
+    // 或匹配器，和重载、校验时一样（见 `config::compile_at_startup`）
+    // When the configuration stops it from starting, the problems and the reasons it cannot start
+    // are listed all at once in the fatal error (see `config::Problems`), each starting with the
+    // setting or matcher it is about, as on a reload and in validation (see
+    // `config::compile_at_startup`)
     let (cfg, listeners, problems) = kixdns::config::compile_at_startup(cfg)?;
-    // 起得来时问题照样加载（超过上限的设置按上限用，见 `config::problems`），升级以后已经在用的配置照样起得来；重载和面板
-    // 的校验会拒绝它们。和重载拒绝时一样记 error，默认日志级别就看得到
-    // Once it starts the problems load all the same (a setting over its limit held to it, see
-    // `config::problems`), so a configuration in use still starts after an upgrade; a reload and
-    // the panel's validation refuse them. They are logged at error, as the reload refusing them
-    // is, so the default log level shows them
-    for problem in &problems {
-        error!(%problem, "configuration problem, loaded all the same; a reload or a save from the panel refuses it");
-    }
     let bind_addr = listeners.udp;
     let bind_tcp = listeners.tcp;
 
@@ -473,6 +465,19 @@ async fn run_dns_server(
         engine = engine.observer(observer);
     }
     let engine = engine.build().context("initialize DNS engine")?;
+    // 端口占住了、引擎也建好了，内核起来了：问题照样加载（超过上限的设置按上限用，见 `config::problems`），升级以后已经在用
+    // 的配置照样起得来；重载和面板的校验会拒绝它们。和重载拒绝时一样记 error，默认日志级别就看得到。端口被占等起不来时只记
+    // 那一条致命错误，不说问题照样加载了：那不是配置的毛病，重载也不因此拒绝，错误里不列问题
+    // With the ports taken and the engine built the kernel is up: the problems load all the same
+    // (a setting over its limit held to it, see `config::problems`), so a configuration in use
+    // still starts after an upgrade; a reload and the panel's validation refuse them. They are
+    // logged at error, as the reload refusing them is, so the default log level shows them. When
+    // it cannot start, a port being taken say, that fatal error alone is logged, not that the
+    // problems were loaded: it is no fault of the configuration, nor does a reload refuse it, and
+    // the error lists no problem
+    for problem in &problems {
+        error!(%problem, "configuration problem, loaded all the same; a reload or a save from the panel refuses it");
+    }
 
     // 监视不了时配置文件改了不会重载，面板保存的配置也不生效：记一条 error，默认日志级别看得到，面板经控制通道读
     // （`config` 的 `watch_error`）。装的时候就有位置监视不上、文件改了指向以后新的地方监视不上时也一样，又监视上了就

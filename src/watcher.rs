@@ -281,6 +281,13 @@ struct Target {
     configured: PathBuf,
     /// 它的变化出现在哪些路径的事件里（见 [`watch_points`]）/ The paths its changes show up under in events (see [`watch_points`])
     points: Vec<PathBuf>,
+    /// 替它记着数的目录（见 [`Targets::dirs`]）：监视点所在的目录里监视上了的，每个监视点一项。撤它的监视时只减这些，
+    /// 没替它监视上的目录不减：那个目录后来替它或别的文件监视上了，记的数是后来那些的
+    /// The directories counted for it (see [`Targets::dirs`]): those of its watch points'
+    /// directories that went in, one per watch point. Its watches come out by these alone,
+    /// never by a directory that did not go in for it: watched later, for it or another file,
+    /// that directory's count is theirs
+    held: Vec<PathBuf>,
 }
 
 /// 有位置监视不上的文件：配置里写的路径，和为什么 / The files with places that cannot be watched:
@@ -312,27 +319,40 @@ impl Targets {
                 continue;
             }
             let points = watch_points(path).map_err(notify::Error::io)?;
-            let mut watched = false;
-            let mut first_error = None;
-            for dir in points.iter().filter_map(|point| point.parent()) {
-                match targets.add_dir(&mut watcher, dir) {
-                    Ok(()) => watched = true,
-                    Err(err) => {
-                        first_error.get_or_insert(err);
-                    }
-                }
-            }
-            match (watched, first_error) {
-                (false, Some(err)) => return Err(err),
-                (true, Some(err)) => uncovered.push((path.clone(), err)),
+            let (held, first_error) = targets.hold(&mut watcher, &points);
+            match (held.is_empty(), first_error) {
+                (true, Some(err)) => return Err(err),
+                (false, Some(err)) => uncovered.push((path.clone(), err)),
                 _ => {}
             }
             targets.files.push(Target {
                 configured: path.clone(),
                 points,
+                held,
             });
         }
         Ok((watcher, targets, uncovered))
+    }
+
+    /// 监视 `points` 所在的目录，给出监视上了的（见 [`Target::held`]），和第一个监视不上的为什么
+    /// Watches the directories of `points`, giving those that went in (see [`Target::held`]),
+    /// and why the first that did not
+    fn hold(
+        &mut self,
+        watcher: &mut RecommendedWatcher,
+        points: &[PathBuf],
+    ) -> (Vec<PathBuf>, Option<notify::Error>) {
+        let mut held = Vec::with_capacity(points.len());
+        let mut first_error = None;
+        for dir in points.iter().filter_map(|point| point.parent()) {
+            match self.add_dir(watcher, dir) {
+                Ok(()) => held.push(dir.to_path_buf()),
+                Err(err) => {
+                    first_error.get_or_insert(err);
+                }
+            }
+        }
+        (held, first_error)
     }
 
     /// 多一个监视点用 `dir`，头一个时开始监视它 / One more watch point uses `dir`; the first starts watching it
@@ -368,14 +388,11 @@ impl Targets {
         let points = watch_points(&self.files[index].configured).map_err(notify::Error::io)?;
         // 先装新的再撤旧的，两边都用着的目录不会断开 / The new watches go in before the old come out,
         // so a directory both use is never dropped
-        let mut uncovered = None;
-        for dir in points.iter().filter_map(|point| point.parent()) {
-            if let Err(err) = self.add_dir(watcher, dir) {
-                uncovered.get_or_insert(err);
-            }
-        }
-        let old = std::mem::replace(&mut self.files[index].points, points);
-        for dir in old.iter().filter_map(|point| point.parent()) {
+        let (held, uncovered) = self.hold(watcher, &points);
+        let target = &mut self.files[index];
+        target.points = points;
+        let old = std::mem::replace(&mut target.held, held);
+        for dir in &old {
             self.remove_dir(watcher, dir);
         }
         uncovered.map_or(Ok(()), Err)
@@ -1112,6 +1129,14 @@ mod tests {
         );
     }
 
+    /// 在监视的目录，排好序 / The directories watched, sorted
+    #[cfg(unix)]
+    fn watched_dirs(targets: &Targets) -> Vec<PathBuf> {
+        let mut dirs: Vec<PathBuf> = targets.dirs.keys().cloned().collect();
+        dirs.sort();
+        dirs
+    }
+
     /// 链接改指向以后，旧目标所在的目录不再监视，新目标所在的目录开始监视；目录集合里只剩还用得着的
     /// Once a link points elsewhere, the old target's directory is no longer watched and the
     /// new target's is; the directory set keeps only what is still needed
@@ -1129,20 +1154,87 @@ mod tests {
         symlink(real.join("old/data.json"), &configured).unwrap();
         let (mut watcher, mut targets, _) =
             Targets::watch(std::slice::from_ref(&configured), |_| {}).expect("watch");
-        let dirs = |targets: &Targets| {
-            let mut dirs: Vec<PathBuf> = targets.dirs.keys().cloned().collect();
-            dirs.sort();
-            dirs
-        };
-        assert_eq!(dirs(&targets), [real.join("conf"), real.join("old")]);
+        assert_eq!(
+            watched_dirs(&targets),
+            [real.join("conf"), real.join("old")]
+        );
 
         std::fs::remove_file(&configured).unwrap();
         symlink(real.join("new/data.json"), &configured).unwrap();
         targets.refresh(&mut watcher, 0).expect("watched");
-        assert_eq!(dirs(&targets), [real.join("conf"), real.join("new")]);
+        assert_eq!(
+            watched_dirs(&targets),
+            [real.join("conf"), real.join("new")]
+        );
         assert_eq!(
             targets.files[0].points,
             [configured.clone(), real.join("new/data.json")]
+        );
+    }
+
+    /// 装监视的时候符号链接指向的目录还不在，后来建好了：文件重新解析（链接重建、Rescan）时那个目录监视上，并且留着——
+    /// 撤旧监视只减当初替它监视上的目录，没监视上的那个不减
+    /// A symlink leading into a directory not there when the watch is installed, made later:
+    /// once the file is resolved again (the link made anew, a Rescan) that directory is
+    /// watched, and stays so, as the old watches come out only for the directories that went in
+    /// for it, not for the one that did not
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_made_later_stays_watched_once_the_file_is_resolved_again() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let real = std::fs::canonicalize(root.path()).unwrap();
+        let (conf, missing) = (real.join("conf"), real.join("missing"));
+        std::fs::create_dir(&conf).unwrap();
+        let configured = conf.join("data.json");
+        std::os::unix::fs::symlink(missing.join("data.json"), &configured).unwrap();
+        let (mut watcher, mut targets, uncovered) =
+            Targets::watch(std::slice::from_ref(&configured), |_| {}).expect("watch");
+        assert_eq!(uncovered.len(), 1, "{uncovered:?}");
+        assert_eq!(watched_dirs(&targets), std::slice::from_ref(&conf));
+
+        std::fs::create_dir(&missing).unwrap();
+        std::fs::write(missing.join("data.json"), "v1").unwrap();
+        targets
+            .refresh(&mut watcher, 0)
+            .expect("watched everywhere");
+        assert_eq!(watched_dirs(&targets), [conf, missing]);
+    }
+
+    /// 两个文件都经同一个目录监视：其中一个改指别处以后，另一个在那个目录的监视还在。别的文件替它监视上的目录，一个文件
+    /// 不会当成自己的减掉
+    /// Two files watched through one directory: once one of them points elsewhere, the other
+    /// is still watched there. A directory watched for another file is not taken away by a file
+    /// as its own
+    #[cfg(unix)]
+    #[test]
+    fn a_file_moving_off_a_shared_directory_leaves_the_other_watched_there() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().expect("tempdir");
+        let real = std::fs::canonicalize(root.path()).unwrap();
+        let (conf, shared) = (real.join("conf"), real.join("shared"));
+        std::fs::create_dir(&conf).unwrap();
+        let (first, second) = (conf.join("first.json"), conf.join("second.json"));
+        symlink(shared.join("first.json"), &first).unwrap();
+        std::fs::write(&second, "second").unwrap();
+        let (mut watcher, mut targets, _) =
+            Targets::watch(&[first, second.clone()], |_| {}).expect("watch");
+        let point_second_at = |target: PathBuf| {
+            std::fs::remove_file(&second).unwrap();
+            symlink(target, &second).unwrap();
+        };
+
+        std::fs::create_dir(&shared).unwrap();
+        point_second_at(shared.join("second.json"));
+        targets.refresh(&mut watcher, 1).expect("second watched");
+        targets.refresh(&mut watcher, 0).expect("first watched");
+        assert_eq!(watched_dirs(&targets), [conf.clone(), shared.clone()]);
+
+        point_second_at(conf.join("second.real.json"));
+        targets.refresh(&mut watcher, 1).expect("second watched");
+        assert_eq!(
+            watched_dirs(&targets),
+            [conf, shared],
+            "first is still watched in the shared directory"
         );
     }
 
