@@ -209,12 +209,11 @@ pub(super) struct RuleReads {
     forward_subnets: RequesterScope,
     /// Pipelines its answer checks jump to / 回答检查跳到的 pipeline
     response_jumps: Vec<Arc<str>>,
-    /// Pipelines its rules jump to / 规则跳到的 pipeline
-    request_jumps: Vec<Arc<str>>,
+    /// Pipelines its rules jump to after an earlier rule's answer check may have continued
+    /// 前面的规则的回答检查可能 continue 之后，规则跳到的 pipeline
+    continued_jumps: Vec<Arc<str>>,
     /// Pipelines its rules or answer checks jump to / 规则或回答检查跳到的 pipeline
     jumps: Vec<Arc<str>>,
-    /// Whether an answer check continues / 是否有回答检查会 continue
-    continues: bool,
     /// The Geo data its rules read / 规则读的 Geo 数据
     geo: GeoData,
 }
@@ -226,12 +225,13 @@ impl RuleReads {
             matchers: RequesterScope::default(),
             forward_subnets: RequesterScope::default(),
             response_jumps: Vec::new(),
-            request_jumps: Vec::new(),
+            continued_jumps: Vec::new(),
             jumps: Vec::new(),
-            continues: false,
             geo: GeoData::default(),
         };
         let mut answer_edns = false;
+        // 前面有没有哪条规则的回答检查会 continue / Whether an earlier rule's answer check continues
+        let mut continued = false;
         for rule in rules {
             let (response_matchers, on_match, on_miss) =
                 ResponsePhase::parts(rule.response_phase.as_deref());
@@ -289,10 +289,6 @@ impl RuleReads {
                     });
                 }
             }
-            reads.continues |= on_match
-                .iter()
-                .chain(on_miss)
-                .any(|action| matches!(action, Action::Continue));
             let jump_target = |action: &Action| match action {
                 Action::JumpToPipeline { pipeline } => Some(Arc::clone(pipeline)),
                 _ => None,
@@ -302,9 +298,15 @@ impl RuleReads {
                 reads.jumps.push(target);
             }
             for target in rule.actions.iter().filter_map(jump_target) {
-                reads.request_jumps.push(target.clone());
+                if continued {
+                    reads.continued_jumps.push(target.clone());
+                }
                 reads.jumps.push(target);
             }
+            continued |= on_match
+                .iter()
+                .chain(on_miss)
+                .any(|action| matches!(action, Action::Continue));
         }
         reads.matchers = reads.request_matchers.clone();
         if answer_edns {
@@ -350,46 +352,41 @@ fn requester_scopes(
         .map(|idx| {
             let mut scope = reads[idx].matchers.clone();
             scope.extend(&reads[idx].forward_subnets);
-            // After a forward, an answer check may jump, and the request runs the
-            // rules along the jump path before its waiters, and the cache under this
-            // pipeline's key, take the answer. Forwards there send the packet this
-            // pipeline's forward sent as it is (its subnet counted above), so only
-            // matchers count.
-            // 转发之后回答检查可能跳转，请求运行跳转路径上的规则，之后等待者拿到应答，应答也缓存在
-            // 这个 pipeline 的键下。那里的转发原样发出这个 pipeline 的转发发出的包（它的子网上面已经
-            // 计入），所以只有匹配器计入。
+            // After a forward, an answer check may jump, or continue to rules that jump, and
+            // the request runs the rules along those paths before its waiters (see
+            // `Route::held_inflight`), and the cache under this pipeline's key, take the
+            // answer (see `RuntimePipeline::answered_through`): their matchers count.
+            // 转发之后回答检查可能跳转，或者 continue 到会跳转的规则，请求运行这些路径上的规则，之后等待者（见
+            // `Route::held_inflight`）拿到应答，应答也缓存在这个 pipeline 的键下（见
+            // `RuntimePipeline::answered_through`）：那里的匹配器计入。
             for &reached in &answered_through[idx] {
                 scope.extend(&reads[reached].matchers);
             }
-            // After an answer check continues, the request keeps its entry for the
-            // rest of the decision loop (see `Route::held_inflight`)
-            // and its waiters take the final answer. The rest of the pipeline and
-            // the pipelines it jumps to may decide that answer, and forwards there
-            // send their own ECS, which this pipeline's key does not carry.
-            // 回答检查 continue 之后，请求在决策循环余下的部分一直持有条目（见
-            // `Route::held_inflight`），等待者拿到最终应答。这个应答可能由
-            // pipeline 余下的规则和它跳到的 pipeline 决定，而那里的转发发送自己的 ECS，
-            // 本 pipeline 的键并不带着。
-            if reads[idx].continues {
-                let targets = reads[idx]
-                    .request_jumps
-                    .iter()
-                    .filter_map(|target| index.get(target).copied());
-                for reached in reachable_pipelines(reads, index, targets) {
-                    scope.extend(&reads[reached].matchers);
-                    scope.extend(&reads[reached].forward_subnets);
-                }
+            // Forwards on an answer check's jump path send the packet this pipeline's
+            // forward sent as it is (its subnet counted above); those reached by a jump
+            // after a continue send their own ECS, which this pipeline's key does not
+            // carry otherwise, so their subnets count too.
+            // 回答检查跳转路径上的转发原样发出这个 pipeline 的转发发出的包（它的子网上面已经计入）；
+            // continue 之后跳到的转发发送自己的 ECS，本 pipeline 的键本来不带着，所以它们的子网也计入。
+            let targets = reads[idx]
+                .continued_jumps
+                .iter()
+                .filter_map(|target| index.get(target).copied());
+            for reached in reachable_pipelines(reads, index, targets) {
+                scope.extend(&reads[reached].forward_subnets);
             }
             scope
         })
         .collect()
 }
 
-/// 按各 pipeline 的规则读什么（`reads`，和 `pipelines` 一一对应），给每个 pipeline 填上它分辨请求方的依据、回答阶段跳到的
-/// pipeline、规则阶段的依据和用到的 Geo 数据；`index` 按 id 找 pipeline 的位置
+/// 按各 pipeline 的规则读什么（`reads`，和 `pipelines` 一一对应），给每个 pipeline 填上它分辨请求方的依据、据过上游的回答
+/// 以后跳到的 pipeline（见 `RuntimePipeline::answered_through`）、规则阶段的依据和用到的 Geo 数据；`index` 按 id 找
+/// pipeline 的位置
 /// From what each pipeline's rules read (`reads`, one for each of `pipelines`), fill in every
-/// pipeline's way of telling requesters apart, the pipelines its answer checks jump to, what its
-/// rules alone read, and the Geo data it uses; `index` finds a pipeline's place by its id
+/// pipeline's way of telling requesters apart, the pipelines it jumps to once an upstream's
+/// answer has been gone by (see `RuntimePipeline::answered_through`), what its rules alone read,
+/// and the Geo data it uses; `index` finds a pipeline's place by its id
 pub(super) fn fill_requester_scopes(
     pipelines: &mut [RuntimePipeline],
     reads: &[RuleReads],
@@ -401,6 +398,7 @@ pub(super) fn fill_requester_scopes(
             let targets = rule_reads
                 .response_jumps
                 .iter()
+                .chain(&rule_reads.continued_jumps)
                 .filter_map(|target| pipeline_id_index.get(target).copied());
             reachable_pipelines(reads, pipeline_id_index, targets)
         })
@@ -414,12 +412,13 @@ pub(super) fn fill_requester_scopes(
     {
         pipeline.requester = scope;
         pipeline.rule_requester = rule_reads.request_matchers.clone();
-        // 这个 pipeline 的键下缓存的是它自己的规则给的，和回答检查跳过去拿到的；请求阶段跳过去的应答缓存在目标的键下
-        // （见 `engine::execution::Route::enter`），不随目标读的数据换命名空间
-        // Cached under this pipeline's keys are what its own rules give and what its answer
-        // checks' jumps get; the answers a request-phase jump gets are cached under the
-        // target's keys (see `engine::execution::Route::enter`), so the data the target reads
-        // does not move this namespace
+        // 这个 pipeline 的键下缓存的是它自己的规则给的，和回答检查跳过去、continue 以后的规则跳过去拿到的；别的请求阶段
+        // 跳转拿到的应答缓存在目标的键下（见 `engine::execution::Route::enter`），不随目标读的数据换命名空间
+        // Cached under this pipeline's keys are what its own rules give and what is got by its
+        // answer checks' jumps and by the jumps of its rules after a continue; the answers any
+        // other request-phase jump gets are cached under the target's keys (see
+        // `engine::execution::Route::enter`), so the data that target reads does not move this
+        // namespace
         let mut geo = rule_reads.geo.clone();
         for &reached in &through {
             geo.extend(&reads[reached].geo);

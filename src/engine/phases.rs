@@ -1231,9 +1231,7 @@ impl<'a> Forwarding<'a> {
     fn hand_over(&mut self, answer: &Bytes) {
         if let Some(guard) = self.registered.as_mut() {
             let (request, route) = (self.request, &*self.route);
-            guard.hand_over(|| {
-                for_waiters(answer, &request.requester, &route.trail, route.echo_floor)
-            });
+            guard.hand_over(|| for_waiters(answer, &request.requester, &route.trail));
         }
     }
 
@@ -1312,18 +1310,13 @@ pub(crate) fn client_reply(
 /// 等在这个请求条目上的请求拿到的应答：和这个请求自己的客户端拿到的一样（见
 /// `client_reply`）。它们发送的 ECS 相同（inflight 键带着它），回显也就是它们的，它们自己的
 /// `client_reply` 会保留它。
-pub(crate) fn for_waiters(
-    reply: &Bytes,
-    requester: &Requester,
-    trail: &EcsReach,
-    echo_floor: u8,
-) -> Bytes {
+pub(crate) fn for_waiters(reply: &Bytes, requester: &Requester, trail: &EcsReach) -> Bytes {
     match requester.ecs {
         None => reply.clone(),
         Some(client) => client_reply(
             reply.clone(),
             Some(&client),
-            echo_floor.max(trail.echo_scope(&requester.ecs_view())),
+            trail.echo_scope(&requester.ecs_view()),
         ),
     }
 }
@@ -2096,23 +2089,21 @@ mod refresh_response_rule_tests {
         assert_eq!(cached, Some(vec![STATIC.parse().unwrap()]));
     }
 
+    /// continue 之后跳过去拿到的应答缓存在入口的键下（见 `Route::enter`），刷新拿它更新条目：静态应答和转发拿到的都一样
+    /// What a jump after a continue gets is cached under the entry's key (see `Route::enter`), and
+    /// the refresh renews the entry with it: a static answer and a forwarded one alike
     #[tokio::test]
-    async fn a_refresh_drops_the_entry_when_a_continue_reaches_a_jump() {
-        let later = vec![rule("jump", jump_to("other"), json!({}))];
-        let cached =
-            refresh_with_actions_on_the_answer(json!({}), continue_(), later, static_target())
-                .await;
-        assert_eq!(cached, None);
-    }
-
-    #[tokio::test]
-    async fn a_refresh_drops_the_entry_when_a_continue_jumps_to_an_answering_target() {
+    async fn a_refresh_renews_the_entry_with_what_a_jump_after_a_continue_reaches() {
         let answering = answering_upstream(FINAL, 300).await.address;
-        let later = vec![rule("jump", jump_to("other"), json!({}))];
-        let target = rule("target", forward(&answering), json!({}));
-        let cached =
-            refresh_with_actions_on_the_answer(json!({}), continue_(), later, target).await;
-        assert_eq!(cached, None);
+        for (target, renewed) in [
+            (static_target(), STATIC.parse().unwrap()),
+            (rule("target", forward(&answering), json!({})), FINAL),
+        ] {
+            let later = vec![rule("jump", jump_to("other"), json!({}))];
+            let cached =
+                refresh_with_actions_on_the_answer(json!({}), continue_(), later, target).await;
+            assert_eq!(cached, Some(vec![renewed]));
+        }
     }
 
     #[tokio::test]

@@ -190,19 +190,21 @@ struct ActiveConfig {
     /// Settings the current configuration changes that take a restart to apply (see
     /// `ConfigLoaded::restart_pending`)
     restart_pending: Vec<String>,
-    /// 启动时读的配置里、重载和面板保存会拒绝的写法（见 `config::problems`），每条截到 [`MAX_ERROR_LENGTH`]。启动时照旧
+    /// 启动时读的配置里、重载和面板保存会拒绝的写法（见 `config::problems`），每条截到 [`MAX_ERROR_LENGTH`]。启动时照样
     /// 加载、各记一条 error，也经控制通道报出来，面板不用翻日志；重载成功说明新配置没有这样的写法，就清空
     /// What the configuration read at startup writes that a reload or a save from the panel
-    /// refuses (see `config::problems`), each cut to [`MAX_ERROR_LENGTH`]. Startup loads it as
-    /// before and logs an error for each, and they are reported over the control channel too, so
+    /// refuses (see `config::problems`), each cut to [`MAX_ERROR_LENGTH`]. Startup loads it all
+    /// the same and logs an error for each, and they are reported over the control channel too, so
     /// the panel need not search the log; a successful reload means the new configuration has
     /// none, and they are cleared
     problems: Vec<String>,
-    /// 配置文件为什么监视不了（见 `watcher::ConfigWatch`），监视着时为 None。监视不了时文件改了不会重载，面板保存的配置
-    /// 也不生效，等不到重载序号变
+    /// 配置文件为什么监视不了（见 `watcher::ConfigWatch`），监视着时为 None：启动时装不上，或者文件改了指向、新的地方
+    /// 监视不上（又监视上了就回到 None）。监视不了时文件改了不会重载，面板保存的配置也不生效，等不到重载序号变
     /// Why the configuration file cannot be watched (see `watcher::ConfigWatch`), None while
-    /// it is. Without the watch a change to the file is not reloaded, nor is a save from the
-    /// panel applied, its reload sequence never moving on
+    /// it is: the watch did not go in at startup, or the file came to lead somewhere that cannot
+    /// be watched (back to None once it is watched again). Without the watch a change to the
+    /// file is not reloaded, nor is a save from the panel applied, its reload sequence never
+    /// moving on
     watch_error: Option<String>,
     /// 配了的入站 DoH 为什么没起来（见 `listeners::BoundListeners::doh_error`），起来了或没配时为 None。DoH 的设置只在
     /// 启动时读，校验和重载不读证书，这一项到下次启动才会变
@@ -1148,10 +1150,10 @@ impl PanelMetrics {
         self.active_config.write().problems = clipped(problems);
     }
 
-    /// 配置文件监视不了，因为 `error`（见 `ActiveConfig::watch_error`）/ The configuration file
-    /// cannot be watched, because of `error` (see `ActiveConfig::watch_error`)
-    pub fn config_not_watched(&self, error: String) {
-        self.active_config.write().watch_error = Some(error);
+    /// 配置文件因为 `error` 监视不了，None 是监视着（见 `ActiveConfig::watch_error`）/ The configuration
+    /// file cannot be watched because of `error`, None meaning it is (see `ActiveConfig::watch_error`)
+    pub fn config_watched(&self, error: Option<String>) {
+        self.active_config.write().watch_error = error;
     }
 
     /// 入站 DoH 没起来，因为 `error`（见 `ActiveConfig::doh_error`）/ The inbound DoH did not
@@ -5422,11 +5424,16 @@ mod diagnostic_tests {
             serde_json::Value::Null
         );
 
-        metrics.config_not_watched("too many open files".to_owned());
+        metrics.config_watched(Some("too many open files".to_owned()));
         engine.reload(runtime_for(raw));
         assert_eq!(
             metrics.config_json()["watch_error"],
             serde_json::json!("too many open files")
+        );
+        metrics.config_watched(None);
+        assert_eq!(
+            metrics.config_json()["watch_error"],
+            serde_json::Value::Null
         );
     }
 
