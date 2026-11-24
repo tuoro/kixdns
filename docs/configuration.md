@@ -174,7 +174,7 @@ upstream_equals 和 response_upstream_ip 看的是这次实际作答的上游：
 | deny | 无 | 返回 REFUSED。 |
 | forward | upstream（可选）、transport（可选）、ecs（可选） | 转发到指定上游；缺少 upstream（或写成 null、[]）时使用 default_upstream，写成空字符串不算缺少。 |
 | continue | 无 | 继续处理下一个请求规则，或继续响应流程中的下一个 Pipeline 决策。 |
-| replace_txt_response | text | 响应阶段把当前的应答换成 static_txt_response 给出的那种（TTL 300）：只有 TXT 和 ANY 查询拿到 TXT 记录，其他查询类型返回 NODATA，响应码都是 NOERROR，不管上游回的是什么；上游失败以后执行时没有应答可换，回 SERVFAIL；请求阶段不会产生响应。text 的大小限制和 static_txt_response 一样。 |
+| replace_txt_response | text | 响应阶段把当前的应答换成 static_txt_response 给出的那种（TTL 300）：只有 TXT 和 ANY 查询拿到 TXT 记录，其他查询类型返回 NODATA，响应码都是 NOERROR，不管上游回的是什么；上游失败以后执行时没有应答可换，回 SERVFAIL；请求阶段手上没有应答可换，什么也不做，同一条规则后面的动作照常执行。text 的大小限制和 static_txt_response 一样。 |
 
 static_ip_response、static_cname_response、static_txt_response 和 replace_txt_response 给出的记录都是 IN 类的，所以只回答类别为 IN 或 ANY 的问题；其他类别（例如 CH）的问题返回 NODATA。
 

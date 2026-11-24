@@ -281,3 +281,34 @@ async fn a_replaced_txt_answers_as_a_static_txt_does() {
         );
     }
 }
+
+/// 请求阶段手上没有应答可换，replace_txt_response 什么也不做，同一条规则后面的动作照常执行：后面的静态地址、deny 照样作答。
+/// 以前它当 continue 算，后面的动作一个也不执行，请求落到下一条规则或默认上游
+/// In the request phase there is no answer in hand to replace, so replace_txt_response does
+/// nothing and the rule's actions after it run as usual: a static address or a deny after it
+/// answers all the same. It used to count as a continue, none of the actions after it running,
+/// and the request fell through to the next rule or the default upstream
+#[tokio::test]
+async fn a_request_phase_replace_txt_leaves_the_actions_after_it_to_run() {
+    let cases = [
+        (
+            json!({ "type": "static_ip_response", "ip": "192.0.2.5" }),
+            (ResponseCode::NoError, false, 1),
+        ),
+        (json!({ "type": "deny" }), (ResponseCode::Refused, false, 0)),
+    ];
+    for (then, answered) in cases {
+        let engine = engine_with(json!([{
+            "name": "replace-then-answer",
+            "matchers": [{ "type": "any" }],
+            "actions": [{ "type": "replace_txt_response", "text": ["replaced"] }, then]
+        }]));
+        let mut query = Message::new(0x3535, MessageType::Query, OpCode::Query);
+        query.add_query(Query::query(
+            Name::from_ascii(QNAME).unwrap(),
+            RecordType::A,
+        ));
+        let answer = reply(&engine, &query.to_vec().unwrap()).await;
+        assert_eq!(summary(&answer), answered, "{then}");
+    }
+}

@@ -73,7 +73,12 @@ pub struct Engine {
     pub refreshing: Arc<super::utils::Refreshing>,
     /// 最近刷新失败的应答（见 `RefreshFailures`）/ The answers whose refresh failed lately (see `RefreshFailures`)
     pub(crate) refresh_failures: Arc<super::refresh::RefreshFailures>,
-    // Semaphore to limit concurrent handle_packet async tasks / 用于限制并发 handle_packet 异步任务数量
+    /// 在途的查询和开着的连接按设备分份记账：要等上游的查询、TCP 和 DoH 的新连接先在这里领许可（见
+    /// `Engine::query_permit`、`Engine::connection_permit`），开了流控时上游回答得多快、每台设备卡住了多少也记在这里
+    /// The accounts of queries in flight and connections open, kept by slots of devices: a query
+    /// that waits on an upstream and a new TCP or DoH connection take a permit here first (see
+    /// `Engine::query_permit`, `Engine::connection_permit`), and with flow control on, how fast
+    /// upstreams answer and how many of each device's queries are stuck are kept here too
     pub permit_manager: Arc<PermitManager>,
     // Adaptive flow control state (None when flow control is disabled) / 自适应流控状态（禁用流控时为None）
     pub flow_control_state: Option<Arc<FlowControlState>>,
@@ -340,6 +345,11 @@ impl Engine {
                 && entry.reach == target.reach
                 && entry.fetched_at == target.fetched_at
         };
+        // 读到也算一次访问（见 `CacheStore::get_with`）：这个槽位刚被命中、发起了这次刷新，访问计数又有上限，多数这一次
+        // 不改变它被留下还是挤出，不必为此另开一个不计访问的读法
+        // The read counts as an access too (see `CacheStore::get_with`): the slot was just hit,
+        // starting this refresh, and the count is capped, so one more hardly changes whether it
+        // stays or is pushed out, and is not worth a read of its own that counts nothing
         let still_there = self
             .cache
             .get_with(target.slot, |slot| {

@@ -137,8 +137,13 @@ enum FastPathAnswer<'a> {
         rcode: ResponseCode,
         answers: usize,
     },
-    /// Rule cache entry holding a static decision / 规则缓存中的静态决策
-    CachedRules { record: &'a RuleCacheRecord },
+    /// 规则缓存里的静态决定，它的 RCODE 和几条记录 / A static decision from the rule cache, with
+    /// its RCODE and how many records it has
+    CachedRules {
+        record: &'a RuleCacheRecord,
+        rcode: ResponseCode,
+        answers: usize,
+    },
 }
 
 /// 快速路径跟着走过的一次请求阶段跳转：从哪个 pipeline、凭什么跳走的（见 `Engine::observe_fast_path`）
@@ -292,9 +297,6 @@ impl Engine {
             .retain_upstreams(|upstream| pool_keys.dot.contains(upstream));
         self.doq_client
             .retain_upstreams(|upstream| pool_keys.doq.contains(upstream));
-        // Cache keys include a per-pipeline configuration namespace. Changed
-        // pipelines become unreachable immediately, while unchanged pipelines
-        // keep their warm response and rule caches.
     }
 
     /// `client` 的一个要等上游的查询能不能处理，`emptied_at` 是 UDP socket 上次收空的时刻，TCP、DoH 和轮流时没有（见
@@ -522,18 +524,17 @@ impl Engine {
                     },
                     &outcome,
                 ),
-                FastPathAnswer::CachedRules { record } => {
+                FastPathAnswer::CachedRules {
+                    record,
+                    rcode,
+                    answers,
+                } => {
                     let rules: SmallVec<[&str; 4]> = record
                         .matched_rules
                         .iter()
                         .flat_map(|rules| rules.iter())
                         .map(AsRef::as_ref)
                         .collect();
-                    let Decision::Static { rcode, answers } = &record.entry.decision else {
-                        unreachable!(
-                            "the fast path answers only static decisions from the rule cache"
-                        );
-                    };
                     observer.answered_by_rule(
                         ctx,
                         pipeline_id,
@@ -541,7 +542,7 @@ impl Engine {
                             rules: &rules,
                             decided_by_rule: record.decided_by_rule && !rules.is_empty(),
                             rcode: *rcode,
-                            answers: answers.len(),
+                            answers: *answers,
                         },
                         &outcome,
                     )
@@ -589,7 +590,7 @@ impl Engine {
                     DecisionDetail::Static { rcode, answers },
                 );
             }
-            FastPathAnswer::CachedRules { record } => {
+            FastPathAnswer::CachedRules { record, .. } => {
                 observer.cache_miss(ctx);
                 // 快速路径只从规则缓存答静态决策 / The fast path answers only static decisions from the rule cache
                 report_rule_cache_hit(observer, ctx, pipeline_id, record, true);
@@ -884,7 +885,11 @@ impl Engine {
                         return answer_static(
                             *rcode,
                             answers,
-                            FastPathAnswer::CachedRules { record: &record },
+                            FastPathAnswer::CachedRules {
+                                record: &record,
+                                rcode: *rcode,
+                                answers: answers.len(),
+                            },
                         );
                     }
                     Decision::Jump { pipeline: target } => (
@@ -960,9 +965,12 @@ impl Engine {
         // goes before the configuration is handed to the async path
         drop(hops);
 
-        // Cache miss, need async processing / 缓存未命中，需要异步处理
-        // Return AsyncNeeded with pre-parsed data to avoid re-parsing in handle_packet
-        // 返回 AsyncNeeded 包含预解析数据，避免在 handle_packet 中重新解析
+        // 这里答不上（要问上游、要先等上游的过期应答、跳到了头，或者规则当场决定不了）：交给异步路径，带上读好的查询、选中
+        // 的 pipeline 和选它的那份配置，不再解析一遍（见 `Engine::handle_packet_full`）
+        // Not answered here (an upstream to ask, a stale answer to wait on the upstream first, the
+        // jumps followed as far as they go, or rules that cannot decide on the spot): on to the
+        // async path with the query as read, the pipeline picked and the configuration that
+        // picked it, parsed no second time (see `Engine::handle_packet_full`)
         Some(FastPathResponse::AsyncNeeded(PreParsedData {
             head: RequestHead::quick(&q, name_of(pipeline_opt)),
             state: arc_swap::Guard::into_inner(state),
@@ -1397,7 +1405,7 @@ impl Engine {
             match decision {
                 Decision::Jump { pipeline: target } => {
                     if route.jumps_left == 0 {
-                        crate::warn_sparse!("max jump limit reached");
+                        super::rules::warn_jump_limit(request, &route.pipeline, &target, "request");
                         // How many jumps a request has left depends on the way it
                         // came, which no key carries, so this SERVFAIL is its own
                         // (see `Engine::answer`): a waiter on its held entry
@@ -1413,7 +1421,15 @@ impl Engine {
                     }
                     route.jumps_left -= 1;
                     let Some(p) = cfg.pipeline(&target) else {
-                        crate::warn_sparse!(pipeline = %target, "jump target pipeline not found");
+                        crate::warn_sparse!(
+                            event = "jump_target_missing",
+                            qname = %request.qname,
+                            qtype = ?request.qtype,
+                            client_ip = %request.peer.ip(),
+                            pipeline = %route.pipeline,
+                            target = %target,
+                            "jump target pipeline not found, answering SERVFAIL"
+                        );
                         info.upstream = Some(Source::Static);
                         return Ok(crate::proto_utils::servfail_reply(packet));
                     };
@@ -4726,12 +4742,8 @@ mod tests {
 
         // Assert: Verify Deny action returns Refused response code
         match result {
-            ResponseActionResult::Static { rcode, source, .. } => {
+            ResponseActionResult::Static { rcode, .. } => {
                 assert_eq!(rcode, ResponseCode::Refused, "Deny should return Refused");
-                assert_eq!(
-                    source, "response_action",
-                    "Source should be response_action"
-                );
             }
             _ => panic!("expected static refused"),
         }

@@ -134,3 +134,84 @@ async fn a_jump_limit_of_n_allows_n_response_jumps() {
         );
     }
 }
+
+/// 跳转次数用完、跳不过去时记一条告警，请求阶段和回答阶段都记成同一种 `jump_limit`，带着问题、客户端、所在的 pipeline、
+/// 要跳去的、上限和阶段；要跳去的 pipeline 不存在时那条告警也带着这些。以前请求阶段那两条一个字段也没有，回答阶段一条
+/// 都不记：a↔b 的回答阶段跳转环一个查询问上游几十次才 SERVFAIL，日志里什么也没有
+/// A jump that cannot be made, the jumps used up, is logged as one warning, the same
+/// `jump_limit` in the request phase and in the response phase, with the question, the client,
+/// the pipeline it is in, the one it was to jump to, the limit and the phase; the warning for a
+/// jump to a pipeline that does not exist carries these too. The two of the request phase used
+/// to carry no field at all, and the response phase logged none: a response-phase cycle
+/// between a and b asked the upstream dozens of times for one query before SERVFAIL, and the
+/// log said nothing
+#[tokio::test]
+async fn a_jump_cut_short_is_logged_with_where_it_was_going() {
+    let entry = answering_upstream(ENTRY, 60).await;
+    let jump = |to: &str| json!([{ "type": "jump_to_pipeline", "pipeline": to }]);
+    let rule = |actions: Value| json!({ "name": "all", "matchers": [{ "type": "any" }], "actions": actions });
+    let checked = |to: &str| {
+        let mut rule = rule(json!([{ "type": "forward", "upstream": entry.address }]));
+        rule["response_actions_on_match"] = jump(to);
+        rule
+    };
+    let cases = [
+        (
+            json!([
+                { "id": "main", "rules": [rule(jump("b"))] },
+                { "id": "b", "rules": [rule(jump("main"))] },
+            ]),
+            [
+                "event=\"jump_limit\"",
+                "pipeline=main",
+                "target=b",
+                "limit=2",
+                "phase=\"request\"",
+            ],
+        ),
+        (
+            json!([
+                { "id": "main", "rules": [checked("b")] },
+                { "id": "b", "rules": [checked("main")] },
+            ]),
+            [
+                "event=\"jump_limit\"",
+                "pipeline=main",
+                "target=b",
+                "limit=2",
+                "phase=\"response\"",
+            ],
+        ),
+        (
+            json!([{ "id": "main", "rules": [rule(jump("nowhere"))] }]),
+            [
+                "event=\"jump_target_missing\"",
+                "pipeline=main",
+                "target=nowhere",
+                "qtype=A",
+                "client_ip=",
+            ],
+        ),
+    ];
+    for (pipelines, fields) in cases {
+        let engine = engine_from(json!({
+            "settings": counting_settings(json!({ "response_jump_limit": 2 })),
+            "pipelines": pipelines
+        }));
+        let (warnings, guard) = crate::engine::test_support::Warnings::capture();
+        let reply = ask(&engine, &query(), peer()).await;
+        drop(guard);
+        assert_eq!(
+            Message::from_bytes(&reply).unwrap().metadata.response_code,
+            ResponseCode::ServFail
+        );
+        let lines = warnings.lines();
+        let line = lines
+            .iter()
+            .find(|line| line.contains(fields[0]))
+            .unwrap_or_else(|| panic!("{} among {lines:?}", fields[0]));
+        for field in fields.iter().chain(&["qname=name.test"]) {
+            assert!(line.contains(field), "{field} in {line}");
+        }
+    }
+}
