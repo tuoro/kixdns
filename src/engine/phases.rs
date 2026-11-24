@@ -466,8 +466,7 @@ pub(crate) fn handle_static_decision(
         answers,
     );
     let ttl = route.static_ttl(super::response::least_ttl(answers));
-    route.cache(engine, request, &reply, rcode, None, ttl);
-    reply
+    route.cache(engine, request, reply, rcode, None, ttl)
 }
 
 /// 转发决定自己说的：问哪些上游、怎样问、回答检查做什么。请求本身见 `Request`，它沿着规则走到了哪里见 `Route`
@@ -994,8 +993,9 @@ impl<'a> Forwarding<'a> {
         };
         if actions.is_empty() {
             let ttl = ttl_to_cache(self.engine, ttl, request.state.pipeline.min_ttl());
-            self.route
-                .cache(self.engine, request, &raw, rcode, Some(upstream), ttl);
+            let raw = self
+                .route
+                .cache(self.engine, request, raw, rcode, Some(upstream), ttl);
             self.hand_over(&raw);
             return Ok(ForwardResult::Success(raw));
         }
@@ -1135,17 +1135,18 @@ impl<'a> Forwarding<'a> {
                 // reject_failure_reply_on_refresh)
                 // 响应动作转发拿到的应答（见 reject_failure_reply_on_refresh）
                 reject_failure_reply_on_refresh(request.refresh.is_some(), &ctx.raw)?;
-                self.route.cache(
+                let ttl = ttl_to_cache(self.engine, extract_ttl(&ctx.msg), min_ttl);
+                let raw = self.route.cache(
                     self.engine,
                     request,
-                    &ctx.raw,
+                    ctx.raw,
                     ctx.msg.metadata.response_code,
                     Some(ctx.upstream.clone()),
-                    ttl_to_cache(self.engine, extract_ttl(&ctx.msg), min_ttl),
+                    ttl,
                 );
-                self.hand_over(&ctx.raw);
+                self.hand_over(&raw);
                 response.upstream = Some(Source::Upstream(ctx.upstream));
-                Ok(ForwardResult::Success(ctx.raw))
+                Ok(ForwardResult::Success(raw))
             }
             ResponseActionResult::Static {
                 bytes, rcode, ttl, ..
@@ -1157,8 +1158,9 @@ impl<'a> Forwarding<'a> {
                 // `Route::fell_back`): the cache is shared by every requester, and cached it
                 // would go on serving after the upstream recovered, until the entry expired
                 let ttl = self.route.static_ttl(ttl);
-                self.route
-                    .cache(self.engine, request, &bytes, rcode, None, ttl);
+                let bytes = self
+                    .route
+                    .cache(self.engine, request, bytes, rcode, None, ttl);
                 self.hand_over(&bytes);
                 response.upstream = Some(Source::Static);
                 Ok(ForwardResult::Success(bytes))
