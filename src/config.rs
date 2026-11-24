@@ -1178,8 +1178,8 @@ pub fn validate(raw: &str) -> Result<ValidationReport> {
 }
 
 /// 配置里会悄悄做成别的事的写法：读不懂的上游地址、拼错的 rcode、无效的静态 IP 或 CNAME 目标、
-/// 装不进一条记录的 TXT、跳到不存在的 pipeline、会匹配所有域名的空域名匹配器、几个 pipeline 写了同一个 id、
-/// 不是 IP 的静态 ECS 地址。以前这些都照常加载：
+/// 装不进一条记录的 TXT、跳到不存在的 pipeline、值写成空而什么都匹配的匹配器（见
+/// `AnyMatcher::written_empty`）、几个 pipeline 写了同一个 id、不是 IP 的静态 ECS 地址。以前这些都照常加载：
 /// 上游一直失败、rcode 变成 NXDOMAIN、静态应答变成 SERVFAIL、空后缀什么都匹配。
 ///
 /// 启动时记成错误、照旧加载，已经在用的配置升级以后行为不变；热重载和面板的校验（见 [`validate`]）
@@ -1188,8 +1188,8 @@ pub fn validate(raw: &str) -> Result<ValidationReport> {
 /// Ways of writing a configuration that silently do something else: an upstream
 /// address nothing can read, a misspelt rcode, an invalid static IP or CNAME target,
 /// TXT content that does not fit a record, a jump to a pipeline that does not exist,
-/// an empty domain matcher that matches every name, several pipelines written with
-/// one id, a static ECS address that is no IP. These all used to load as
+/// a matcher written empty that so matches everything (see `AnyMatcher::written_empty`),
+/// several pipelines written with one id, a static ECS address that is no IP. These all used to load as
 /// usual: the upstream kept failing, the rcode became NXDOMAIN, the static answer
 /// became SERVFAIL, the empty suffix matched everything.
 ///
@@ -1277,16 +1277,16 @@ pub fn problems(cfg: &PipelineConfig) -> Vec<String> {
     found
 }
 
-/// 照样加载、照写的做，却值得知道的写法：不再起作用的旧设置（见 [`RETIRED_SETTINGS`]）和后台刷新专用规则，一个国家
-/// 代码也没写、永远不命中的 geoip 匹配器，大得可能占掉很多内存的缓存，短得来不及重发和改用 TCP 的整体超时，没设
-/// bootstrap 却有写成主机名的上游（系统的解析器要是 KixDNS 自己，解析就绕回来，见 `engine::bootstrap`），还有规则用到、
+/// 照样加载、照写的做，却值得知道的写法：不再起作用的旧设置（见 [`RETIRED_SETTINGS`]）和后台刷新专用规则，值写成空而
+/// 永远不命中的匹配器（见 `AnyMatcher::written_empty`），大得可能占掉很多内存的缓存，短得来不及重发和改用 TCP 的整体
+/// 超时，没设 bootstrap 却有写成主机名的上游（系统的解析器要是 KixDNS 自己，解析就绕回来，见 `engine::bootstrap`），还有规则用到、
 /// 却没配可读的数据的 Geo 标签（规则编译以后才知道用到哪些，见 [`geo_tags_without_data`]）。启动、重载和面板的校验都
 /// 不拒绝，也不算 [`problems`]；编译时找出来（见 `RuntimePipelineConfig::warnings`），校验的回答和控制通道 `config` 结果的
 /// `warnings` 列出它们，配置每生效一次各记一条 warn。以前只记 warn，默认日志级别看不到，校验也不说
 /// What loads and runs as written yet is worth knowing: settings no longer in effect (see
-/// [`RETIRED_SETTINGS`]) and the background refresh rule, a geoip matcher written with no
-/// country code, which never matches, a cache so large it may take a lot of memory, an overall
-/// timeout too short for the resend and the TCP fallback, upstreams written with a host name
+/// [`RETIRED_SETTINGS`]) and the background refresh rule, a matcher written empty that so never
+/// matches (see `AnyMatcher::written_empty`), a cache so large it may take a lot of memory, an
+/// overall timeout too short for the resend and the TCP fallback, upstreams written with a host name
 /// while bootstrap is unset (resolving comes back round should the system resolver be KixDNS
 /// itself, see `engine::bootstrap`), and Geo tags rules use with no data configured to read them
 /// from (which tags rules use is known once they compile, see [`geo_tags_without_data`]).
@@ -1372,9 +1372,6 @@ pub fn warnings(cfg: &PipelineConfig) -> Vec<String> {
     }
     found
 }
-
-/// 一个国家代码也没写的 geoip 匹配器 / A geoip matcher written with no country code
-const NO_COUNTRY_CODE: &str = "a geoip matcher written with no country code never matches";
 
 /// 规则用到（`geosite`、`geoip` 是它们用到的标签）、却没配可读的数据的 Geo 标签，每种一条 [`warnings`]：没写
 /// `geosite_data_paths` 时的 GeoSite 标签，没写 `geoip_dat_path` 时 MMDB 也答不了的 GeoIP 标签（MMDB 只有两个字母的
@@ -1575,13 +1572,10 @@ pub fn refuse_problems(cfg: &PipelineConfig) -> Result<()> {
     Ok(())
 }
 
-const EMPTY_DOMAIN_MATCHER: &str = "an empty domain matcher matches every name";
-
 /// 一条规则里几个 forward 的 ecs 写得不一样：它们合成一次转发，只能发一个 ECS，所以一个也不发
 /// A rule whose forwards write different ecs: they merge into one forward, which can send
 /// one ECS only, so none is sent
 const MERGED_ECS_DIFFER: &str = "its forward actions are asked together as one forward, which sends one ECS, but their ecs settings differ, so none of them is sent; write the same ecs on each, or split them into separate rules";
-const EMPTY_EXACT_MATCHER: &str = "an empty domain_exact matches only the root name";
 
 /// 一个上游也没写：每个查询都会失败 / Not a single upstream written: every query would fail
 const NO_UPSTREAM: &str = "no upstream is written, so every query it gets would fail";
@@ -1699,21 +1693,13 @@ impl AnyMatcher<'_> {
     /// 这个匹配器会悄悄做成别的事的写法（见 [`problems`]）/ How this matcher is written to
     /// silently do something else (see [`problems`])
     fn problem(self) -> Option<String> {
+        if let Some((Weight::Problem, problem)) = self.written_empty() {
+            return Some(problem);
+        }
+        // 以前写错的 rcode 悄悄当成 OTHER，匹配所有不常见的 RCODE，这条规则几乎永远不中
+        // A misspelt rcode used to pass for OTHER, matching every uncommon RCODE, so the rule
+        // hardly ever matched
         match self {
-            Self::Request(Matcher::DomainSuffix { value } | Matcher::DomainRegex { value })
-            | Self::Response(
-                ResponseMatcher::RequestDomainSuffix { value }
-                | ResponseMatcher::RequestDomainRegex { value },
-            ) if value.is_empty() => Some(EMPTY_DOMAIN_MATCHER.to_owned()),
-            Self::Request(Matcher::DomainExact { value })
-            | Self::Response(ResponseMatcher::RequestDomainExact { value })
-                if value.is_empty() =>
-            {
-                Some(EMPTY_EXACT_MATCHER.to_owned())
-            }
-            // 以前写错的 rcode 悄悄当成 OTHER，匹配所有不常见的 RCODE，这条规则几乎永远不中
-            // A misspelt rcode used to pass for OTHER, matching every uncommon RCODE, so the
-            // rule hardly ever matched
             Self::Response(ResponseMatcher::ResponseRcode { value })
                 if !value.eq_ignore_ascii_case("OTHER")
                     && crate::engine::utils::parse_rcode(value).is_none() =>
@@ -1728,17 +1714,158 @@ impl AnyMatcher<'_> {
 
     /// 这个匹配器照样加载、却值得知道的写法（见 [`warnings`]）/ How this matcher is written
     /// that loads all the same yet is worth knowing (see [`warnings`])
-    fn warning(self) -> Option<&'static str> {
+    fn warning(self) -> Option<String> {
+        self.written_empty()
+            .and_then(|(weight, warning)| (weight == Weight::Warning).then_some(warning))
+    }
+
+    /// 值写成空的这个匹配器做成了什么，按它的意思分：它看的每一样都匹配的（每个名字，或者每份带 TXT 记录的回答）
+    /// 和只匹配根名字的空 domain_exact 算 [`problems`]，永远不匹配的算 [`warnings`]。域名按读进来的样子看，单独一个点
+    /// 是根（见 `matcher::domain_value`），所以 domain_suffix 写成 `.` 和写成空的一样，domain_exact 写成 `.` 正是要根；
+    /// 逗号分隔的列表一项也没写算空。值写成空的编译不过（网段、qclass、qtype）、另有检查（rcode）或者根本没有值的，为
+    /// None。逐个列出每一种，新加的匹配器编译时就得决定
+    /// What this matcher comes to with its value written empty, by what it means: one matching
+    /// everything it looks at (every name, or every answer carrying a TXT record) and an empty
+    /// domain_exact, matching only the root name, count among [`problems`], one never matching
+    /// among [`warnings`]. A domain is looked at as read, a lone dot being the root (see
+    /// `matcher::domain_value`), so domain_suffix written `.` is as written empty, and
+    /// domain_exact written `.` means the root indeed; a comma-separated list naming nothing
+    /// counts as empty. None for one that written empty does not compile (a network, a qclass, a
+    /// qtype), is checked otherwise (an rcode) or has no value at all. Every kind is listed, so a
+    /// new matcher has to be decided on to compile
+    fn written_empty(self) -> Option<(Weight, String)> {
+        use crate::matcher::domain_value;
+        let every_name = |kind: &str, value: &str| {
+            (
+                Weight::Problem,
+                format!("{kind} \"{value}\" matches every name"),
+            )
+        };
+        let root = |kind: &str| {
+            (
+                Weight::Problem,
+                format!("{kind} \"\" matches only the root name; write \".\" to mean the root"),
+            )
+        };
+        let never = |kind: &str, value: &str| {
+            (Weight::Warning, format!("{kind} \"{value}\" never matches"))
+        };
+        let no_country = |kind: &str| {
+            (
+                Weight::Warning,
+                format!("{kind} with no country code never matches"),
+            )
+        };
+        let lists_nothing = |list: &str| split_upstreams(list).next().is_none();
         match self {
-            Self::Request(Matcher::GeoipCountry { country_codes })
-            | Self::Response(ResponseMatcher::ResponseAnswerIpGeoipCountry { country_codes })
-                if country_codes.is_empty() =>
-            {
-                Some(NO_COUNTRY_CODE)
-            }
-            _ => None,
+            Self::Request(matcher) => match matcher {
+                Matcher::DomainSuffix { value } if domain_value(value).is_empty() => {
+                    Some(every_name("domain_suffix", value))
+                }
+                Matcher::DomainRegex { value } if value.is_empty() => {
+                    Some(every_name("domain_regex", value))
+                }
+                Matcher::GeoSiteNot { value } if value.is_empty() => {
+                    Some(every_name("geo_site_not", value))
+                }
+                Matcher::DomainExact { value } if value.is_empty() => Some(root("domain_exact")),
+                Matcher::ListenerLabel { value } if value.is_empty() => {
+                    Some(never("listener_label", value))
+                }
+                Matcher::GeoSite { value } if value.is_empty() => Some(never("geo_site", value)),
+                Matcher::GeoipCountry { country_codes } if country_codes.is_empty() => {
+                    Some(no_country("geoip_country"))
+                }
+                Matcher::Any
+                | Matcher::ListenerLabel { .. }
+                | Matcher::DomainSuffix { .. }
+                | Matcher::DomainExact { .. }
+                | Matcher::DomainRegex { .. }
+                | Matcher::ClientIp { .. }
+                | Matcher::GeoipCountry { .. }
+                | Matcher::GeoipPrivate { .. }
+                | Matcher::Qclass { .. }
+                | Matcher::EdnsPresent { .. }
+                | Matcher::GeoSite { .. }
+                | Matcher::GeoSiteNot { .. }
+                | Matcher::Qtype { .. } => None,
+            },
+            Self::Response(matcher) => match matcher {
+                ResponseMatcher::RequestDomainSuffix { value }
+                    if domain_value(value).is_empty() =>
+                {
+                    Some(every_name("request_domain_suffix", value))
+                }
+                ResponseMatcher::RequestDomainRegex { value } if value.is_empty() => {
+                    Some(every_name("request_domain_regex", value))
+                }
+                ResponseMatcher::ResponseRequestDomainGeoSiteNot { value } if value.is_empty() => {
+                    Some(every_name("response_request_domain_geo_site_not", value))
+                }
+                ResponseMatcher::RequestDomainExact { value } if value.is_empty() => {
+                    Some(root("request_domain_exact"))
+                }
+                // 空的前缀和正则对什么文字都成立；精确比较空文字的是有意要空的 TXT 记录
+                // An empty prefix or regex holds for any text; an exact match on empty text
+                // means an empty TXT record indeed
+                ResponseMatcher::ResponseTxtContent { mode, value }
+                    if value.is_empty()
+                        && !matches!(
+                            crate::matcher::TxtMatchMode::from_str(mode),
+                            Ok(crate::matcher::TxtMatchMode::Exact) | Err(_)
+                        ) =>
+                {
+                    Some((
+                        Weight::Problem,
+                        format!(
+                            "response_txt_content in {} mode with an empty value matches every answer carrying a TXT record",
+                            mode.to_ascii_lowercase()
+                        ),
+                    ))
+                }
+                ResponseMatcher::UpstreamEquals { value } if lists_nothing(value) => {
+                    Some(never("upstream_equals", value))
+                }
+                ResponseMatcher::ResponseUpstreamIp { cidr } if lists_nothing(cidr) => {
+                    Some(never("response_upstream_ip", cidr))
+                }
+                ResponseMatcher::ResponseAnswerIp { cidr } if lists_nothing(cidr) => {
+                    Some(never("response_answer_ip", cidr))
+                }
+                ResponseMatcher::ResponseRequestDomainGeoSite { value } if value.is_empty() => {
+                    Some(never("response_request_domain_geo_site", value))
+                }
+                ResponseMatcher::ResponseAnswerIpGeoipCountry { country_codes }
+                    if country_codes.is_empty() =>
+                {
+                    Some(no_country("response_answer_ip_geoip_country"))
+                }
+                ResponseMatcher::UpstreamEquals { .. }
+                | ResponseMatcher::RequestDomainSuffix { .. }
+                | ResponseMatcher::RequestDomainExact { .. }
+                | ResponseMatcher::RequestDomainRegex { .. }
+                | ResponseMatcher::ResponseUpstreamIp { .. }
+                | ResponseMatcher::ResponseAnswerIp { .. }
+                | ResponseMatcher::ResponseType { .. }
+                | ResponseMatcher::ResponseRcode { .. }
+                | ResponseMatcher::ResponseQclass { .. }
+                | ResponseMatcher::ResponseEdnsPresent { .. }
+                | ResponseMatcher::ResponseAnswerIpGeoipCountry { .. }
+                | ResponseMatcher::ResponseAnswerIpGeoipPrivate { .. }
+                | ResponseMatcher::ResponseRequestDomainGeoSite { .. }
+                | ResponseMatcher::ResponseRequestDomainGeoSiteNot { .. }
+                | ResponseMatcher::ResponseTxtContent { .. } => None,
+            },
         }
     }
+}
+
+/// 一种写法算 [`problems`] 还是 [`warnings`] / Whether a way of writing counts among
+/// [`problems`] or [`warnings`]
+#[derive(PartialEq)]
+enum Weight {
+    Problem,
+    Warning,
 }
 
 fn rule_problems(
@@ -2303,9 +2430,9 @@ mod validation_tests {
         assert_eq!(
             warned,
             [
-                "pipeline_select[1].matchers[1]: a geoip matcher written with no country code never matches",
-                "pipelines[0].rules[1].matchers[0]: a geoip matcher written with no country code never matches",
-                "pipelines[0].rules[2].response_matchers[0]: a geoip matcher written with no country code never matches",
+                "pipeline_select[1].matchers[1]: geoip_country with no country code never matches",
+                "pipelines[0].rules[1].matchers[0]: geoip_country with no country code never matches",
+                "pipelines[0].rules[2].response_matchers[0]: response_answer_ip_geoip_country with no country code never matches",
             ]
         );
     }
@@ -2547,7 +2674,7 @@ mod validation_tests {
                 found
                     .iter()
                     .any(|problem| problem.starts_with(&format!("{place}: "))
-                        && problem.contains("empty domain_exact matches only the root name")),
+                        && problem.contains("exact \"\" matches only the root name")),
                 "missing {place} in {found:#?}"
             );
         }
@@ -2556,6 +2683,139 @@ mod validation_tests {
                 .iter()
                 .any(|problem| problem.contains("matches every name")),
             "{found:#?}"
+        );
+    }
+
+    /// 每种带值的匹配器，值写成空的都按它的意思报出来：对每个名字都成立的（domain_suffix、domain_regex、geo_site_not 和
+    /// 回答阶段对应的几种，以及 prefix、regex 模式的 response_txt_content，对每份带 TXT 记录的回答成立）算问题；永远不成立
+    /// 的（geo_site、listener_label、upstream_equals，一个网段也没写的 response_upstream_ip、response_answer_ip，一个国家代码
+    /// 也没写的 geoip 匹配器）算警告。精确比较空文字的 response_txt_content 是有意要空的 TXT 记录，不报。以前只查了域名类
+    /// 和 geoip，geo_site_not 写成空的对所有名字都成立，也不算问题
+    /// Every matcher with a value is raised, written empty, by what it then means: one holding
+    /// for every name (domain_suffix, domain_regex, geo_site_not and their answer-phase
+    /// counterparts, and response_txt_content in prefix or regex mode, holding for every answer
+    /// carrying a TXT record) is a problem; one never holding (geo_site, listener_label,
+    /// upstream_equals, response_upstream_ip and response_answer_ip naming no network, a geoip
+    /// matcher naming no country code) is a warning. response_txt_content comparing exactly with
+    /// empty text means an empty TXT record and is not raised. Only domains and geoip used to be
+    /// checked, and geo_site_not written empty held for every name without being a problem
+    #[test]
+    fn every_matcher_written_empty_is_raised_by_what_it_means() {
+        let config = serde_json::json!({
+            "settings": { "default_upstream": "1.1.1.1:53" },
+            "pipeline_select": [{ "pipeline": "main", "matchers": [
+                { "type": "listener_label", "value": "" },
+                { "type": "geo_site_not", "value": "" }
+            ] }],
+            "pipelines": [{ "id": "main", "rules": [{
+                "name": "r",
+                "matchers": [
+                    { "type": "geo_site", "value": "" },
+                    { "type": "domain_suffix", "value": "." },
+                    { "type": "geoip_country", "country_codes": [] }
+                ],
+                "actions": [{ "type": "forward" }],
+                "response_matchers": [
+                    { "type": "upstream_equals", "value": "" },
+                    { "type": "response_upstream_ip", "cidr": "" },
+                    { "type": "response_answer_ip", "cidr": " , " },
+                    { "type": "response_request_domain_geo_site", "value": "" },
+                    { "type": "response_request_domain_geo_site_not", "value": "" },
+                    { "type": "response_txt_content", "mode": "prefix", "value": "" },
+                    { "type": "response_txt_content", "mode": "Regex", "value": "" },
+                    { "type": "response_txt_content", "mode": "exact", "value": "" }
+                ],
+                "response_actions_on_match": [{ "type": "allow" }]
+            }] }]
+        });
+        let parsed = super::parse_config(&config.to_string()).expect("parses");
+        assert_eq!(
+            super::problems(&parsed),
+            [
+                "pipeline_select[0].matchers[1]: geo_site_not \"\" matches every name",
+                "pipelines[0].rules[0].matchers[1]: domain_suffix \".\" matches every name",
+                "pipelines[0].rules[0].response_matchers[4]: response_request_domain_geo_site_not \"\" matches every name",
+                "pipelines[0].rules[0].response_matchers[5]: response_txt_content in prefix mode with an empty value matches every answer carrying a TXT record",
+                "pipelines[0].rules[0].response_matchers[6]: response_txt_content in regex mode with an empty value matches every answer carrying a TXT record",
+            ]
+        );
+        assert_eq!(
+            super::warnings(&parsed),
+            [
+                "pipeline_select[0].matchers[0]: listener_label \"\" never matches",
+                "pipelines[0].rules[0].matchers[0]: geo_site \"\" never matches",
+                "pipelines[0].rules[0].matchers[2]: geoip_country with no country code never matches",
+                "pipelines[0].rules[0].response_matchers[0]: upstream_equals \"\" never matches",
+                "pipelines[0].rules[0].response_matchers[1]: response_upstream_ip \"\" never matches",
+                "pipelines[0].rules[0].response_matchers[2]: response_answer_ip \" , \" never matches",
+                "pipelines[0].rules[0].response_matchers[3]: response_request_domain_geo_site \"\" never matches",
+            ]
+        );
+    }
+
+    /// 单独一个点是根：domain_exact 写成 `.` 不算问题，只命中根名字（拦对根的 ANY、NS 放大查询就这样写），写成空的才
+    /// 算问题；domain_suffix 写成 `.` 和写成空的一样匹配每个名字，算问题。以前 `.` 原样留着，名字文本里没有它，两种都什么
+    /// 也不匹配，也不报
+    /// A lone dot is the root: domain_exact written `.` is no problem and matches the root name
+    /// alone (as a rule blocking ANY or NS amplification at the root is written), and only one
+    /// written empty is a problem; domain_suffix written `.` matches every name as one written
+    /// empty does, a problem. The dot used to stay as written, which no name text holds, so both
+    /// matched nothing and nothing was raised
+    #[tokio::test]
+    async fn a_lone_dot_is_the_root() {
+        let upstream = crate::engine::test_support::answering_upstream(
+            std::net::Ipv4Addr::new(192, 0, 2, 7),
+            300,
+        )
+        .await;
+        let config = serde_json::json!({
+            "settings": { "default_upstream": upstream.address, "upstream_timeout_ms": 3000 },
+            "pipelines": [{ "id": "main", "rules": [
+                rule(
+                    "root",
+                    serde_json::json!([{ "type": "domain_exact", "value": "." }]),
+                    serde_json::json!([{ "type": "static_response", "rcode": "REFUSED" }])
+                ),
+                rule("rest", serde_json::json!([{ "type": "any" }]), serde_json::json!([{ "type": "forward" }]))
+            ] }]
+        });
+        assert_eq!(problems_of(config.clone()), Vec::<String>::new());
+        let engine = crate::engine::test_support::engine_from(config);
+        for (name, answered) in [
+            (".", hickory_proto::op::ResponseCode::Refused),
+            ("example.com.", hickory_proto::op::ResponseCode::NoError),
+        ] {
+            let mut query = hickory_proto::op::Message::new(
+                0x5151,
+                hickory_proto::op::MessageType::Query,
+                hickory_proto::op::OpCode::Query,
+            );
+            query.add_query(hickory_proto::op::Query::query(
+                hickory_proto::rr::Name::from_ascii(name).unwrap(),
+                hickory_proto::rr::RecordType::NS,
+            ));
+            let reply = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                engine.handle_packet(&query.to_vec().unwrap(), "127.0.0.1:53000".parse().unwrap()),
+            )
+            .await
+            .expect("answer in time")
+            .expect("answer");
+            let reply = hickory_proto::op::Message::from_vec(&reply).unwrap();
+            assert_eq!(reply.metadata.response_code, answered, "{name}");
+        }
+
+        let suffix = serde_json::json!({
+            "settings": { "default_upstream": "1.1.1.1:53" },
+            "pipelines": [{ "id": "main", "rules": [rule(
+                "all",
+                serde_json::json!([{ "type": "domain_suffix", "value": "." }]),
+                serde_json::json!([{ "type": "allow" }])
+            )] }]
+        });
+        assert_eq!(
+            problems_of(suffix),
+            ["pipelines[0].rules[0].matchers[0]: domain_suffix \".\" matches every name"]
         );
     }
 
@@ -3094,7 +3354,7 @@ mod validation_tests {
                 "\"dns-query\" does not start with \"/\"",
             ),
             ("pipeline_select[0]", "no pipeline \"gone\""),
-            ("pipeline_select[0].matchers[0]", "empty domain matcher"),
+            ("pipeline_select[0].matchers[0]", "matches every name"),
             ("pipelines[0].rules[0]", "1.1.1.1:99999"),
             ("pipelines[0].rules[1]", "nonsense"),
             ("pipelines[0].rules[2]", "unknown prefix \"http://\""),
@@ -3105,15 +3365,15 @@ mod validation_tests {
             ("pipelines[0].rules[7]", "cname target"),
             ("pipelines[0].rules[8]", "256 bytes"),
             ("pipelines[0].rules[9]", "\"gone\", which does not exist"),
-            ("pipelines[0].rules[10].matchers[0]", "empty domain matcher"),
-            ("pipelines[0].rules[11].matchers[0]", "empty domain matcher"),
+            ("pipelines[0].rules[10].matchers[0]", "matches every name"),
+            ("pipelines[0].rules[11].matchers[0]", "matches every name"),
             (
                 "pipelines[0].rules[12].response_matchers[0]",
-                "empty domain matcher",
+                "matches every name",
             ),
             (
                 "pipelines[0].rules[12].response_matchers[1]",
-                "empty domain matcher",
+                "matches every name",
             ),
             ("pipelines[0].rules[12]", "udp+tcp://dns.example:53"),
         ] {

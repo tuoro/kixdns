@@ -62,16 +62,14 @@ impl TxtMatchMode {
 // ============================================================================
 
 /// 配置里写的域名值，按名字文本的写法存（见 `proto_utils::name_text`）：转小写，去掉结尾的点。
-/// 名字文本不带结尾的点，写了点的值以前永远匹配不上。只有一个点的值保持原样。
+/// 名字文本不带结尾的点，写了点的值以前永远匹配不上。单独一个点是根，名字文本是空的
 /// A domain value from the configuration, kept the way name text is written (see
 /// `proto_utils::name_text`): lowercased, without the trailing dot. Name text carries no
-/// trailing dot, so a value written with one used to match nothing. A lone dot stays as it is.
+/// trailing dot, so a value written with one used to match nothing. A lone dot is the root,
+/// whose name text is empty
 pub(crate) fn domain_value(value: &str) -> Arc<str> {
     let value = value.to_ascii_lowercase();
-    match value.strip_suffix('.') {
-        Some(head) if !head.is_empty() => Arc::from(head),
-        _ => Arc::from(value),
-    }
+    Arc::from(value.strip_suffix('.').unwrap_or(&value))
 }
 
 /// 规则写的 GeoSite 标签，转成小写存：数据文件里的标签读进来就转小写（见 `geosite`），在这里转一次，每个查询就不用
