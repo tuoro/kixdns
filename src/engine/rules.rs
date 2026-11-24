@@ -1,4 +1,3 @@
-use anyhow::Context;
 use bytes::Bytes;
 use hickory_proto::op::{Message, ResponseCode};
 use hickory_proto::rr::{DNSClass, Record, RecordType};
@@ -16,9 +15,9 @@ use crate::engine::execution::Request;
 use crate::engine::matcher_adapter::log_match;
 use crate::engine::response::{
     least_ttl, make_static_cname_answer, make_static_ip_answer, make_static_txt_answer,
+    static_reply,
 };
 use crate::engine::upstream::UpstreamFailure;
-use crate::engine::utils::engine_helpers::{self, build_response};
 use crate::engine::utils::parse_rcode;
 use crate::matcher::RuntimeResponseMatcherWithOp;
 use crate::matcher::eval_match_chain;
@@ -336,7 +335,6 @@ pub(crate) struct ApplyResponseActionsContext<'a> {
     pub(crate) request: &'a Request<'a>,
     pub(crate) actions: &'a [Action],
     pub(crate) ctx_opt: Option<ResponseContext>,
-    pub(crate) req: &'a Message,
     /// 规则自己的转发发出的包；动作里自己写了 `ecs` 的转发从客户端发来的查询改写（见 `Request::packet`）
     /// The packet the rule's own forward sent; a forward among the actions writing an `ecs` of
     /// its own rewrites the query as the client sent it instead (see `Request::packet`)
@@ -385,31 +383,25 @@ async fn run_response_actions(
             }
             Action::StaticResponse { rcode } => {
                 let code = parse_rcode(rcode).unwrap_or(ResponseCode::NXDomain);
-                return static_answer(ctx.req, code, Vec::new(), "response_action");
+                return Ok(static_answer(request, code, &[], "response_action"));
             }
             Action::StaticIpResponse { ip } => {
                 let (rcode, answers) = make_static_ip_answer(qname, qtype, qclass, ip);
-                return static_answer(ctx.req, rcode, answers, "response_action");
+                return Ok(static_answer(request, rcode, &answers, "response_action"));
             }
             Action::StaticCnameResponse { target, ttl } => {
                 let (rcode, answers) =
                     make_static_cname_answer(qname, qclass, target, ttl.unwrap_or(300));
-                return static_answer(ctx.req, rcode, answers, "response_action");
+                return Ok(static_answer(request, rcode, &answers, "response_action"));
             }
             Action::StaticTxtResponse { text, ttl } => {
                 let (rcode, answers) =
                     make_static_txt_answer(qname, qtype, qclass, text, ttl.unwrap_or(300));
-                return static_answer(ctx.req, rcode, answers, "response_action");
+                return Ok(static_answer(request, rcode, &answers, "response_action"));
             }
             Action::JumpToPipeline { pipeline } => {
                 if ctx.remaining_jumps == 0 {
-                    let bytes = engine_helpers::build_servfail_response(ctx.req)?;
-                    return Ok(ResponseActionResult::Static {
-                        bytes,
-                        rcode: ResponseCode::ServFail,
-                        ttl: None,
-                        source: JUMP_LIMIT,
-                    });
+                    return Ok(servfail(request, JUMP_LIMIT));
                 }
                 return Ok(ResponseActionResult::Jump {
                     pipeline: Arc::clone(pipeline),
@@ -419,13 +411,12 @@ async fn run_response_actions(
             // As when every action has run: the answer if there is one, SERVFAIL if not
             Action::Allow => break,
             Action::Deny => {
-                let bytes = engine_helpers::build_refused_response(ctx.req)?;
-                return Ok(ResponseActionResult::Static {
-                    bytes,
-                    rcode: ResponseCode::Refused,
-                    ttl: None,
-                    source: "response_action",
-                });
+                return Ok(static_answer(
+                    request,
+                    ResponseCode::Refused,
+                    &[],
+                    "response_action",
+                ));
             }
             Action::Continue => {
                 return Ok(ResponseActionResult::Continue { ctx: ctx.ctx_opt });
@@ -440,10 +431,10 @@ async fn run_response_actions(
             // no answer in hand (after an upstream failure) there is nothing to replace: SERVFAIL
             Action::ReplaceTxtResponse { text } => {
                 if ctx.ctx_opt.is_none() {
-                    return response_action_servfail(ctx.req);
+                    return Ok(servfail(request, "response_action"));
                 }
                 let (rcode, answers) = make_static_txt_answer(qname, qtype, qclass, text, 300);
-                return static_answer(ctx.req, rcode, answers, "replace_txt");
+                return Ok(static_answer(request, rcode, &answers, "replace_txt"));
             }
             Action::Forward {
                 upstream,
@@ -463,7 +454,7 @@ async fn run_response_actions(
                         rule = %ctx.rule_name,
                         "response actions exceeded forward limit"
                     );
-                    return response_action_servfail(ctx.req);
+                    return Ok(servfail(request, "response_action"));
                 }
 
                 // 手上应答记的来源（`udp:1.1.1.1:53`）不是能发查询的地址，所以没写 upstream 时和请求
@@ -498,7 +489,10 @@ async fn run_response_actions(
                 let sent_ecs = |rule_ecs: crate::ecs_scope::ForwardEcs| {
                     own_ecs.as_ref().map_or(rule_ecs, |(_, sent)| *sent)
                 };
-                let (raw, actual_upstream) = match crate::engine::upstream::forward_upstream(
+                // hickory 读不了的应答，回答检查和后面的动作都用不了，和上游失败一样算这次转发失败
+                // A reply hickory cannot read is of no use to the checks and actions after, and
+                // fails this forward as the upstream failing does
+                let forwarded = crate::engine::upstream::forward_upstream(
                     ctx.engine,
                     packet,
                     &upstream_addr,
@@ -509,17 +503,30 @@ async fn run_response_actions(
                     request.asker(),
                 )
                 .await
-                {
-                    Ok(result) => {
+                .and_then(|(raw, upstream)| match Message::from_bytes(&raw) {
+                    Ok(msg) => Ok(ResponseContext { raw, msg, upstream }),
+                    Err(error) => Err(anyhow::Error::new(error)
+                        .context(format!("the reply from {upstream} cannot be read"))),
+                });
+                match forwarded {
+                    Ok(answer) => {
                         if let Some((trail, rule_ecs)) = ctx.trail.as_mut() {
-                            trail.record_reply(sent_ecs(*rule_ecs), &result.0);
+                            trail.record_reply(sent_ecs(*rule_ecs), &answer.raw);
                         }
-                        result
+                        ctx.ctx_opt = Some(answer);
                     }
                     Err(err) => {
                         if let Some((trail, rule_ecs)) = ctx.trail.as_mut() {
                             trail.record_failure(sent_ecs(*rule_ecs));
                         }
+                        // 流控没让等的失败是这台设备自己的事（见 `UpstreamFailure::withheld`）：原样交回，这个
+                        // 请求只给自己回 SERVFAIL，它登记的条目随之放下，不把 SERVFAIL 交给等着的别的请求（见
+                        // `Engine::handle_packet_internal`）
+                        // A failure with flow control keeping the query from waiting is the
+                        // device's own affair (see `UpstreamFailure::withheld`): it goes back
+                        // as it is, the request answering SERVFAIL to itself alone, and the
+                        // entries it registered go with it, no SERVFAIL being handed to the other
+                        // requests waiting (see `Engine::handle_packet_internal`)
                         if UpstreamFailure::was_withheld(&err) {
                             tracing::debug!(
                                 event = "response_action_withheld",
@@ -529,76 +536,70 @@ async fn run_response_actions(
                                 error = %err,
                                 "flow control kept the response action forward from the upstream"
                             );
-                        } else {
-                            crate::warn_sparse!(
-                                event = "response_action_failure",
-                                upstream = %upstream_addr,
-                                qname = %qname,
-                                qtype = ?qtype,
-                                client_ip = %request.peer.ip(),
-                                pipeline = %ctx.pipeline_id,
-                                rule = %ctx.rule_name,
-                                error = %err,
-                                "response action forward failed"
-                            );
-                        }
-                        // 流控没让等的失败是这台设备自己的事（见 `UpstreamFailure::withheld`）：原样交回，这个
-                        // 请求出错、由监听器回 SERVFAIL，它登记的条目随之放下，不把 SERVFAIL 交给等着的别的请求
-                        // A failure with flow control keeping the query from waiting is the
-                        // device's own affair (see `UpstreamFailure::withheld`): it goes back
-                        // as it is, the request fails with the listener answering SERVFAIL,
-                        // and the entries it registered go with it, no SERVFAIL being handed
-                        // to the other requests waiting
-                        if err.downcast_ref::<UpstreamFailure>().is_none()
-                            || UpstreamFailure::was_withheld(&err)
-                        {
                             return Err(err);
                         }
-                        return response_action_servfail(ctx.req);
+                        crate::warn_sparse!(
+                            event = "response_action_failure",
+                            upstream = %upstream_addr,
+                            qname = %qname,
+                            qtype = ?qtype,
+                            client_ip = %request.peer.ip(),
+                            pipeline = %ctx.pipeline_id,
+                            rule = %ctx.rule_name,
+                            error = %format_args!("{err:#}"),
+                            "response action forward failed"
+                        );
+                        return Ok(servfail(request, "response_action"));
                     }
-                };
-                let msg = Message::from_bytes(&raw).context("parse upstream response")?;
-                ctx.ctx_opt = Some(ResponseContext {
-                    raw,
-                    msg,
-                    upstream: actual_upstream, // Use actual responding upstream
-                });
+                }
             }
         }
     }
 
     // 动作都执行完：有应答就交出它，没有就 SERVFAIL
     // Every action has run: the answer if there is one, SERVFAIL if not
-    match ctx.ctx_opt {
-        Some(resp_ctx) => Ok(ResponseActionResult::Upstream { ctx: resp_ctx }),
-        None => response_action_servfail(ctx.req),
+    Ok(match ctx.ctx_opt {
+        Some(resp_ctx) => ResponseActionResult::Upstream { ctx: resp_ctx },
+        None => servfail(request, "response_action"),
+    })
+}
+
+/// 响应动作照请求给出的静态应答，带着它记录里最小的 TTL：照线上格式从客户端的查询写（见 `response::static_reply`），不为它
+/// 解析请求
+/// A static answer the response actions give for the request, with the least TTL of its records:
+/// written on the wire from the client's query (see `response::static_reply`), with no parse of
+/// the request for it
+fn static_answer(
+    request: &Request<'_>,
+    rcode: ResponseCode,
+    answers: &[Record],
+    source: &'static str,
+) -> ResponseActionResult {
+    ResponseActionResult::Static {
+        ttl: least_ttl(answers),
+        bytes: static_reply(
+            request.packet,
+            request.qname,
+            request.qtype,
+            request.qclass,
+            rcode,
+            answers,
+        ),
+        rcode,
+        source,
     }
 }
 
-/// 响应动作照请求给出的静态应答，带着它记录里最小的 TTL / A static answer the response actions give
-/// for the request, with the least TTL of its records
-fn static_answer(
-    req: &Message,
-    rcode: ResponseCode,
-    answers: Vec<Record>,
-    source: &'static str,
-) -> anyhow::Result<ResponseActionResult> {
-    Ok(ResponseActionResult::Static {
-        ttl: least_ttl(&answers),
-        bytes: build_response(req, rcode, answers)?,
-        rcode,
-        source,
-    })
-}
-
-/// 响应动作给不出应答时的 SERVFAIL / The SERVFAIL of response actions that find no answer
-fn response_action_servfail(req: &Message) -> anyhow::Result<ResponseActionResult> {
-    Ok(ResponseActionResult::Static {
-        bytes: engine_helpers::build_servfail_response(req)?,
+/// 响应动作给不出应答时的 SERVFAIL，`source` 说明为什么（见 `ResponseActionResult::Static`）
+/// The SERVFAIL of response actions that find no answer, `source` telling why (see
+/// `ResponseActionResult::Static`)
+fn servfail(request: &Request<'_>, source: &'static str) -> ResponseActionResult {
+    ResponseActionResult::Static {
+        bytes: crate::proto_utils::servfail_reply(request.packet),
         rcode: ResponseCode::ServFail,
         ttl: None,
-        source: "response_action",
-    })
+        source,
+    }
 }
 
 #[cfg(test)]
