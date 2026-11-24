@@ -115,76 +115,148 @@ impl Unwatched {
     }
 }
 
-/// 两个管理器里每个标签的数据现在的指纹（见 `TagMatchers::fingerprint`、[`GeoIpFingerprints`]）。缓存命名空间算上
-/// pipeline 读的那几个标签的（见 `EngineInner::at_geo`）：一个标签的数据真换了样子，读它的 pipeline 换命名空间；别的标签
-/// 换了、同一份数据又读了一遍（热重载多用了一个标签、监视到文件被重写了一遍），这些 pipeline 都留着缓存
-/// The fingerprint of each tag's data in the two managers right now (see
-/// `TagMatchers::fingerprint` and [`GeoIpFingerprints`]). Cache namespaces take in those of the
-/// tags a pipeline reads (see `EngineInner::at_geo`): once a tag's data really changes, the
-/// pipelines reading it move to a new namespace; with other tags changing, or the same data
-/// read again (a hot reload using one tag more, a watched file written over the same), those
-/// pipelines keep their caches
+/// 两个管理器里每份数据的代数：GeoSite 和 GeoIP 的每个标签各一个，MMDB 一个，只增不减。数据的指纹（见
+/// `TagMatchers::fingerprint`、[`GeoIpFingerprints`]）变了才进到下一代，不在了也算；同一份数据又读了一遍（热重载多用了一个
+/// 标签、监视到文件被重写了一遍）还是这一代。缓存命名空间算上 pipeline 读的那几个标签的代数（见 `EngineInner::at_geo`）：
+/// 一个标签的数据真换了样子，读它的 pipeline 换命名空间，别的 pipeline 留着缓存。数据换回先前的样子也是新的一代，不回到
+/// 先前的命名空间：换的时候还在路上的请求拿着那个命名空间、按新数据判断，得出的应答缓存在它下面。不再用的标签也记着
+/// 代数，再用上时接着往上数
+/// The generation of each piece of data in the two managers: one per GeoSite and GeoIP tag
+/// and one for the MMDB, only ever growing. A piece moves to its next generation only once
+/// its fingerprint (see `TagMatchers::fingerprint` and [`GeoIpFingerprints`]) changes, its
+/// going away included; the same data read again (a hot reload using one tag more, a watched
+/// file written over the same) stays at its generation. Cache namespaces take in the
+/// generations of the tags a pipeline reads (see `EngineInner::at_geo`): once a tag's data
+/// really changes, the pipelines reading it move to a new namespace, and the other pipelines
+/// keep their caches. Data changing back to what it was is a new generation too, never the
+/// namespace of before: a request still on its way at the change holds that namespace and
+/// judges by the new data, and the answer it reaches is cached under it. A tag no longer used
+/// keeps its generation, counting on from there once used again
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct GeoGeneration {
-    site: FxHashMap<String, u64>,
-    ip: GeoIpFingerprints,
+    site: FxHashMap<String, Generation>,
+    ip: FxHashMap<Arc<str>, Generation>,
+    mmdb: Generation,
+}
+
+/// 一份数据的代数，和这一代的指纹（没有数据时是 None）/ The generation of one piece of data, and
+/// the fingerprint of that generation (None without data)
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Generation {
+    count: u64,
+    print: Option<u64>,
+}
+
+impl Generation {
+    /// 数据现在的指纹是 `print`，变了就进到下一代 / The data's fingerprint is `print` now, moving
+    /// to the next generation once it changed
+    fn see(&mut self, print: Option<u64>) {
+        if self.print != print {
+            self.print = print;
+            self.count += 1;
+        }
+    }
+}
+
+/// 每个标签现在的指纹是 `prints` 里的，不在里面的没有数据：各自的代数跟上 / Each tag's fingerprint
+/// is the one in `prints` now, and a tag not there has no data: each generation catches up
+fn see_each<K: Clone + Eq + Hash>(
+    generations: &mut FxHashMap<K, Generation>,
+    prints: &FxHashMap<K, u64>,
+) {
+    for (tag, generation) in generations.iter_mut() {
+        generation.see(prints.get(tag).copied());
+    }
+    for (tag, &print) in prints {
+        generations.entry(tag.clone()).or_default().see(Some(print));
+    }
 }
 
 impl GeoGeneration {
-    /// `uses` 里的标签各自的数据的指纹，没有数据的算 None，写进 `hasher` / The fingerprints of the
-    /// data of each tag of `uses`, None for one without data, written into `hasher`
+    /// 两个管理器里的数据现在的指纹是 `site`、`ip`：各份数据的代数跟上 / The fingerprints of the
+    /// data in the two managers are `site` and `ip` now: each piece's generation catches up
+    fn catch_up(&mut self, site: &FxHashMap<String, u64>, ip: &GeoIpFingerprints) {
+        see_each(&mut self.site, site);
+        see_each(&mut self.ip, &ip.tags);
+        self.mmdb.see(ip.mmdb);
+    }
+
+    /// `uses` 里的标签各自的数据的代数，从没有过数据的算 0，写进 `hasher`。国家代码有 MMDB 时按它判断（见
+    /// `GeoIpManager::matches_any_tag`），MMDB 的代数也算进去
+    /// The generation of the data of each tag of `uses`, 0 for one that never had data,
+    /// written into `hasher`. With an MMDB a country code is judged by it (see
+    /// `GeoIpManager::matches_any_tag`), so the MMDB's generation goes in too
     pub(crate) fn hash_into(&self, uses: &GeoData, hasher: &mut impl Hasher) {
+        let count = |generation: Option<&Generation>| generation.map_or(0, |g| g.count);
         for tag in &uses.site {
-            self.site.get(&**tag).hash(hasher);
+            count(self.site.get(&**tag)).hash(hasher);
         }
         for tag in &uses.ip {
-            self.ip.of(tag).hash(hasher);
+            count(self.ip.get(tag)).hash(hasher);
+            if is_country_tag(tag) {
+                self.mmdb.count.hash(hasher);
+            }
         }
     }
 
-    /// 测试用：GeoSite 标签 `site` 和 GeoIP 标签 `ip` 的数据各有这些指纹 / For tests: the data of
-    /// GeoSite tags `site` and GeoIP tags `ip` with these fingerprints
+    /// 测试用：GeoSite 标签 `site` 和 GeoIP 标签 `ip` 的数据各在这一代 / For tests: the data of
+    /// GeoSite tags `site` and GeoIP tags `ip` at these generations
     #[cfg(test)]
     pub(crate) fn of_tags(site: &[(&str, u64)], ip: &[(&str, u64)]) -> Self {
+        let generation = |count| Generation { count, print: None };
         Self {
             site: site
                 .iter()
-                .map(|&(tag, print)| (tag.to_owned(), print))
+                .map(|&(tag, count)| (tag.to_owned(), generation(count)))
                 .collect(),
-            ip: GeoIpFingerprints::of_tags(ip),
+            ip: ip
+                .iter()
+                .map(|&(tag, count)| (Arc::from(tag), generation(count)))
+                .collect(),
+            mmdb: Generation::default(),
         }
     }
 }
 
-/// 数据换进管理器以后，引擎状态换成按新指纹算的命名空间
+/// 数据换进管理器以后，引擎状态换成按新代数算的命名空间
 /// After data is swapped into a manager, the engine state moves to the namespaces of the new
-/// fingerprints
+/// generations
 #[derive(Clone)]
 struct Rotation {
     geosite: Arc<RwLock<GeoSiteManager>>,
     geoip: Arc<RwLock<GeoIpManager>>,
     state: Arc<ArcSwap<EngineInner>>,
+    /// 到上次看数据时为止的代数 / The generations as of the last look at the data
+    generation: Arc<Mutex<GeoGeneration>>,
 }
 
 impl Rotation {
+    /// 数据现在的代数：先看指纹，跟上代数。几处同时看时一处处来，代数按看的先后往上数。每次换数据以后、下一次换之前，
+    /// 换的那一方都看一遍（见 [`Self::swapped`]），所以数据每换成别的样子都进到新的一代，换回先前的样子也一样
+    /// The data's generations now: the fingerprints are looked at and the generations catch
+    /// up. Looks at the same time take turns, the generations counting up in the order of the
+    /// looks. Whoever swaps data looks once after each swap, before the next (see
+    /// [`Self::swapped`]), so each time the data turns into something else it moves to a new
+    /// generation, back to what it was included
     fn generation(&self) -> GeoGeneration {
-        GeoGeneration {
-            site: self.geosite.read().fingerprints(),
-            ip: self.geoip.read().fingerprints(),
-        }
+        let mut generation = self.generation.lock();
+        let site = self.geosite.read().fingerprints();
+        let ip = self.geoip.read().fingerprints();
+        generation.catch_up(&site, &ip);
+        generation.clone()
     }
 
     /// 数据刚换进管理器 / Data was just swapped into a manager
     fn swapped(&self) {
-        // 数据先换、指纹后读：拿到新命名空间的请求读到的一定是新数据。换状态用 rcu，同时有配置重载、或者另一种数据换了、
-        // 存进新状态时重来一遍，重读一遍指纹，不会把它盖回去；重载那边存的时候也读一遍指纹（见 `Engine::apply_config`）。
-        // 指纹都没变时状态原样不动
-        // The data first, the fingerprints after: a request that gets the new namespace reads
-        // the new data. The state is swapped with rcu, which starts over, reading the
-        // fingerprints again, when a configuration reload or the other kind of data stores a
-        // new state meanwhile instead of overwriting it; the reload reads the fingerprints as
-        // it stores too (see `Engine::apply_config`). With no fingerprint changed the state
-        // stays as it is
+        // 数据先换、代数后算：拿到新命名空间的请求读到的一定是新数据。换状态用 rcu，同时有配置重载、或者另一种数据换了、
+        // 存进新状态时重来一遍，重算一遍代数，不会把它盖回去；重载那边存的时候也算一遍代数（见 `Engine::apply_config`）。
+        // 代数都没变时状态原样不动
+        // The data first, the generations after: a request that gets the new namespace reads
+        // the new data. The state is swapped with rcu, which starts over, working out the
+        // generations again, when a configuration reload or the other kind of data stores a
+        // new state meanwhile instead of overwriting it; the reload works them out as it
+        // stores too (see `Engine::apply_config`). With no generation changed the state stays
+        // as it is
         self.state.rcu(|state| state.at_geo(self.generation()));
     }
 }
@@ -346,9 +418,9 @@ pub(crate) struct GeoSources {
 }
 
 impl GeoSources {
-    /// 把 `cfg` 用到的 Geo 数据装进两个管理器，并监视它的文件；数据每换一次，`state` 换成按新指纹算的命名空间
+    /// 把 `cfg` 用到的 Geo 数据装进两个管理器，并监视它的文件；数据每换一次，`state` 换成按新代数算的命名空间
     /// Loads the Geo data `cfg` uses into the two managers and watches its files; every
-    /// time the data is swapped, `state` moves to the namespaces of the new fingerprints
+    /// time the data is swapped, `state` moves to the namespaces of the new generations
     pub(crate) fn load(
         cfg: &RuntimePipelineConfig,
         geosite: &Arc<RwLock<GeoSiteManager>>,
@@ -359,6 +431,7 @@ impl GeoSources {
             geosite: Arc::clone(geosite),
             geoip: Arc::clone(geoip),
             state: Arc::clone(state),
+            generation: Arc::default(),
         };
         let status = Arc::default();
         Self {
@@ -369,7 +442,7 @@ impl GeoSources {
         }
     }
 
-    /// 每个标签的数据现在的指纹 / The fingerprint of each tag's data now
+    /// 每份数据现在的代数 / The generation of each piece of data now
     pub(crate) fn generation(&self) -> GeoGeneration {
         self.rotation.generation()
     }
@@ -945,8 +1018,34 @@ mod tests {
         );
     }
 
-    /// 换数据时按 `geosite`、`geoip` 的新指纹换命名空间的引擎状态：一份什么规则都没有的配置的 / The
-    /// engine state a swap moves to the namespaces of the new fingerprints of `geosite` and
+    /// 一份数据的指纹变了才进到下一代，不在了也算，换回先前的样子也是新的一代；又读了一遍同样的数据还是这一代
+    /// A piece of data moves to its next generation only once its fingerprint changes, its
+    /// going away included, and changing back to what it was is a new generation too; the same
+    /// data read again stays at its generation
+    #[test]
+    fn a_generation_moves_on_with_every_change_and_never_back() {
+        let mut generation = GeoGeneration::default();
+        let looks: [&[(&str, u64)]; 6] = [
+            &[("ads", 1)],
+            &[("ads", 1)],
+            &[("ads", 2)],
+            &[("ads", 1)],
+            &[],
+            &[("ads", 1)],
+        ];
+        let counts: Vec<u64> = looks
+            .into_iter()
+            .map(|prints| {
+                let site = prints.iter().map(|&(tag, print)| (tag.to_owned(), print));
+                generation.catch_up(&site.collect(), &GeoIpFingerprints::default());
+                generation.site["ads"].count
+            })
+            .collect();
+        assert_eq!(counts, [1, 1, 2, 3, 4, 5]);
+    }
+
+    /// 换数据时按 `geosite`、`geoip` 的新代数换命名空间的引擎状态：一份什么规则都没有的配置的 / The
+    /// engine state a swap moves to the namespaces of the new generations of `geosite` and
     /// `geoip`: that of a configuration without rules
     fn rotation(
         geosite: &Arc<RwLock<GeoSiteManager>>,
@@ -964,6 +1063,7 @@ mod tests {
             geosite: Arc::clone(geosite),
             geoip: Arc::clone(geoip),
             state: Arc::new(ArcSwap::from_pointee(EngineInner::new(cfg))),
+            generation: Arc::default(),
         }
     }
 

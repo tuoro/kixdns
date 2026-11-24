@@ -747,9 +747,9 @@ pub mod udp_batch {
 
     /// 一批最多这么多个报文 / The most datagrams in one batch
     pub const BATCH: usize = 32;
-    /// 每个报文的接收缓冲，和单收时一样大，更长的报文被截断（见 `proto_utils::MAX_QUERY_LEN`）/ Each
-    /// datagram's receive buffer, as large as for single receives; a longer datagram is cut (see
-    /// `proto_utils::MAX_QUERY_LEN`)
+    /// 每个报文的接收缓冲，更长的报文被截断，和逐个收时截到的一样长（见 `proto_utils::MAX_QUERY_LEN`）/ Each
+    /// datagram's receive buffer; a longer datagram is cut, to the length receiving one by one
+    /// cuts to (see `proto_utils::MAX_QUERY_LEN`)
     pub const RECV_SIZE: usize = crate::proto_utils::MAX_QUERY_LEN;
 
     /// 对端：内核给的原始地址发回时原样交回，`addr` 给引擎和日志用
