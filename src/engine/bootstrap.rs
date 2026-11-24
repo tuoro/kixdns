@@ -150,7 +150,25 @@ impl Known {
 type Family = anyhow::Result<Vec<(IpAddr, u32)>>;
 
 /// 问一次的结果，等着它的各拿一份 / One asking's outcome, a copy for each that waits on it
-type Asking = Shared<BoxFuture<'static, Result<Arc<[IpAddr]>, Arc<str>>>>;
+type Asking = Shared<BoxFuture<'static, Result<Arc<[IpAddr]>, NoAddress>>>;
+
+/// bootstrap 没给出一个名字的地址：为什么，和是不是 DNS 里就没有它的地址 / Bootstrap giving no address
+/// for a name: why, and whether DNS has no address for it at all
+#[derive(Clone, Debug)]
+struct NoAddress {
+    why: Arc<str>,
+    /// 两族都答了、都没有记录（比如 NXDOMAIN），而不是没问到（见 [`Family`]）/ Both families answered with no
+    /// record (NXDOMAIN, say), rather than not given (see [`Family`])
+    not_in_dns: bool,
+}
+
+impl std::fmt::Display for NoAddress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.why)
+    }
+}
+
+impl std::error::Error for NoAddress {}
 
 impl Bootstrap {
     /// `servers` 是 `bootstrap` 的写法：逗号分隔的 `IP:端口`，空的就交给系统的解析器
@@ -235,7 +253,7 @@ impl Through {
                 None => entry.asking.get_or_insert_with(|| self.ask(host)).clone(),
             }
         };
-        asking.await.map_err(anyhow::Error::msg)
+        asking.await.map_err(anyhow::Error::new)
     }
 
     /// 问一次 `host`：在自己的任务里问完，等它的走了也一样，问到的地址记下来（见 [`Host`]）
@@ -245,13 +263,16 @@ impl Through {
         let (through, host) = (Arc::clone(self), Box::<str>::from(host));
         let asking: Asking = async move {
             let asked = through.ask_servers(&host).await;
+            let not_in_dns =
+                matches!(&asked, Ok([Ok(a), Ok(aaaa)]) if a.is_empty() && aaaa.is_empty());
             let mut hosts = through.hosts.lock();
             let entry = hosts.entry(host.clone()).or_default();
             entry.asking = None;
             let known = asked
                 .and_then(|asked| Known::new(asked, entry.known.as_ref()))
-                .map_err(|error| {
-                    Arc::<str>::from(format!("bootstrap gave no address for {host}: {error:#}"))
+                .map_err(|error| NoAddress {
+                    why: format!("bootstrap gave no address for {host}: {error:#}").into(),
+                    not_in_dns,
                 })?;
             let addresses = Arc::clone(&known.addresses);
             entry.known = Some(known);
@@ -385,17 +406,14 @@ impl Through {
     }
 }
 
-/// reqwest 用的解析器，端口由 reqwest 按 URL 补上：上游的主机名交给 [`Bootstrap`]；代理的主机名（`proxies`）交给系统的
-/// 解析器，和别的程序读代理环境变量时一样。reqwest 经代理连上游时只在本机解析代理（上游的名字在 CONNECT 里由代理解析），
-/// 代理不是上游，bootstrap 的服务器未必认得它（局域网里的名字、hosts 文件里的）；NO_PROXY 里的上游 reqwest 直连，照常经
-/// [`Bootstrap`] 解析
+/// reqwest 用的解析器，端口由 reqwest 按 URL 补上：上游的主机名交给 [`Bootstrap`]，代理的主机名（`proxies`）见
+/// [`proxy_addresses`]。reqwest 经代理连上游时只在本机解析代理（上游的名字在 CONNECT 里由代理解析）；NO_PROXY 里的上游
+/// reqwest 直连，照常经 [`Bootstrap`] 解析
 /// The resolver reqwest uses, the port filled in by reqwest from the URL: upstream host names go
-/// to [`Bootstrap`]; the proxies' host names (`proxies`) to the system resolver, as for any
-/// program reading the proxy environment variables. Connecting through a proxy, reqwest resolves
-/// only the proxy here (the upstream's name, in the CONNECT, the proxy resolves), and a proxy is
-/// no upstream, which the bootstrap servers may well not know (a LAN name, one from the hosts
-/// file); an upstream in NO_PROXY reqwest connects to directly, resolved through [`Bootstrap`] as
-/// usual
+/// to [`Bootstrap`], and for the proxies' host names (`proxies`) see [`proxy_addresses`].
+/// Connecting through a proxy, reqwest resolves only the proxy here (the upstream's name, in the
+/// CONNECT, the proxy resolves); an upstream in NO_PROXY reqwest connects to directly, resolved
+/// through [`Bootstrap`] as usual
 #[derive(Clone)]
 pub(crate) struct Resolver {
     /// 上游的主机名怎样解析，直连的 DoH 也用它 / How upstream host names are resolved, by direct DoH too
@@ -424,11 +442,39 @@ impl reqwest::dns::Resolve for Resolver {
         let bootstrap = Arc::clone(&self.bootstrap);
         Box::pin(async move {
             let addresses = match proxy {
-                true => system_addresses(&host, 0).await?,
+                true => proxy_addresses(&bootstrap, &host).await?,
                 false => bootstrap.addresses(&host, 0).await?,
             };
             Ok(Box::new(addresses.into_iter()) as reqwest::dns::Addrs)
         })
+    }
+}
+
+/// 代理 `host` 的地址（端口由 reqwest 补上）。和上游的名字一样经 `bootstrap`：系统的解析器是 KixDNS 自己、KixDNS 又要经
+/// 这个代理才问得到它的地址时，问系统就绕回来，每条新连接都要等满 [`ASK_BUDGET`] 才失败。bootstrap 的服务器答了 DNS 里没有
+/// 它的地址时（见 [`NoAddress`]），它是本机或局域网自己的名字：hosts 文件里的、mDNS 的、局域网 DNS 的，或者靠搜索域补全的
+/// 单个标签，只有系统的解析器认得，交给它。没问到（到时没答上、只答了失败应答）照样是错误，不转给系统的解析器：它可能就是
+/// KixDNS 自己。没设 bootstrap 时 `bootstrap` 本来就交给系统的解析器
+/// The addresses of the proxy `host` (the port filled in by reqwest). They go through `bootstrap`
+/// as upstream names do: with the system resolver KixDNS itself and KixDNS reaching that proxy's
+/// address only through the proxy, asking the system comes back round, and every new connection
+/// fails only once it has waited out [`ASK_BUDGET`]. With the bootstrap servers answering that
+/// DNS has no address for it (see [`NoAddress`]), it is a name of the host's or the LAN's own: one
+/// from the hosts file, mDNS or the LAN's DNS, or a single label completed by the search domains,
+/// which only the system resolver knows, and it goes there. Not given (unanswered in time, or
+/// answered with failure replies alone), it is an error all the same, not passed on to the system
+/// resolver, which may be KixDNS itself. With bootstrap unset, `bootstrap` leaves it to the system
+/// resolver anyway
+async fn proxy_addresses(bootstrap: &Bootstrap, host: &str) -> anyhow::Result<Vec<SocketAddr>> {
+    match bootstrap.addresses(host, 0).await {
+        Err(error)
+            if error
+                .downcast_ref::<NoAddress>()
+                .is_some_and(|no| no.not_in_dns) =>
+        {
+            system_addresses(host, 0).await
+        }
+        given => given,
     }
 }
 
@@ -470,35 +516,76 @@ mod tests {
         tokio::time::resume();
     }
 
-    /// reqwest 经代理连上游时只在本机解析代理：代理的主机名交给系统的解析器，上游的照常问 bootstrap。`localhost`
-    /// 是代理（大小写不论），系统解析出环回地址，bootstrap 服务器一个查询也没收到；`upstream.test` 问了 bootstrap。
-    /// 以前代理的名字也问 bootstrap，它的服务器未必认得
-    /// Through a proxy reqwest resolves only the proxy here: the proxy's host name goes to the
-    /// system resolver, an upstream's to bootstrap as usual. `localhost` being the proxy (in any
-    /// case), the system gives loopback addresses and the bootstrap server gets no query;
-    /// `upstream.test` is asked of bootstrap. The proxy's name used to be asked of bootstrap too,
-    /// whose servers may well not know it
+    /// reqwest 经代理连上游时只在本机解析代理，代理的主机名和上游的一样问 bootstrap：系统的解析器是 KixDNS 自己、KixDNS
+    /// 又要经这个代理才问得到它时，问系统会绕回来。`proxy.test` 是代理（大小写不论），只有本机的 bootstrap 服务器认得，
+    /// 它给的环回地址就是代理的地址。以前代理的名字一律交给系统的解析器
+    /// Through a proxy reqwest resolves only the proxy here, and the proxy's host name is asked of
+    /// bootstrap as an upstream's is: with the system resolver KixDNS itself and KixDNS reaching
+    /// the proxy only through it, asking the system comes back round. `proxy.test` being the proxy
+    /// (in any case), known to the local bootstrap server alone, the loopback addresses it gives
+    /// are the proxy's. The proxy's name used to go to the system resolver whatever happened
     #[tokio::test]
-    async fn a_proxy_is_resolved_by_the_system_resolver() {
+    async fn a_proxy_is_resolved_through_bootstrap() {
         use reqwest::dns::Resolve;
         let server = loopback_bootstrap(300).await;
-        let resolver = Resolver::new(through(&server.address), vec![Box::from("localhost")]);
+        let resolver = Resolver::new(through(&server.address), vec![Box::from("proxy.test")]);
         let resolve = |name: &str| resolver.resolve(name.parse().expect("a host name"));
-        let proxy: Vec<SocketAddr> = resolve("LocalHost")
-            .await
-            .expect("the system resolves localhost")
-            .collect();
-        assert!(
-            !proxy.is_empty() && proxy.iter().all(|address| address.ip().is_loopback()),
-            "{proxy:?}"
-        );
-        assert_eq!(server.queries(), 0, "the proxy is not asked of bootstrap");
-        let upstream: Vec<SocketAddr> = resolve("upstream.test")
-            .await
-            .expect("bootstrap resolves the upstream")
-            .collect();
-        assert_eq!(upstream.len(), 2, "{upstream:?}");
-        assert_eq!(server.queries(), 2, "A and AAAA asked of bootstrap");
+        let loopback: Vec<SocketAddr> =
+            vec!["127.0.0.1:0".parse().unwrap(), "[::1]:0".parse().unwrap()];
+        for name in ["Proxy.Test", "upstream.test"] {
+            let addresses: Vec<SocketAddr> = resolve(name)
+                .await
+                .unwrap_or_else(|error| panic!("{name}: {error}"))
+                .collect();
+            assert_eq!(addresses, loopback, "{name}");
+        }
+        assert_eq!(server.queries(), 4, "A and AAAA of each asked of bootstrap");
+    }
+
+    /// bootstrap 答了 DNS 里没有代理的地址（NXDOMAIN、两族都没有记录）时，它是本机或局域网自己的名字，交给系统的解析器：
+    /// `localhost` 由系统解析出环回地址。没问到（只答了 SERVFAIL）照样失败，不转给系统的解析器，它可能就是 KixDNS 自己
+    /// With bootstrap answering that DNS has no address for the proxy (NXDOMAIN, or no record of
+    /// either family), it is a name of the host's or the LAN's own and goes to the system
+    /// resolver: `localhost` gets loopback addresses from the system. Not given (SERVFAIL alone),
+    /// it fails all the same, not passed on to the system resolver, which may be KixDNS itself
+    #[tokio::test]
+    async fn a_proxy_not_in_dns_is_left_to_the_system_resolver() {
+        use reqwest::dns::Resolve;
+        for rcode in [
+            ResponseCode::NXDomain,
+            ResponseCode::NoError,
+            ResponseCode::ServFail,
+        ] {
+            let server = upstream(move |query| no_records(query, rcode)).await;
+            let resolver = Resolver::new(through(&server.address), vec![Box::from("localhost")]);
+            let resolved = resolver.resolve("localhost".parse().unwrap()).await;
+            assert_eq!(
+                server.queries(),
+                2,
+                "{rcode}: A and AAAA asked of bootstrap"
+            );
+            match rcode {
+                ResponseCode::ServFail => {
+                    let error = resolved.err().expect("not given by bootstrap");
+                    assert!(
+                        error
+                            .to_string()
+                            .starts_with("bootstrap gave no address for localhost"),
+                        "{error}"
+                    );
+                }
+                _ => {
+                    let addresses: Vec<SocketAddr> = resolved
+                        .unwrap_or_else(|error| panic!("{rcode}: {error}"))
+                        .collect();
+                    assert!(
+                        !addresses.is_empty()
+                            && addresses.iter().all(|address| address.ip().is_loopback()),
+                        "{rcode}: {addresses:?}"
+                    );
+                }
+            }
+        }
     }
 
     /// 问到的地址 IPv4 在前，TTL 没过就不再问。写成 IP 的不用问
