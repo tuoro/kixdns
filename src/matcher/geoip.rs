@@ -454,6 +454,7 @@ impl GeoIpManager {
             }
             let geoip = super::geoip_proto::GeoIP::decode(entry.as_slice())
                 .context("failed to decode a geoip.dat entry")?;
+            let mut skipped = Skipped::default();
             for cidr in geoip.cidr {
                 match cidr.ip.len() {
                     4 => {
@@ -487,11 +488,10 @@ impl GeoIpManager {
                         count += 1;
                         ipv6_count += 1;
                     }
-                    len => {
-                        tracing::debug!(len, "skipping a GeoIP CIDR with an unsupported IP length");
-                    }
+                    len => skipped.add(|| format!("an address of {len} bytes")),
                 }
             }
+            skipped.warn(&country_code, ".dat file");
         }
 
         for index in tag_indexes.values_mut() {
@@ -636,29 +636,35 @@ impl GeoIpManager {
             if tag.is_empty() || !wanted(&tag) {
                 continue;
             }
-            let index = get_or_insert_tag_index(&mut tag_indexes, &tag);
-
+            let mut skipped = Skipped::default();
             for ip_str in &geoip.ips {
-                match json_network(ip_str) {
-                    Some(ipnet::IpNet::V4(v4net)) => {
+                let Some(net) = json_network(ip_str) else {
+                    skipped.add(|| ip_str.clone());
+                    continue;
+                };
+                // 标签的索引在读出第一个网段时才建，和 .dat 一样：一个网段都读不出来的标签不算文件提供了
+                // A tag's index is made with its first network read, as for .dat: a tag none of
+                // whose networks can be read does not count as provided by the file
+                let index = get_or_insert_tag_index(&mut tag_indexes, &tag);
+                match net {
+                    ipnet::IpNet::V4(v4net) => {
                         index.ipv4_ranges.push(AddrRange {
                             start: u32::from(v4net.network()),
                             end: u32::from(v4net.broadcast()),
                         });
-                        count += 1;
                         ipv4_count += 1;
                     }
-                    Some(ipnet::IpNet::V6(v6net)) => {
+                    ipnet::IpNet::V6(v6net) => {
                         index.ipv6_ranges.push(AddrRange {
                             start: u128::from(v6net.network()),
                             end: u128::from(v6net.broadcast()),
                         });
-                        count += 1;
                         ipv6_count += 1;
                     }
-                    None => {}
                 }
+                count += 1;
             }
+            skipped.warn(&tag, "JSON file");
         }
 
         for index in tag_indexes.values_mut() {
@@ -686,6 +692,32 @@ fn json_network(text: &str) -> Option<ipnet::IpNet> {
     text.parse()
         .ok()
         .or_else(|| text.parse::<IpAddr>().ok().map(ipnet::IpNet::from))
+}
+
+/// 一个条目里读不出来、跳过的网段：几条，第一条是什么。跳过的记一条告警，不然标签照样在，用它的规则却悄悄地少了这些
+/// 网段，和 GeoSite 一样（见 `GeoSiteManager::convert_v2ray_to_entries`）
+/// The networks of one entry that cannot be read and are skipped: how many, and what the
+/// first was. Those skipped make one warning, or the tag stays with the rules using it quietly
+/// missing them, as for GeoSite (see `GeoSiteManager::convert_v2ray_to_entries`)
+#[derive(Default)]
+struct Skipped {
+    count: usize,
+    first: Option<String>,
+}
+
+impl Skipped {
+    fn add(&mut self, network: impl FnOnce() -> String) {
+        self.count += 1;
+        self.first.get_or_insert_with(network);
+    }
+
+    /// 有跳过的就记一条告警 / Logs a warning when any were skipped
+    fn warn(self, tag: &str, source: &str) {
+        if let Some(example) = self.first {
+            tracing::warn!(tag, skipped = self.count, example = %example, source,
+                "skipped GeoIP networks that cannot be read");
+        }
+    }
 }
 
 fn get_or_insert_tag_index<'a>(
@@ -1282,6 +1314,71 @@ mod tests {
                 manager.matches_any_tag(ip.parse().unwrap(), &hosts),
                 expected,
                 "{ip}"
+            );
+        }
+    }
+
+    /// 读不出来的网段跳过，按条目各记一条告警，说跳过了几条、第一条是什么，别的网段照常：JSON 里前缀超过位宽的、写错的、
+    /// 带空格的，.dat 里地址不是 4 或 16 字节的。一个网段都读不出来的标签不算文件提供了，用它的规则什么都不匹配，
+    /// 和文件里没有这个标签一样
+    /// Networks that cannot be read are skipped with one warning for each entry, saying how many
+    /// and what the first was, the other networks loading as usual: in JSON one whose prefix is
+    /// wider than the address, one written wrong, one with a space; in a .dat an address that is
+    /// not 4 or 16 bytes. A tag none of whose networks can be read does not count as provided by
+    /// the file, so rules using it match nothing, as when the file lacks the tag
+    #[test]
+    fn networks_that_cannot_be_read_are_warned_about() {
+        use prost::Message;
+        let dir = tempfile::tempdir().unwrap();
+        let json = dir.path().join("geoip.json");
+        std::fs::write(
+            &json,
+            r#"{"entries":[
+                {"country_code":"SOME","ips":["192.0.2.0/24","198.51.100.0/33"," 203.0.113.0/24"]},
+                {"country_code":"NONE","ips":["10.0.0.0/8x","bogus"]}
+            ]}"#,
+        )
+        .unwrap();
+        let dat = dir.path().join("geoip.dat");
+        let cidr = |ip: Vec<u8>, prefix| super::super::geoip_proto::Cidr { ip, prefix };
+        let list = super::super::geoip_proto::GeoIPList {
+            entry: vec![super::super::geoip_proto::GeoIP {
+                country_code: "SOME".to_string(),
+                cidr: vec![
+                    cidr(vec![192, 0, 2, 0], 24),
+                    cidr(vec![198, 51, 100, 0, 0], 24),
+                ],
+            }],
+        };
+        std::fs::write(&dat, list.encode_to_vec()).unwrap();
+
+        let (warnings, guard) = crate::engine::test_support::Warnings::capture();
+        let from_json = GeoIpManager::parse_file(&json, &tags(&["some", "none"])).unwrap();
+        let from_dat = GeoIpManager::parse_file(&dat, &tags(&["some"])).unwrap();
+        drop(guard);
+        for parsed in [from_json, from_dat] {
+            assert_eq!(parsed.tag_count(), 1);
+            let mut manager = GeoIpManager::default();
+            manager.apply_parsed(parsed);
+            assert!(manager.matches_tag("192.0.2.1".parse().unwrap(), "SOME"));
+            assert!(!manager.matches_tag("203.0.113.1".parse().unwrap(), "SOME"));
+        }
+        let lines = warnings.lines();
+        let skipped: Vec<&String> = lines
+            .iter()
+            .filter(|line| line.contains("skipped GeoIP networks that cannot be read"))
+            .collect();
+        assert_eq!(skipped.len(), 3, "{lines:#?}");
+        for (line, (tag, count, example)) in skipped.iter().zip([
+            ("SOME", 2, "198.51.100.0/33"),
+            ("NONE", 2, "10.0.0.0/8x"),
+            ("SOME", 1, "an address of 5 bytes"),
+        ]) {
+            assert!(
+                line.contains(tag)
+                    && line.contains(&format!("skipped={count}"))
+                    && line.contains(example),
+                "{line}"
             );
         }
     }
