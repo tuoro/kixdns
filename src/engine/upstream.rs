@@ -12,7 +12,7 @@ use tracing::debug;
 use super::Engine;
 use super::concurrency::GaveUp;
 use super::transport::UdpExchange;
-use crate::config::{Transport, parse_upstream_addr, split_upstreams, transport_for_scheme};
+use crate::config::{Transport, parse_upstream_addr, split_upstreams};
 use crate::observe::{
     UpstreamAttempt, UpstreamOutcome, UpstreamResult, UpstreamSkipReason, UpstreamSkipped,
 };
@@ -180,13 +180,6 @@ pub(crate) fn reject_failure_reply_on_refresh(
     }
 }
 
-/// Whether an upstream address carries a `scheme://` transport prefix, which
-/// [`parse_upstream_addr`] lets override the configured transport.
-/// 上游地址是否带 `scheme://` 传输前缀（parse_upstream_addr 以前缀覆盖配置的传输）。
-pub(crate) fn has_transport_prefix(addr: &str) -> bool {
-    addr.contains("://")
-}
-
 /// `cfg` 里经 TCP 问的上游地址（去掉前缀，见 [`upstreams`]），启动时据此预热连接；`tcp` 和 `tcp_udp` 算 TCP
 /// The addresses (short of their prefix, see [`upstreams`]) of the upstreams `cfg` asks over
 /// TCP, whose connections are warmed up at startup; `tcp` and `tcp_udp` count as TCP
@@ -198,32 +191,6 @@ pub(crate) fn tcp_upstreams(
         .filter(|(_, transport)| matches!(transport, Transport::Tcp | Transport::TcpUdp))
         .map(|(address, _)| address.to_owned())
         .collect()
-}
-
-/// 一个上游写得对不对：前缀认识，地址是它的传输读得懂的。说明为什么不对。
-/// Whether one upstream is written right: a known prefix, and an address its
-/// transport can read. Says why not.
-pub(crate) fn upstream_problem(upstream: &str, default_transport: Transport) -> Option<String> {
-    if let Some(idx) = upstream.find("://")
-        && transport_for_scheme(&upstream[..idx]).is_none()
-    {
-        return Some(format!(
-            "upstream \"{upstream}\" starts with an unknown prefix \"{}://\"",
-            &upstream[..idx]
-        ));
-    }
-    let (address, transport) = parse_upstream_addr(upstream, default_transport);
-    crate::engine::transport::check_upstream_address(address, transport)
-        .err()
-        .map(|error| format!("upstream \"{upstream}\" is not usable: {error:#}"))
-}
-
-/// 连上 `upstream` 之前要解析的主机名，没写前缀的按 `default_transport` 连（见 `transport::host_name`）
-/// The host name to resolve before connecting to `upstream`, one without a prefix connected to
-/// by `default_transport` (see `transport::host_name`)
-pub(crate) fn host_name(upstream: &str, default_transport: Transport) -> Option<String> {
-    let (address, transport) = parse_upstream_addr(upstream, default_transport);
-    crate::engine::transport::host_name(address, transport)
 }
 
 /// 一份配置里的上游在各连接池里的键，按传输分开；DoH 自己清理不用的上游，不在这里
@@ -298,7 +265,7 @@ async fn fallback_after_primary_failure(
     primary_is_task_error: bool,
     other: Transport,
 ) -> anyhow::Result<(Bytes, Transport)> {
-    let other_label = transport_label(other);
+    let other_label = other.label();
     if remaining.is_zero() {
         other_task.abort();
         if primary_is_task_error {
@@ -1023,12 +990,12 @@ impl Drop for Attempts<'_> {
 }
 
 /// Sends `packet` to one upstream over `transport`, and returns the answer with the
-/// transport that carried it (a UDP query may end up over TCP; see [`transport_label`]).
+/// transport that carried it (a UDP query may end up over TCP; see [`upstream_label`]).
 /// Each transport's exchange is allocated on its own, sized to that transport: held
 /// inline, it made every query waiting on an upstream reserve room for the largest of
 /// them (DoT, about 2 KB), whatever the query went over.
 /// 把 `packet` 经 `transport` 发给一个上游，返回应答以及实际带回应答的传输（UDP 查询可能最后走了
-/// TCP；见 [`transport_label`]）。每种传输的收发单独在堆上分配，大小按这种传输来：放在调用方里时，
+/// TCP；见 [`upstream_label`]）。每种传输的收发单独在堆上分配，大小按这种传输来：放在调用方里时，
 /// 等上游的每个查询不管走的是哪种传输，都得按最大的那种（DoT，约 2 KB）预留。
 ///
 /// 经加密传输发的查询在这里补齐长度（见 `padded_query`），明文传输上不填充（RFC 7830 第 6 节）
@@ -1091,43 +1058,27 @@ async fn send_to_upstream(
     }
 }
 
-/// `传输:地址` 里的传输名：实际带回应答的那种传输；双发失败时记 udp
-/// The transport name in `transport:address`: the one that carried the answer; udp for a
-/// dual send that failed
-fn transport_label(via: Transport) -> &'static str {
-    match via {
-        Transport::Udp | Transport::TcpUdp => "udp",
-        Transport::Tcp => "tcp",
-        Transport::Doh => "doh",
-        Transport::Dot => "dot",
-        Transport::Doq => "doq",
-    }
-}
-
 /// 记住的上游名字最多这么多个，配置里写不了这么多；再多的现算，不记 / The most upstream names kept,
 /// more than a configuration writes; any further are built each time and not kept
 const UPSTREAM_LABELS: usize = 4096;
 
-/// 上游在应答记录里的名字（`udp:1.1.1.1:53`）。每个转发回来的应答都带一个，而上游只有配置里那几个，
-/// 算过就留着：之后不分配内存，所有应答共用一份。
-/// An upstream's name in the records of its answers (`udp:1.1.1.1:53`). Every answer back
-/// from a forward carries one and the configuration only has so many upstreams, so each is
-/// kept once built: no allocation after that, and all answers share one copy.
+/// 上游在应答记录里的名字（`udp:1.1.1.1:53`，读回去见 `config::split_answered`）：`via` 是实际带回应答的那种传输，
+/// 双发都失败时是 tcp+udp。每个转发回来的应答都带一个，而上游只有配置里那几个，算过就留着：之后不分配内存，所有应答
+/// 共用一份。
+/// An upstream's name in the records of its answers (`udp:1.1.1.1:53`, read back by
+/// `config::split_answered`): `via` is the transport that carried the answer, tcp+udp for a dual
+/// send that failed both ways. Every answer back from a forward carries one and the
+/// configuration only has so many upstreams, so each is kept once built: no allocation after
+/// that, and all answers share one copy.
 fn upstream_label(via: Transport, addr: &str) -> Arc<str> {
     type Labels = dashmap::DashMap<Box<str>, Arc<str>, rustc_hash::FxBuildHasher>;
-    static LABELS: std::sync::LazyLock<[Labels; 5]> =
+    static LABELS: std::sync::LazyLock<[Labels; 6]> =
         std::sync::LazyLock::new(|| std::array::from_fn(|_| Labels::default()));
-    let labels = &LABELS[match via {
-        Transport::Udp | Transport::TcpUdp => 0,
-        Transport::Tcp => 1,
-        Transport::Doh => 2,
-        Transport::Dot => 3,
-        Transport::Doq => 4,
-    }];
+    let labels = &LABELS[via as usize];
     if let Some(label) = labels.get(addr) {
         return Arc::clone(&label);
     }
-    let label: Arc<str> = Arc::from(format!("{}:{addr}", transport_label(via)));
+    let label: Arc<str> = Arc::from(format!("{}:{addr}", via.label()));
     if labels.len() < UPSTREAM_LABELS {
         labels.insert(addr.into(), Arc::clone(&label));
     }
@@ -1424,15 +1375,15 @@ mod tests {
             ("doq", Transport::Doq),
             ("QuIc", Transport::Doq),
         ] {
-            assert_eq!(transport_for_scheme(scheme), Some(transport), "{scheme}");
+            assert_eq!(Transport::from_label(scheme), Some(transport), "{scheme}");
         }
         for scheme in ["", "tc", "tcpp", "http", "udp+udp", "tc\u{0440}"] {
-            assert_eq!(transport_for_scheme(scheme), None, "{scheme}");
+            assert_eq!(Transport::from_label(scheme), None, "{scheme}");
         }
     }
 
-    /// 上游的名字算一次，之后所有应答共用；双发算 UDP
-    /// An upstream's name is built once and all answers share it; a dual send counts as UDP
+    /// 上游的名字算一次，之后所有应答共用
+    /// An upstream's name is built once and all answers share it
     #[test]
     fn an_upstream_name_is_built_once_and_shared() {
         let first = upstream_label(Transport::Udp, "192.0.2.1:53");
@@ -1441,21 +1392,41 @@ mod tests {
             &first,
             &upstream_label(Transport::Udp, "192.0.2.1:53")
         ));
-        assert!(Arc::ptr_eq(
-            &first,
-            &upstream_label(Transport::TcpUdp, "192.0.2.1:53")
-        ));
         assert_eq!(
             &*upstream_label(Transport::Udp, "192.0.2.2:53"),
             "udp:192.0.2.2:53"
         );
         for (via, label) in [
             (Transport::Tcp, "tcp:192.0.2.1:53"),
+            (Transport::TcpUdp, "tcp+udp:192.0.2.1:53"),
             (Transport::Doh, "doh:192.0.2.1:53"),
             (Transport::Dot, "dot:192.0.2.1:53"),
             (Transport::Doq, "doq:192.0.2.1:53"),
         ] {
             assert_eq!(&*upstream_label(via, "192.0.2.1:53"), label);
+        }
+    }
+
+    /// 上游的名字拆得回它的传输和地址，写和读用的是同一份传输名（见 `Transport::label`）。不带传输名的拆不出传输，地址是
+    /// 整个名字，IPv4、IPv6 都是：以前观察者那份拆法把 `1.1.1.1:53` 拆成地址 `53`
+    /// An upstream's name splits back into its transport and address, writing and reading going
+    /// by the one set of transport names (see `Transport::label`). One without a transport's
+    /// name gives no transport, the address being the whole name, IPv4 and IPv6 alike: the
+    /// observer's own split used to give `1.1.1.1:53` the address `53`
+    #[test]
+    fn an_upstream_name_splits_back_into_what_it_was_built_from() {
+        for via in Transport::ALL {
+            for address in ["192.0.2.1:53", "[2001:db8::1]:853", "dns.example/dns-query"] {
+                let name = upstream_label(via, address);
+                assert_eq!(
+                    crate::config::split_answered(&name),
+                    (Some(via), address),
+                    "{name}"
+                );
+            }
+        }
+        for name in ["1.1.1.1:53", "[2001:db8::1]:53", "dns.example:853"] {
+            assert_eq!(crate::config::split_answered(name), (None, name));
         }
     }
 
@@ -2047,7 +2018,7 @@ mod tests {
             let reply = result.unwrap_or_else(|err| panic!("case {index}: {err:#}"));
             assert_eq!(via, expected, "case {index}");
             assert_eq!(
-                transport_label(via),
+                via.label(),
                 if expected == Transport::Tcp {
                     "tcp"
                 } else {
