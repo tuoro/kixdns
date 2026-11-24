@@ -5,7 +5,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use std::hash::BuildHasher;
-use std::io::Read;
 
 use anyhow::Context;
 use hashbrown::HashTable;
@@ -15,6 +14,7 @@ use rustc_hash::{FxBuildHasher, FxHashMap};
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
+use super::dat_reader::DatReader;
 use super::{MAX_REGEX_LEN, REGEX_SIZE_LIMIT, ascii_regex_pattern, domain_suffix_matches};
 
 /// 域名匹配器类型 / Domain matcher type
@@ -760,124 +760,6 @@ struct Attribute {
     key: String,
 }
 
-/// .dat 文件的顺序读取：按需读出字段、跳过不要的部分，不把整个文件读进内存
-/// Sequential reading of a .dat file: fields are read as needed and the rest skipped, without
-/// reading the whole file into memory
-struct DatReader {
-    file: std::io::BufReader<fs::File>,
-    /// 当前在文件里的位置 / The current position in the file
-    pos: usize,
-    /// 打开时的文件长度 / The file's length when opened
-    len: usize,
-}
-
-impl DatReader {
-    fn open(path: &Path) -> anyhow::Result<Self> {
-        let file = fs::File::open(path)?;
-        let len = usize::try_from(file.metadata()?.len())?;
-        Ok(Self {
-            file: std::io::BufReader::with_capacity(64 * 1024, file),
-            pos: 0,
-            len,
-        })
-    }
-
-    /// 下一个字节，必须有 / The next byte, which must be there
-    fn next_byte(&mut self) -> anyhow::Result<u8> {
-        anyhow::ensure!(self.pos < self.len, "unexpected end of file");
-        let mut byte = [0u8];
-        self.file.read_exact(&mut byte)?;
-        self.pos += 1;
-        Ok(byte[0])
-    }
-
-    /// 读一个变长整数：最多 10 个字节，多了就是坏文件 / Reads a varint: 10 bytes at most,
-    /// more means a broken file
-    fn varint(&mut self) -> anyhow::Result<usize> {
-        let mut value = 0u64;
-        for shift in (0..64).step_by(7) {
-            let byte = self.next_byte()?;
-            value |= u64::from(byte & 0x7F) << shift;
-            if byte & 0x80 == 0 {
-                return varint_len(value);
-            }
-        }
-        anyhow::bail!("invalid varint in .dat file")
-    }
-
-    /// 从当前位置往后读到 `end` 为止，找下一个字段号是 `number` 的字段，给出它的值有多长，读的位置停在值的开头；
-    /// 别的字段按线上类型跳过。字段头和长度都是变长整数。找的字段不是带长度的、哪个字段越出 `end`、线上类型不认识，
-    /// 都是坏文件：越出的字段以前让条目到此为止，余下的域名悄悄丢掉。读到 `end` 也没找到时是 None
-    /// Reads on from the current position up to `end` for the next field numbered `number`,
-    /// giving the length of its value with the position left where the value starts; other
-    /// fields are skipped by wire type. Keys and lengths are varints. The field not being
-    /// length-delimited, any field running past `end`, or a wire type not known means a
-    /// broken file: a field running past used to end its entry there, quietly dropping the
-    /// domains left. None when `end` is reached without finding it
-    fn next_field(&mut self, number: usize, end: usize) -> anyhow::Result<Option<usize>> {
-        while self.pos < end {
-            let key = self.varint()?;
-            let (field, wire_type) = (key >> 3, key & 0x07);
-            let len = match wire_type {
-                0 => {
-                    self.varint()?;
-                    0
-                }
-                1 => 8,
-                2 => self.varint()?,
-                5 => 4,
-                other => anyhow::bail!("invalid wire type {other} in .dat file"),
-            };
-            if runs_past(self.pos, len, end) {
-                anyhow::bail!(
-                    "truncated .dat file: field {field} at offset {} needs {len} bytes, past the end of its message at {end}",
-                    self.pos
-                );
-            }
-            if field == number {
-                anyhow::ensure!(
-                    wire_type == 2,
-                    "invalid wire type {wire_type} for field {number} in .dat file"
-                );
-                return Ok(Some(len));
-            }
-            self.seek_to(self.pos + len)?;
-        }
-        Ok(None)
-    }
-
-    /// 接下来的 `len` 个字节，读进 `buf` / The next `len` bytes, read into `buf`
-    fn read(&mut self, buf: &mut Vec<u8>, len: usize) -> anyhow::Result<()> {
-        buf.clear();
-        buf.resize(len, 0);
-        self.file.read_exact(buf)?;
-        self.pos += len;
-        Ok(())
-    }
-
-    /// 移到文件里的 `pos` / Moves to `pos` in the file
-    fn seek_to(&mut self, pos: usize) -> anyhow::Result<()> {
-        let offset = i64::try_from(pos)? - i64::try_from(self.pos)?;
-        self.file.seek_relative(offset)?;
-        self.pos = pos;
-        Ok(())
-    }
-}
-
-/// 变长整数当作长度或位置用 / A varint used as a length or position
-fn varint_len(value: u64) -> anyhow::Result<usize> {
-    usize::try_from(value).context("varint in .dat file too large")
-}
-
-/// 从 `pos` 起的 `len` 个字节是否越出 `end`。`len` 是文件里读出来的，可以接近 u64::MAX：
-/// 加起来溢出也算越出，不能让回绕成的小数通过检查、把读的位置退回前面
-/// Whether `len` bytes from `pos` run past `end`. `len` is read from the file and may come
-/// close to u64::MAX: a sum that overflows runs past too, rather than wrapping to a small
-/// number that passes the check and moves the reading position back
-fn runs_past(pos: usize, len: usize, end: usize) -> bool {
-    pos.checked_add(len).is_none_or(|stop| stop > end)
-}
-
 impl GeoSiteManager {
     /// 从数据文件加载 `tags` 这几个标签，给出加载了几个，测试用 / Loads the tags `tags` from a data
     /// file, giving how many, for tests
@@ -1176,8 +1058,8 @@ impl GeoSiteManager {
         // overwrite caught in the act) gets the whole file rejected: otherwise the caller
         // takes the part that was read as the complete file and drops every tag the rest of
         // it holds (see `DatReader::next_field`)
-        while let Some(entry_len) = file.next_field(1, file.len)? {
-            let entry_start = file.pos;
+        while let Some(entry_len) = file.next_field(1, file.end())? {
+            let entry_start = file.pos();
             let entry_end = entry_start + entry_len;
 
             // 先只读 tag（字段 1），判断这个条目要不要。只看第一个 tag 字段：protobuf 规定同一个字段写了几次时

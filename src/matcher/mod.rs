@@ -1,4 +1,5 @@
 pub mod advanced_rule;
+mod dat_reader;
 pub mod geoip;
 pub mod geoip_converter;
 mod geoip_proto;
