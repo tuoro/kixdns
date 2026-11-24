@@ -56,6 +56,15 @@ fn log_of(dir: &Path) -> String {
     std::fs::read_to_string(dir.join("kixdns.log")).unwrap()
 }
 
+/// 端口被占时日志里写的那段错误：C 库给的文字连同错误号，内核和测试用的是同一个 C 库（glibc 写 "Address already in
+/// use"，musl 写 "Address in use"）
+/// What the log writes for a taken port: the C library's text with the error number, the kernel
+/// and the test using the same C library (glibc writes "Address already in use", musl "Address
+/// in use")
+fn address_in_use() -> String {
+    std::io::Error::from_raw_os_error(libc::EADDRINUSE).to_string()
+}
+
 fn query() -> Vec<u8> {
     let mut query = Message::new(7, MessageType::Query, OpCode::Query);
     query.metadata.recursion_desired = true;
@@ -198,7 +207,7 @@ fn a_taken_dns_port_ends_the_kernel_with_the_reason() {
         let log = log_of(dir.path());
         assert!(!status.success());
         assert!(log.contains(reason), "{log}");
-        assert!(log.contains("Address already in use"), "{log}");
+        assert!(log.contains(&address_in_use()), "{log}");
         assert!(!log.contains("dns server started"), "{log}");
     }
 }
@@ -227,7 +236,7 @@ fn a_taken_doh_port_leaves_dns_answering() {
     assert!(until(&mut kernel, || udp_answers(address) && tcp_answers(address)));
     let log = log_of(dir.path());
     assert!(log.contains("DoH server cannot start"), "{log}");
-    assert!(log.contains("Address already in use"), "{log}");
+    assert!(log.contains(&address_in_use()), "{log}");
 }
 
 /// 监听 `[::]` 时 IPv4 和 IPv6 都答，UDP 和 TCP 都一样；这台机器没有 IPv6 就不测
