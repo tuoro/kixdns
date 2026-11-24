@@ -1,9 +1,11 @@
 //! 规则里的正则：按 ASCII 编译、限制编译后的大小。域名正则照写的区分大小写（写了 `(?i)` 才不分），规则看到的名字
-//! 已转成小写（见 `proto_utils::name_text`），所以不带 `(?i)` 写成大写的字母不会命中
+//! 已转成小写（见 `proto_utils::name_text`），所以不带 `(?i)` 写成大写的字母不会命中，配置这样写时有一条警告（见
+//! [`capitals_warning`]）
 //! The regexes in rules: compiled for ASCII with a bound on their compiled size. A domain regex
 //! is case-sensitive as written (ignoring case only under `(?i)`), and the names rules see are
 //! lowercased already (see `proto_utils::name_text`), so without `(?i)` a letter written in
-//! capitals never matches
+//! capitals never matches, and a configuration writing one gets a warning (see
+//! [`capitals_warning`])
 
 use super::*;
 /// 正则写得比 `max` 字节长时的报错 / The error for a regex written longer than `max` bytes
@@ -78,6 +80,66 @@ fn ascii_hir(hir: regex_syntax::hir::Hir) -> regex_syntax::hir::Hir {
         HirKind::Literal(literal) => Hir::literal(literal.0),
         HirKind::Empty => Hir::empty(),
     }
+}
+
+/// 配置里的域名正则 `pattern` 不在 `(?i)` 下写成大写、照写永远命不中的部分，写成一条 `kind`（`domain_regex` 这样）的警告
+/// （见 `config::warnings`）；没有这样的部分，或者正则写错了、太长（编译时另报）时为 None。规则看到的名字是小写的：
+/// 带大写字母的字面量，和只取大写字母的字符类，对不上任何名字。字符类按 ASCII 的部分看，和编译时一样（见 [`ascii_hir`]）
+/// The parts of a configuration's name regex `pattern` written in capitals outside `(?i)`,
+/// which never match as written, as a warning about a `kind` (`domain_regex`, say; see
+/// `config::warnings`); None with no such part, or when the regex is written wrong or too long
+/// (reported as it compiles). The names rules see are lowercase: a literal holding a capital,
+/// or a class taking capitals alone, fits no name. A class counts by its ASCII part, as it
+/// compiles (see [`ascii_hir`])
+pub(crate) fn capitals_warning(kind: &str, pattern: &str) -> Option<String> {
+    regex_within(pattern, MAX_REGEX_LEN).ok()?;
+    let hir = regex_syntax::Parser::new().parse(pattern).ok()?;
+    let mut capitals = Vec::new();
+    find_capitals(&hir, &mut capitals);
+    (!capitals.is_empty()).then(|| {
+        format!(
+            "{kind} \"{pattern}\": the capitals in {} never match, as the names rules see are lowercase; write them in lowercase or under (?i)",
+            capitals.join(", ")
+        )
+    })
+}
+
+/// `hir` 里照写永远命不中的大写部分（见 [`capitals_warning`]），按正则的写法加上引号记进 `found`
+/// The parts of `hir` in capitals that never match as written (see [`capitals_warning`]), put
+/// into `found` as a pattern writes them, in quotes
+fn find_capitals(hir: &regex_syntax::hir::Hir, found: &mut Vec<String>) {
+    use regex_syntax::hir::{Class, ClassUnicode, ClassUnicodeRange, HirKind};
+    let written = match hir.kind() {
+        HirKind::Literal(literal) => literal.0.iter().any(u8::is_ascii_uppercase).then(|| {
+            // 照写的样子：语法树写出来的套着一层 `(?:)` / As a pattern writes it: the tree
+            // writes it out wrapped in `(?:)`
+            regex_syntax::escape(&String::from_utf8_lossy(&literal.0))
+        }),
+        HirKind::Class(class) => {
+            let unicode = match class {
+                Class::Unicode(class) => Some(class.clone()),
+                // 字节类只能是 ASCII（见 `ascii_hir`）/ A byte class can only be ASCII (see `ascii_hir`)
+                Class::Bytes(class) => class.to_unicode_class(),
+            };
+            unicode
+                .is_some_and(|mut class| {
+                    class.intersect(&ClassUnicode::new([ClassUnicodeRange::new('\0', '\x7f')]));
+                    let ranges = class.ranges();
+                    !ranges.is_empty()
+                        && ranges.iter().all(|range| {
+                            range.start().is_ascii_uppercase() && range.end().is_ascii_uppercase()
+                        })
+                })
+                .then(|| hir.to_string())
+        }
+        HirKind::Repetition(repetition) => return find_capitals(&repetition.sub, found),
+        HirKind::Capture(capture) => return find_capitals(&capture.sub, found),
+        HirKind::Concat(subs) | HirKind::Alternation(subs) => {
+            return subs.iter().for_each(|sub| find_capitals(sub, found));
+        }
+        HirKind::Empty | HirKind::Look(_) => None,
+    };
+    found.extend(written.map(|written| format!("\"{written}\"")));
 }
 
 /// 域名的正则（规则和入口的 `domain_regex`、回答条件的 `request_domain_regex`）：最长 [`MAX_REGEX_LEN`] 字节，按写的
