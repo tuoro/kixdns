@@ -596,7 +596,7 @@ impl DoqMuxClient {
         if let Some(pooled) = self.usable() {
             return Ok(connected(pooled, false));
         }
-        let make = || {
+        let make = |deadline| {
             let (pool, upstream) = (Arc::clone(&self.pooled), Arc::clone(&self.upstream));
             let (aging, stop) = (self.runtime.aging, self.stop.clone());
             let made = Self::connect_new(
@@ -604,6 +604,7 @@ impl DoqMuxClient {
                 Arc::clone(&self.upstream),
                 target.clone(),
                 self.zero_rtt_retry_allowed(target),
+                deadline,
             );
             async move {
                 let NewDoqConn { conn, used_0rtt } = made.await?;
@@ -750,15 +751,17 @@ impl DoqMuxClient {
             );
         }
     }
-    /// 建一条到 `target` 的连接，`zero_rtt` 时先试 0-RTT；连接和用没用 0-RTT。几个地址错开着连（见
-    /// [`staggered`]），握手失败了马上连下一个 / Connects to `target`, trying 0-RTT first when
-    /// `zero_rtt`; the connection and whether 0-RTT was used. Several addresses are connected to
-    /// staggered (see [`staggered`]), a failed handshake moving on to the next at once
+    /// 建一条到 `target` 的连接，`zero_rtt` 时先试 0-RTT，最晚到建连的期限 `deadline`；连接和用没用 0-RTT。几个地址
+    /// 错开着连（见 [`staggered`]），握手失败了马上连下一个 / Connects to `target`, trying 0-RTT first when
+    /// `zero_rtt`, by the connect's `deadline`; the connection and whether 0-RTT was used. Several
+    /// addresses are connected to staggered (see [`staggered`]), a failed handshake moving on to
+    /// the next at once
     async fn connect_new(
         runtime: Arc<DoqRuntime>,
         upstream: Arc<str>,
         target: DoqTarget,
         zero_rtt: bool,
+        deadline: tokio::time::Instant,
     ) -> anyhow::Result<NewDoqConn> {
         let mut addresses = runtime
             .bootstrap
@@ -771,7 +774,7 @@ impl DoqMuxClient {
         // 某些网络的 IPv6 连接不稳定或 MTU 限制导致 QUIC Initial 数据包发送失败
         // Some networks have unstable IPv6 or MTU limits causing QUIC Initial packet send failures
         addresses.sort_by_key(SocketAddr::is_ipv6);
-        staggered(addresses, |address| {
+        staggered(addresses, deadline, |address| {
             Self::connect_to(&runtime, &upstream, &target, address, zero_rtt)
         })
         .await

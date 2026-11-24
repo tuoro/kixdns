@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::net::TcpStream;
-use tokio::time::timeout;
+use tokio::time::timeout_at;
 use tracing::warn;
 use webpki_roots::TLS_SERVER_ROOTS;
 
@@ -30,17 +30,22 @@ const ATTEMPT_DELAY: Duration = Duration::from_millis(250);
 
 /// 用 `attempt` 连上 `addresses` 里的一个（RFC 8305 第 4、5 节）：地址按族交替排开，第一个地址那一族在前；起一个尝试，
 /// 它过了 [`ATTEMPT_DELAY`] 还没连上、或者失败了，就接着起下一个，先连上的那个用，别的放弃；都失败时按失败的先后列出每个
-/// 地址和它的失败，日志里看得出连过哪些。TCP、DoT、直连的 DoH 和 DoQ 都这样连：前面的地址不回应时，后面的不用等到建连的
-/// 时限才轮到
+/// 地址和它的失败，日志里看得出连过哪些。到了建连的期限 `deadline`（见 [`Connect::attempt`]）还没连上时，已经失败的照列，
+/// 还在连的记成「多久没回应」：黑洞地址、丢掉的 SYN、不回的 DoQ 握手都是这样，原因里看得出是哪些地址。TCP、DoT、直连的
+/// DoH 和 DoQ 都这样连：前面的地址不回应时，后面的不用等到建连的时限才轮到
 /// Connects through `attempt` to one of `addresses` (RFC 8305 sections 4 and 5): the addresses
 /// alternate by family, the first address's family first; one attempt is started, and once it is
 /// not through after [`ATTEMPT_DELAY`], or has failed, the next one is, the first to connect
 /// being used and the rest given up; with all failed every address is reported with its failure,
-/// in the order they failed, so a log shows what was dialled. TCP, DoT, direct DoH and DoQ all
-/// connect so: with an early address not answering, the later ones have their turn well within
-/// the connect's time limit
+/// in the order they failed, so a log shows what was dialled. Not through by the connect's
+/// `deadline` (see [`Connect::attempt`]), those failed are reported as ever and those still
+/// connecting as unanswered for so long: so for an address that is a black hole, a SYN dropped, a
+/// DoQ handshake never answered, the cause shows which addresses they were. TCP, DoT, direct DoH
+/// and DoQ all connect so: with an early address not answering, the later ones have their turn
+/// well within the connect's time limit
 pub(super) async fn staggered<T, F>(
     addresses: Vec<SocketAddr>,
+    deadline: tokio::time::Instant,
     attempt: impl Fn(SocketAddr) -> F,
 ) -> anyhow::Result<T>
 where
@@ -50,10 +55,17 @@ where
 
     let mut waiting = interleaved(addresses).into_iter();
     let mut attempts = futures::stream::FuturesUnordered::new();
+    // 起过的尝试：地址和起的时候，有了结果的是 None / The attempts started: the address and when,
+    // None once it has an outcome
+    let mut started = Vec::new();
     let mut failed = Vec::new();
     loop {
         match waiting.next() {
-            Some(address) => attempts.push(attempt(address).map(move |outcome| (address, outcome))),
+            Some(address) => {
+                let at = started.len();
+                started.push(Some((address, tokio::time::Instant::now())));
+                attempts.push(attempt(address).map(move |outcome| (at, outcome)));
+            }
             None if attempts.is_empty() => {
                 anyhow::ensure!(!failed.is_empty(), "no address to connect to");
                 anyhow::bail!("{}", failed.join("; "));
@@ -61,11 +73,21 @@ where
             None => {}
         }
         tokio::select! {
-            Some((address, outcome)) = attempts.next() => match outcome {
-                Ok(connected) => return Ok(connected),
-                Err(error) => failed.push(format!("connect {address}: {error:#}")),
-            },
+            Some((at, outcome)) = attempts.next() => {
+                let (address, _) = started[at].take().expect("one outcome per attempt");
+                match outcome {
+                    Ok(connected) => return Ok(connected),
+                    Err(error) => failed.push(format!("connect {address}: {error:#}")),
+                }
+            }
             () = tokio::time::sleep(ATTEMPT_DELAY), if !waiting.as_slice().is_empty() => {}
+            () = tokio::time::sleep_until(deadline) => {
+                failed.extend(started.iter().flatten().map(|(address, since)| {
+                    let waited = since.elapsed().as_millis();
+                    format!("connect {address}: no answer in {waited}ms")
+                }));
+                anyhow::bail!("{}", failed.join("; "));
+            }
         }
     }
 }
@@ -89,13 +111,15 @@ fn interleaved(addresses: Vec<SocketAddr>) -> Vec<SocketAddr> {
 }
 
 /// 连上写成 `主机:端口` 的地址（TCP、DoT 上游，直连的 DoH 上游）：主机名交给 `bootstrap` 解析，几个地址错开着连
-/// （见 [`staggered`]），连上的那条再调好（见 [`tune_stream_socket`]）
+/// （见 [`staggered`]），最晚连到建连的期限 `deadline`，连上的那条再调好（见 [`tune_stream_socket`]）
 /// Connects to an address written as `host:port` (TCP and DoT upstreams, a direct DoH one): the
 /// host name goes to `bootstrap`, several addresses are connected to staggered (see
-/// [`staggered`]), and the one connected is tuned (see [`tune_stream_socket`])
+/// [`staggered`]) up to the connect's `deadline`, and the one connected is tuned (see
+/// [`tune_stream_socket`])
 pub(in crate::engine) async fn connect_tcp(
     bootstrap: &Bootstrap,
     address: &str,
+    deadline: tokio::time::Instant,
 ) -> anyhow::Result<TcpStream> {
     let addresses = match address.parse::<SocketAddr>() {
         Ok(address) => vec![address],
@@ -108,7 +132,7 @@ pub(in crate::engine) async fn connect_tcp(
                 .await?
         }
     };
-    let stream = staggered(addresses, |address| async move {
+    let stream = staggered(addresses, deadline, |address| async move {
         Ok(TcpStream::connect(address).await?)
     })
     .await?;
@@ -238,14 +262,18 @@ impl Default for Connect {
 }
 
 impl Connect {
-    /// 在建的那一次；没有就用 `make` 起一次，退避期间是 Err。上一次建完了的，先照它的结果定退避：成功了不退避，失败了从
-    /// 失败的那一刻起退避
+    /// 在建的那一次；没有就用 `make` 起一次，退避期间是 Err。`make` 拿到这次建连的期限（[`CONNECT_BUDGET`] 以后），
+    /// 连地址的那一步自己按它收尾（见 [`staggered`]），说得出连过哪些地址；到期还没建完的（解析名字、TLS 握手卡住）在这里
+    /// 截住。上一次建完了的，先照它的结果定退避：成功了不退避，失败了从失败的那一刻起退避
     /// The connect under way; with none, one started with `make`, except while backing off, which
-    /// is an Err. One through already sets the backing off first by what it gave: none after a
+    /// is an Err. `make` is given the connect's deadline ([`CONNECT_BUDGET`] from now), by which
+    /// the step dialling addresses ends on its own (see [`staggered`]), telling which addresses it
+    /// dialled; one not through by then otherwise (resolving the name, a TLS handshake stuck) is
+    /// cut off here. One through already sets the backing off first by what it gave: none after a
     /// success, and after a failure counted from when it failed
     pub(in crate::engine) fn attempt<F>(
         &mut self,
-        make: impl FnOnce() -> F,
+        make: impl FnOnce(tokio::time::Instant) -> F,
     ) -> anyhow::Result<Attempt>
     where
         F: Future<Output = anyhow::Result<()>> + Send + 'static,
@@ -273,7 +301,11 @@ impl Connect {
                 left.as_millis()
             );
         }
-        let made = timeout(CONNECT_BUDGET, make());
+        // 同一个期限：`timeout_at` 先看里面的，两边一起到期时交出的是连地址那一步自己的原因 / The one
+        // deadline: `timeout_at` looks at what it wraps first, so with both due at once the cause
+        // the dialling step gives is what comes out
+        let deadline = tokio::time::Instant::now() + CONNECT_BUDGET;
+        let made = timeout_at(deadline, make(deadline));
         let attempt = async move {
             made.await
                 .unwrap_or_else(|_| {
@@ -309,7 +341,7 @@ impl Connect {
         lock: &parking_lot::Mutex<L>,
         connect: impl FnOnce(&mut L) -> &mut Connect,
         take: impl Fn(&mut L) -> Option<T>,
-        make: impl FnOnce() -> F,
+        make: impl FnOnce(tokio::time::Instant) -> F,
     ) -> anyhow::Result<Option<(T, bool)>>
     where
         F: Future<Output = anyhow::Result<()>> + Send + 'static,
