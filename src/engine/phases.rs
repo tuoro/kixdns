@@ -191,18 +191,22 @@ pub(crate) enum Looked {
     Missed,
 }
 
-/// 查一次缓存：槽位里这个请求的那份应答、它存了多少秒、现在算什么
+/// 查一次缓存：槽位里这个请求的那份应答、它存了多少秒、现在算什么，只给新鲜的、过期还能用的。槽位里的应答全都不能再
+/// 用了，缓存才把整个槽位清掉；往槽位里写的时候顺带去掉不能再用的（见 `CacheSlot::with`），所以拿到的这份可能已经不能再
+/// 用，现在算什么在这里判断。不能再用的留在原处，等重新取回的应答写进来时取代它，或者随槽位清扫：查缓存不为它拿写锁；它在
+/// 的时候，这个请求方的查找也不退到一份更宽、更旧的应答上，和快速路径一样（见 `CacheSlot::select`）
 /// One cache lookup: this request's answer in the slot, how many seconds it has been stored,
-/// and what it counts as now
-fn cached_hit(
+/// and what it counts as now, giving only one fresh, or stale and still of use. The cache
+/// clears a slot only once none of its answers is of use any more, and drops those of no
+/// further use from a slot as it writes to it (see `CacheSlot::with`), so the one got here may
+/// be of no use already, and what it counts as now is decided here. One of no further use stays
+/// where it is, until the answer fetched again replaces it or the slot is swept: a lookup takes
+/// no write lock for it, and while it is there this requester's lookups do not fall back to a
+/// wider, older answer, as on the fast path (see `CacheSlot::select`)
+fn usable_hit(
     engine: &Engine,
     context: &CacheLookupContext<'_>,
 ) -> Option<(Arc<CacheEntry>, u64, Age)> {
-    // 槽位里的应答全都不能再用了，缓存才把整个槽位清掉；往槽位里写的时候顺带去掉不能再用的（见 `CacheSlot::with`）。
-    // 所以拿到的这份可能已经不能再用，现在算什么在这里判断
-    // The cache clears a slot only once none of its answers is of use any more, and drops
-    // those of no further use from a slot as it writes to it (see `CacheSlot::with`). So the
-    // one got here may be of no use already, and what it counts as now is decided here
     let now = Instant::now();
     let hit = engine.cache_get(
         context.slot,
@@ -211,22 +215,7 @@ fn cached_hit(
     )?;
     let elapsed_secs = now.saturating_duration_since(hit.inserted_at).as_secs();
     let age = age_of(&hit, elapsed_secs, &context.state.pipeline.settings);
-    Some((hit, elapsed_secs, age))
-}
-
-/// 同 [`cached_hit`]，只给新鲜的、过期还能用的。不能再用的留在原处，等重新取回的应答写进来时取代它，或者随槽位清扫：
-/// 查缓存不为它拿写锁；它在的时候，这个请求方的查找也不退到一份更宽、更旧的应答上，和快速路径一样（见
-/// `CacheSlot::select`）。以前查到就删掉，紧跟着来的请求就拿到了别的子网取来的那份
-/// As [`cached_hit`], giving only one fresh, or stale and still of use. One of no further use
-/// stays where it is, until the answer fetched again replaces it or the slot is swept: a lookup
-/// takes no write lock for it, and while it is there this requester's lookups do not fall back
-/// to a wider, older answer, as on the fast path (see `CacheSlot::select`). It used to be
-/// dropped on being found, and the request right after got the answer another subnet fetched
-fn usable_hit(
-    engine: &Engine,
-    context: &CacheLookupContext<'_>,
-) -> Option<(Arc<CacheEntry>, u64, Age)> {
-    cached_hit(engine, context).filter(|&(_, _, age)| age != Age::Spent)
+    (age != Age::Spent).then_some((hit, elapsed_secs, age))
 }
 
 /// Checks the response cache: a fresh answer goes out with its TTLs aged and may start a
@@ -285,6 +274,35 @@ pub(crate) fn check_cache_after_wait(
     };
     let view = context.requester.ecs_view();
     Some(serve_stale(engine, context, &hit, &view, kind, response))
+}
+
+/// 上游失败以后（见 `Forwarding::upstream_failed`）再查一次缓存：这期间别人写进同一槽位、也适用于这个请求方的新鲜应答
+/// （同时在问、inflight 键不同的请求拿到的，或者后台刷新拿到的）照常交出；过期还能用的按上游失败时交出的过期应答交出
+/// （RFC 8767）。以前只认过期的，新鲜的放着不用，客户端拿 SERVFAIL
+/// Look in the cache again once the upstream failed (see `Forwarding::upstream_failed`): a fresh
+/// answer someone else wrote into the slot meanwhile that applies to this requester too (got by
+/// a request asking at once under another inflight key, or by a background refresh) goes out as
+/// usual; one stale and still of use goes out as the stale answer of an upstream failure (RFC
+/// 8767). Only a stale one used to count, a fresh one left unused and the client getting
+/// SERVFAIL
+pub(crate) fn check_cache_after_failure(
+    engine: &Engine,
+    context: &CacheLookupContext<'_>,
+    response: &mut ResponseInfo,
+) -> Option<Bytes> {
+    let (hit, elapsed_secs, age) = usable_hit(engine, context)?;
+    if age == Age::Fresh {
+        return Some(serve_fresh(engine, context, &hit, elapsed_secs, response));
+    }
+    let view = context.requester.ecs_view();
+    Some(serve_stale(
+        engine,
+        context,
+        &hit,
+        &view,
+        CacheHitKind::StaleUpstreamFailure,
+        response,
+    ))
 }
 
 /// 交出新鲜的 `hit`：TTL 都减去存了的秒数（RFC 1035 第 5.2 节），快到期的顺带发起后台刷新
@@ -390,37 +408,6 @@ pub(crate) fn served_from_cache(
     }
     set_id(&mut resp_bytes, tx_id);
     resp_bytes.freeze()
-}
-
-/// RFC 8767: after an upstream failure, check if a stale (expired but still in the cache)
-/// cache entry exists. Returns the stale response bytes with TTL set to serve_stale_ttl,
-/// reported to the observer as served on an upstream failure.
-/// RFC 8767：上游失败以后，检查是否存在过期但仍在缓存中的缓存条目。返回 TTL 设置为
-/// serve_stale_ttl 的过期响应字节，按上游失败时交出的那种上报观察者。
-///
-/// Does not emit the `dns_response` record; only the engine request path logs it.
-/// 不输出 `dns_response` 记录；该记录只由引擎请求路径输出。
-pub(crate) fn check_stale_cache_logged(
-    engine: &Engine,
-    context: &CacheLookupContext<'_>,
-    response: &mut ResponseInfo,
-) -> Option<Bytes> {
-    if !context.state.pipeline.settings.serve_stale {
-        return None;
-    }
-    // 不能再用的留给查缓存去掉 / One of no further use is left for the lookup to drop
-    let (hit, _, age) = cached_hit(engine, context)?;
-    (age == Age::Stale).then(|| {
-        let view = context.requester.ecs_view();
-        serve_stale(
-            engine,
-            context,
-            &hit,
-            &view,
-            CacheHitKind::StaleUpstreamFailure,
-            response,
-        )
-    })
 }
 
 /// 把过期的 `hit` 当作 stale 提供（RFC 8767）：TTL 都设成 serve_stale_ttl；顺带发起后台刷新（刷新失败时
@@ -1084,42 +1071,43 @@ impl<'a> Forwarding<'a> {
     }
 
     /// 上游失败、规则没有 miss 动作时给客户端的应答：所有上游尝试都耗尽了、或者上游的应答读不了（见 [`Self::read`]）才
-    /// 这样答，先找过期应答（RFC 8767），没有就 SERVFAIL
+    /// 这样答，先再查一次缓存（见 `check_cache_after_failure`），没有就 SERVFAIL
     /// The answer for the client when the upstream failed and the rule has no miss actions,
     /// given once every upstream attempt is exhausted or the upstream's reply cannot be read
-    /// (see [`Self::read`]): a stale answer (RFC 8767), or else SERVFAIL
+    /// (see [`Self::read`]): the cache looked in again (see `check_cache_after_failure`), or else
+    /// SERVFAIL
     fn upstream_failed(&mut self, e: anyhow::Error, response: &mut ResponseInfo) -> ForwardResult {
         let (request, decision, route) = (self.request, self.decision, &*self.route);
         let withheld = UpstreamFailure::was_withheld(&e);
-        let stale = check_stale_cache_logged(
+        let cached = check_cache_after_failure(
             self.engine,
             &request.lookup(&route.key_pipeline, route.keys.slot),
             response,
         );
-        let answer = match stale {
-            Some(stale) => {
+        let answer = match cached {
+            Some(cached) => {
                 if withheld {
                     debug!(
-                        event = "serve_stale_on_upstream_withheld",
+                        event = "cached_answer_on_upstream_withheld",
                         upstream = %decision.upstream,
                         qname = %request.qname,
                         client_ip = %request.peer.ip(),
                         error = %e,
-                        "RFC 8767: flow control kept the query from the upstream, serving stale cache"
+                        "flow control kept the query from the upstream, answering from the cache"
                     );
                 } else {
                     crate::warn_sparse!(
-                        event = "serve_stale_on_upstream_failure",
+                        event = "cached_answer_on_upstream_failure",
                         upstream = %decision.upstream,
                         qname = %request.qname,
                         qtype = ?request.qtype,
                         client_ip = %request.peer.ip(),
                         pipeline = %route.pipeline,
                         error = %e,
-                        "RFC 8767: upstream failed, serving stale cache"
+                        "upstream failed, answering from the cache"
                     );
                 }
-                stale
+                cached
             }
             None => {
                 if withheld {

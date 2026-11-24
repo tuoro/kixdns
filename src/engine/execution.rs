@@ -5840,6 +5840,64 @@ mod tests {
         );
     }
 
+    /// 两个请求同时问 `stale.com`，缓存里都没有；先到的那个转发，上游不应答。这期间别人往同一个槽位写进一份新鲜的应答（同时
+    /// 在问、inflight 键不同的请求拿到的，或者后台刷新拿到的），转发失败以后照常交出它，开不开 serve_stale 都一样，等着的那个
+    /// 也拿到同一份。以前只认过期的，两个请求都拿 SERVFAIL
+    /// Two requests for `stale.com` at once, neither found in the cache; the earlier one
+    /// forwards and the upstream never answers. Meanwhile someone else writes a fresh answer
+    /// into the same slot (a request asking at once under another inflight key, or a background
+    /// refresh), which goes out as usual once the forward fails, serve_stale on or off, and the
+    /// waiting one gets the same. Only a stale one used to count, both requests getting SERVFAIL
+    #[tokio::test]
+    async fn a_failed_forward_answers_with_a_fresh_answer_cached_meanwhile() {
+        use crate::engine::test_support::{ask, first_a, upstream};
+        use hickory_proto::op::{MessageType, OpCode, Query};
+        use hickory_proto::rr::rdata::A;
+        use hickory_proto::rr::{Name, RData, Record};
+
+        for serve_stale in [false, true] {
+            let silent = upstream(|_| Vec::new()).await;
+            let engine = engine_from_json(serde_json::json!({
+                "settings": {
+                    "default_upstream": silent.address,
+                    "upstream_timeout_ms": 300,
+                    "enable_tcp_fallback": false,
+                    "serve_stale": serve_stale
+                },
+                "pipelines": []
+            }));
+            let fresh = std::net::Ipv4Addr::new(192, 0, 2, 67);
+            let name = Name::from_ascii("stale.com.").unwrap();
+            let mut answer = Message::new(0, MessageType::Response, OpCode::Query);
+            answer.add_query(Query::query(name.clone(), RecordType::A));
+            answer.add_answer(Record::from_rdata(name, 300, RData::A(A(fresh))));
+            let entry = Arc::new(CacheEntry {
+                bytes: Bytes::from(answer.to_vec().unwrap()),
+                inserted_at: Instant::now(),
+                original_ttl: 300,
+                ..(*stale_entry("default")).clone()
+            });
+            let slot = stale_com_keys(&engine).slot;
+            // RD 置位，和 `QueryFlags::RECURSIVE` 一样 / RD set, as in `QueryFlags::RECURSIVE`
+            let mut packet = stale_com_query();
+            packet[2] = 0x01;
+            let peer = |last| SocketAddr::from(([10, 0, 0, last], 53000));
+            let (one, two, ()) = tokio::join!(
+                ask(&engine, &packet, peer(1)),
+                ask(&engine, &packet, peer(2)),
+                async {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    engine.cache_insert(slot, entry);
+                }
+            );
+            assert_eq!(
+                [first_a(&one), first_a(&two)],
+                [Some(fresh); 2],
+                "serve_stale {serve_stale}"
+            );
+        }
+    }
+
     /// 只有 `stale.com` 一条过期应答的引擎，`settings` 决定 serve_stale 的几个设置；连同查它用的上下文
     /// An engine holding one expired answer for `stale.com`, `settings` setting the
     /// serve_stale options; with the context to look it up
@@ -5902,7 +5960,7 @@ mod tests {
             let state = engine.state.load_full();
             let context = stale_com_lookup(&state, &peer, slot);
             assert_eq!(
-                phases::check_stale_cache_logged(&engine, &context, &mut Default::default())
+                phases::check_cache_after_failure(&engine, &context, &mut Default::default())
                     .is_some(),
                 served,
                 "expire_ttl {expire_ttl}: the fallback"
@@ -5946,7 +6004,7 @@ mod tests {
                 let state = engine.state.load_full();
                 let context = stale_com_lookup(&state, &peer, slot);
                 let served = if fallback {
-                    phases::check_stale_cache_logged(&engine, &context, &mut Default::default())
+                    phases::check_cache_after_failure(&engine, &context, &mut Default::default())
                         .is_some()
                 } else {
                     matches!(
@@ -6005,7 +6063,7 @@ mod tests {
             };
             engine.cache_insert(dedupe_hash, entry.clone());
             assert_eq!(
-                phases::check_stale_cache_logged(&engine, &context, &mut Default::default())
+                phases::check_cache_after_failure(&engine, &context, &mut Default::default())
                     .is_some(),
                 served,
                 "{rcode}: the fallback"
