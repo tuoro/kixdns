@@ -326,11 +326,11 @@ async fn udp_static_fast_path_rejects_non_query_and_malformed_additional_records
 }
 
 /// 请求头是标准查询、报文读不了的回 FORMERR（RFC 6891 第 6.1.1 节），带上它的 ID、RD 和问题，不比查询长。
-/// 批量收发、一个一个收发和 TCP 都这样；超过接收缓冲的 UDP 查询被截断后也算这一类
+/// 批量收发、一个一个收发和 TCP 都这样；超过 `MAX_QUERY_LEN` 的 UDP 查询截断后也算这一类，两种接收循环一样
 /// A query with a standard header that cannot be read gets FORMERR (RFC 6891 section
 /// 6.1.1) with its ID, RD and question, no longer than the query. So in the batched
-/// and one-by-one receive loops and over TCP; a UDP query cut off at the receive buffer
-/// counts too
+/// and one-by-one receive loops and over TCP; a UDP query cut off at `MAX_QUERY_LEN`
+/// counts too, in both receive loops alike
 #[tokio::test]
 async fn a_query_that_cannot_be_read_gets_formerr() {
     #[cfg(target_os = "linux")]
