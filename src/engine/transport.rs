@@ -354,6 +354,30 @@ impl UdpClient {
         }
     }
 
+    /// 测试里占住 IPv4 池里每个 socket 的每个 ID：这期间查询都发不出去（见 [`Self::begin`]），直到
+    /// [`Self::free_ids_for_tests`] / In tests, takes every ID of every socket of the IPv4 pool: no
+    /// query can be sent meanwhile (see [`Self::begin`]), until [`Self::free_ids_for_tests`]
+    #[cfg(test)]
+    pub(crate) fn hold_every_id_for_tests(&self) {
+        for slot in self.pool.iter() {
+            let state = slot.load();
+            for id in 0..=u16::MAX {
+                let (tx, _) = oneshot::channel();
+                let nowhere = SocketAddr::from(([0, 0, 0, 0], 0));
+                state.inflight.insert(id, (id, nowhere, Arc::from([]), tx));
+            }
+        }
+    }
+
+    /// 放开 [`Self::hold_every_id_for_tests`] 占住的 ID / Lets go of the IDs
+    /// [`Self::hold_every_id_for_tests`] took
+    #[cfg(test)]
+    pub(crate) fn free_ids_for_tests(&self) {
+        for slot in self.pool.iter() {
+            slot.load().inflight.clear();
+        }
+    }
+
     /// 把查询发给 `upstream` 一次，返回等它回答的那一头（见 [`UdpSent`]）
     /// Sends the query to `upstream` once and gives the end that waits for its reply (see
     /// [`UdpSent`])
@@ -772,7 +796,8 @@ impl Drop for InFlight<'_> {
 /// （各传输给的 `make` 连同装上一起做）：发起它的查询被取消了（几个上游竞速时别的先答完、外层超时），连接照样建完、装上，
 /// 从一开始就有人读它、看它关没关，留给接着来的查询。同时要连接的查询都等这同一次，各自最多等到自己的期限。失败以后退避：
 /// 从 [`CONNECT_BACKOFF`] 起每失败一次翻倍，最多 [`CONNECT_BACKOFF_AT_MOST`]，从失败的那一刻算，这期间来要连接的查询马上
-/// 失败、不去连。它放在各传输自己的锁里，那把锁只在看一眼、起一次建连的那一下拿着
+/// 失败、不去连。时间按 tokio 的单调时钟算，和老化一样（见 [`Aging`]）。它放在各传输自己的锁里，那把锁只在看一眼、起一次建连的
+/// 那一下拿着
 /// Making a connection (TCP, DoT, DoQ, DoH over HTTP/2). The connect happens in a task of its
 /// own, taking at most [`CONNECT_BUDGET`], and that task puts the connection in place itself
 /// (the `make` each transport gives does both): with the query that started it cancelled
@@ -781,15 +806,16 @@ impl Drop for InFlight<'_> {
 /// next. Queries wanting a connection meanwhile all wait for this one connect, each until its own
 /// deadline at most. After a failure it backs off, from [`CONNECT_BACKOFF`] doubling on each
 /// failure up to [`CONNECT_BACKOFF_AT_MOST`], counted from the failure, the queries asking
-/// meanwhile failing at once without connecting. It sits under each transport's own lock, held
-/// only for the moment of a look and of starting a connect
+/// meanwhile failing at once without connecting. Times run on tokio's monotonic clock, as aging
+/// does (see [`Aging`]). It sits under each transport's own lock, held only for the moment of a
+/// look and of starting a connect
 pub(super) struct Connect {
     /// 这一次建连，等它的各拿一份；建完了也留着，下一个来要连接的查询看过结果再丢掉 / This connect, a copy
     /// for each waiting on it; kept once through, until the next query asking for a connection has
     /// looked at what it gave
     attempt: Option<Attempt>,
     /// 退避到什么时候，下一次失败退避多久 / Backing off until when, and for how long after the next failure
-    retry_at: Option<std::time::Instant>,
+    retry_at: Option<tokio::time::Instant>,
     backoff: Duration,
 }
 
@@ -800,7 +826,7 @@ pub(super) type Attempt = Shared<BoxFuture<'static, Result<(), ConnectFailed>>>;
 #[derive(Clone, Debug)]
 pub(super) struct ConnectFailed {
     why: Arc<str>,
-    at: std::time::Instant,
+    at: tokio::time::Instant,
 }
 
 impl std::fmt::Display for ConnectFailed {
@@ -855,7 +881,7 @@ impl Connect {
         }
         if let Some(left) = self
             .retry_at
-            .and_then(|at| at.checked_duration_since(std::time::Instant::now()))
+            .and_then(|at| at.checked_duration_since(tokio::time::Instant::now()))
         {
             anyhow::bail!(
                 "connect failed lately, trying again in {}ms",
@@ -873,7 +899,7 @@ impl Connect {
                 })
                 .map_err(|error| ConnectFailed {
                     why: format!("{error:#}").into(),
-                    at: std::time::Instant::now(),
+                    at: tokio::time::Instant::now(),
                 })
         }
         .boxed()
@@ -1561,29 +1587,26 @@ impl<T: StreamTransport> StreamMuxClient<T> {
             // Pre-allocate a reusable buffer for reads
             // DNS TCP max is 65535 bytes, but typical responses are much smaller
             let mut reusable_buf = BytesMut::with_capacity(4096);
-            // 一直读到这一代被取消：复位时马上取消，用旧了摘下的等它的查询都到了期限再取消（见 `spawn_writer`）
-            // Reading goes on until this generation is cancelled: at once on a reset, and once its
-            // queries have all reached their deadlines when taken out as worn (see `spawn_writer`)
+            // 一直读到这一代被取消：还在槽里时一拆就取消，用旧了摘下的等它的查询都到了期限再取消（见 `spawn_writer`）
+            // Reading goes on until this generation is cancelled: at once when it is torn down
+            // while in the slot, and once its queries have all reached their deadlines when taken
+            // out as worn (see `spawn_writer`)
             loop {
                 let mut len_buf = [0u8; 2];
-                // Cancellation: select! interrupts blocked read_exact on reset
-                // 取消机制：select! 在 reset 时中断阻塞的 read_exact
+                // 取消时 select! 打断卡着的 read_exact / On cancellation select! interrupts a blocked read_exact
                 tokio::select! {
                     _ = cancel_token.cancelled() => {
-                        debug!(target = T::LOG_TARGET, upstream = %upstream, gen = my_generation, "{} reader cancelled by reset, exiting", T::NAME);
+                        debug!(target = T::LOG_TARGET, upstream = %upstream, gen = my_generation, "{} reader cancelled, exiting", T::NAME);
                         return;
                     }
                     result = reader.read_exact(&mut len_buf) => {
                         if let Err(err) = result {
-                            // 拆的是这个读取任务自己的那一代；已经换了代就什么都不动
-                            // The generation this reader belongs to is what goes; one already
-                            // replaced is left alone
+                            // 拆的是这个读取任务自己的那一代（见 `close_locked`）：它的查询都被告知，槽里换上的新连接不动
+                            // What goes is this reader's own generation (see `close_locked`): its
+                            // queries are all told, and a newer connection in the slot is left alone
                             let why = format!("{} read len failed", T::LABEL);
-                            if Self::close(&wires, my_generation, &why) {
-                                debug!(target = T::LOG_TARGET, upstream = %upstream, error = %err, "{} read len failed", T::LABEL);
-                            } else {
-                                debug!(target = T::LOG_TARGET, upstream = %upstream, gen = my_generation, "{} reader failed but generation changed, ignoring", T::NAME);
-                            }
+                            let in_slot = Self::close(&wires, my_generation, &why);
+                            debug!(target = T::LOG_TARGET, upstream = %upstream, gen = my_generation, in_slot, error = %err, "{why}");
                             break;
                         }
                     }
@@ -1599,15 +1622,14 @@ impl<T: StreamTransport> StreamMuxClient<T> {
 
                 tokio::select! {
                     _ = cancel_token.cancelled() => {
-                        debug!(target = T::LOG_TARGET, upstream = %upstream, gen = my_generation, "{} reader cancelled by reset during body read, exiting", T::NAME);
+                        debug!(target = T::LOG_TARGET, upstream = %upstream, gen = my_generation, "{} reader cancelled during body read, exiting", T::NAME);
                         return;
                     }
                     result = reader.read_exact(&mut reusable_buf[..resp_len]) => {
                         if let Err(err) = result {
                             let why = format!("{} read body failed", T::LABEL);
-                            if Self::close(&wires, my_generation, &why) {
-                                debug!(target = T::LOG_TARGET, upstream = %upstream, error = %err, "{} read body failed", T::LABEL);
-                            }
+                            let in_slot = Self::close(&wires, my_generation, &why);
+                            debug!(target = T::LOG_TARGET, upstream = %upstream, gen = my_generation, in_slot, error = %err, "{why}");
                             break;
                         }
                     }
@@ -1733,9 +1755,8 @@ impl<T: StreamTransport> StreamMuxClient<T> {
             // properly
             if let Some(err) = failed {
                 let why = format!("{} write failed", T::LABEL);
-                if Self::close(&wires, my_generation, &why) {
-                    debug!(target = T::LOG_TARGET, upstream = %wires.upstream, error = %err, "{why}");
-                }
+                let in_slot = Self::close(&wires, my_generation, &why);
+                debug!(target = T::LOG_TARGET, upstream = %wires.upstream, gen = my_generation, in_slot, error = %err, "{why}");
                 return;
             }
             let _ = timeout(CLOSE_BUDGET, writer.shutdown()).await;
@@ -1963,16 +1984,21 @@ impl<T: StreamTransport> StreamMuxClient<T> {
         Self::close_locked(&wires.pending, &mut wires.slot.lock().live, generation, why)
     }
 
-    /// 槽的锁已经拿在手里，拆掉第 `generation` 代连接：停掉它的读取和写入任务，丢掉写入队列，让等在它上面的
-    /// 查询都以 `why` 失败。现在的连接不是这一代（已经换成新的，或者已经拆了）就什么都不做，返回 false。
+    /// 槽的锁已经拿在手里，拆掉第 `generation` 代连接：等在它上面的查询都以 `why` 失败；它还在槽里的话从槽里拿掉，停掉它的
+    /// 读取和写入任务，丢掉写入队列，返回 true。不在槽里的（用旧了摘下的；已经拆了、换上了新的）只让它的查询失败，返回
+    /// false：槽里的连接不动，用旧了摘下的那一代的读写任务照旧到它最晚的期限过了才结束（见 [`Self::spawn_writer`]），自己
+    /// 读写失败时更早。
     ///
     /// 拆连接的决定都是对着某一条连接作的：它空闲太久了、它读写失败了、它上面的查询超时了。作出决定到拿到锁
     /// 之间连接可能已经换过，这个决定不能落到替它的那条上：那会让刚建好的连接白建，登记在它上面的查询失败
     ///
-    /// With the slot's lock held, tears down the connection of `generation`: its reader and
-    /// writer are stopped, its write queue dropped, and the queries waiting on it fail with
-    /// `why`. When the connection now is not of that generation (replaced by a new one, or torn
-    /// down already) nothing is done and false comes back.
+    /// With the slot's lock held, tears down the connection of `generation`: the queries waiting
+    /// on it fail with `why`, and while it is in the slot it is taken out, its reader and writer
+    /// stopped and its write queue dropped, true coming back. One not in the slot (taken out as
+    /// worn; torn down already and replaced) only has its queries failed, and false comes back:
+    /// the connection in the slot is left alone, and the reader and writer of one taken out as
+    /// worn still end once its latest deadline has passed (see [`Self::spawn_writer`]), or
+    /// earlier on a read or write of their own failing.
     ///
     /// Every decision to tear a connection down is made about one connection: it sat idle too
     /// long, its read or write failed, a query on it timed out. Between the decision and the
@@ -2015,13 +2041,14 @@ impl<T: StreamTransport> StreamMuxClient<T> {
         closed.is_some()
     }
 
-    /// 复位第 `generation` 代连接：取消读取和写入任务，丢掉写入队列，让所有等在它上面的查询马上失败，各自可以换新连接
-    /// 重发，而不是干等到期限、再轮流把下一条连接也复位掉。现在的连接已经不是它就什么都不做，返回 false（见 `close_locked`）
-    /// Resets the connection of `generation`: its reader and writer are cancelled, its write
-    /// queue dropped, and every query waiting on it fails at once, free to retry over a fresh
-    /// connection instead of sitting out its deadline and resetting the next connection in turn.
-    /// When the connection now is another, nothing is done and false comes back (see
-    /// `close_locked`)
+    /// 复位第 `generation` 代连接（见 [`Self::close_locked`]）：等在它上面的查询马上失败，各自可以换新连接重发，而不是干等到
+    /// 期限、再轮流把下一条连接也复位掉。它还在槽里时读写任务跟着停掉，返回 true；用旧了摘下的那一代不在槽里，读写任务到它
+    /// 最晚的期限过了才结束，返回 false
+    /// Resets the connection of `generation` (see [`Self::close_locked`]): every query waiting
+    /// on it fails at once, free to retry over a fresh connection instead of sitting out its
+    /// deadline and resetting the next connection in turn. While it is in the slot its reader and
+    /// writer stop with it and true comes back; one taken out as worn is not in the slot, its
+    /// reader and writer ending once its latest deadline has passed, and false comes back
     fn reset(&self, generation: u64) -> bool {
         let why = format!("{} connection reset", T::NAME);
         Self::close(&self.wires, generation, &why)
@@ -5162,6 +5189,20 @@ mod tests {
             2,
             "connects again past it"
         );
+    }
+
+    /// 建连失败以后的退避按 tokio 的时钟算，和老化一样：暂停的时钟推过退避，下一次就去连
+    /// The backing off after a failed connect runs on tokio's clock, as aging does: with the
+    /// paused clock moved past it, the next connect is made
+    #[tokio::test(start_paused = true)]
+    async fn backing_off_runs_on_tokio_clock() {
+        let refused = || async { Err::<(), _>(anyhow::anyhow!("refused")) };
+        let mut connect = Connect::default();
+        let attempt = connect.attempt(refused).expect("the first connect is made");
+        assert!(attempt.await.is_err());
+        assert!(connect.attempt(refused).is_err(), "backing off");
+        tokio::time::advance(CONNECT_BACKOFF + Duration::from_millis(1)).await;
+        assert!(connect.attempt(refused).is_ok(), "connects again past it");
     }
 
     /// TCP upstream that answers the very first query it ever receives
