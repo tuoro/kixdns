@@ -10,10 +10,9 @@ use std::str::FromStr;
 use hickory_proto::rr::{DNSClass, RecordType};
 use serde_json::{Value, json};
 
-use crate::engine::matcher_adapter::{MatcherContext, matcher_matches};
 use crate::engine::test_support::engine_from;
 use crate::matcher::advanced_rule::compile_pipelines;
-use crate::matcher::{RuntimePipelineConfig, eval_match_chain};
+use crate::matcher::{GeoManagers, RequestFacts, RuntimePipelineConfig, eval_match_chain};
 
 const LABELS: [&str; 9] = ["a", "b", "ex", "cn", "com", "google", "ads", "x", "a\\046b"];
 const OPERATORS: [&str; 4] = ["and", "or", "and_not", "or_not"];
@@ -148,8 +147,9 @@ async fn the_compiled_index_misses_no_rule_that_matches() {
                 rng.name()
             };
             let qtype = RecordType::from_str(rng.pick(&QTYPES)).unwrap();
-            let ctx = MatcherContext {
+            let facts = RequestFacts {
                 qname: &qname,
+                qtype,
                 qclass: if rng.below(10) == 0 {
                     DNSClass::CH
                 } else {
@@ -157,16 +157,14 @@ async fn the_compiled_index_misses_no_rule_that_matches() {
                 },
                 client_ip: IpAddr::from_str(rng.pick(&CLIENTS)).unwrap(),
                 edns_present: rng.flag(),
-                qtype,
-                geoip_manager: Some(&engine.geoip_manager),
-                geosite_manager: Some(&engine.geosite_manager),
             };
+            let geo = GeoManagers::new(&engine.geoip_manager, &engine.geosite_manager);
             let candidates = index.get_candidates(&qname, qtype);
             for (position, rule) in pipeline.rules.iter().enumerate() {
                 if eval_match_chain(
                     &rule.matchers,
                     |m| m.operator,
-                    |m| matcher_matches(&m.matcher, &ctx),
+                    |m| m.matcher.matches(&facts, geo),
                 ) {
                     matched += 1;
                     assert!(

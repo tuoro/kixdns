@@ -12,12 +12,11 @@ use crate::matcher::advanced_rule::CompiledPipeline;
 use crate::matcher::geoip::GeoIpManager;
 use crate::matcher::geosite::GeoSiteManager;
 use crate::matcher::{
-    PipelineSelectorQuery, Requester, RuntimePipeline, RuntimePipelineConfig, eval_match_chain,
+    GeoManagers, RequestFacts, Requester, RuntimePipeline, RuntimePipelineConfig, eval_match_chain,
 };
 use parking_lot::RwLock;
 
 use super::core::Engine;
-use super::matcher_adapter::{MatcherContext, matcher_matches};
 use super::observation::{
     Observed, decision_kind, report_decision, report_matched_rules, report_rule_cache_hit,
 };
@@ -44,49 +43,24 @@ pub fn select_pipeline<'a>(
     cfg: &'a RuntimePipelineConfig,
     request: &PipelineSelectionContext<'_>,
 ) -> Option<&'a RuntimePipeline> {
-    let qname = request.qname;
-    let client_ip = request.client_ip;
-    let qclass = request.qclass;
-    let edns_present = request.edns_present;
-    let qtype = request.qtype;
-    let listener_label = request.listener_label;
-    // Only acquire the geosite/geoip read locks if a matcher needs them (see
-    // `RuntimePipelineConfig::select_needs_geosite`). For the common case
-    // (Any/ListenerLabel/Qtype matchers), this avoids two parking_lot RwLock read
-    // acquisitions per cache-hit query, eliminating cross-core cache-line bouncing at
-    // high QPS.
-    //
-    // 仅当有匹配器需要 geosite/geoip 时才获取读锁（见
-    // `RuntimePipelineConfig::select_needs_geosite`）。常见情况（Any/ListenerLabel/Qtype
-    // 匹配器）下，避免了每次 cache-hit 查询获取两个 parking_lot RwLock 读锁，消除高 QPS
-    // 下的跨核 cache line 乒乓。
-    let geosite_guard = request
-        .geosite_manager
-        .filter(|_| cfg.select_needs_geosite)
-        .map(|m| m.read());
-    let geoip_guard = request
-        .geoip_manager
-        .filter(|_| cfg.select_needs_geoip)
-        .map(|m| m.read());
-    let geosite_ref = geosite_guard.as_deref();
-    let geoip_ref = geoip_guard.as_deref();
-    let selector_query = PipelineSelectorQuery {
-        listener_label,
-        client_ip,
-        qname,
-        qclass,
-        edns_present,
-        qtype,
+    let facts = RequestFacts {
+        qname: request.qname,
+        qtype: request.qtype,
+        qclass: request.qclass,
+        client_ip: request.client_ip,
+        edns_present: request.edns_present,
     };
-
+    // 匹配器要用 Geo 数据时才拿读锁（见 `GeoManagers`）/ A matcher read-locks Geo data only to use it
+    // (see `GeoManagers`)
+    let geo = GeoManagers {
+        geoip: request.geoip_manager.map(|manager| &**manager),
+        geosite: request.geosite_manager.map(|manager| &**manager),
+    };
     for rule in &cfg.pipeline_select {
         let matched = eval_match_chain(
             &rule.matchers,
             |m| m.operator,
-            |m| {
-                m.matcher
-                    .matches_with_ready_managers(&selector_query, geoip_ref, geosite_ref)
-            },
+            |m| m.matcher.matches(request.listener_label, &facts, geo),
         );
         if matched && let Some(p) = cfg.pipeline(&rule.pipeline) {
             return Some(p);
@@ -403,17 +377,14 @@ impl Engine {
             .get_candidates(qname, qtype);
 
         // 3. Execute Rules
-        // 优化：提取 MatcherContext 到循环外部，避免重复构造
-        // Optimization: Extract MatcherContext outside loop to avoid repeated construction
-        let ctx = MatcherContext {
+        let facts = RequestFacts {
             qname,
+            qtype,
             qclass,
             client_ip,
             edns_present,
-            qtype,
-            geoip_manager: Some(&self.geoip_manager),
-            geosite_manager: Some(&self.geosite_manager),
         };
+        let geo = GeoManagers::new(&self.geoip_manager, &self.geosite_manager);
 
         'rules: for idx in candidate_indices {
             // 候选出自这个 pipeline 自己的索引，同一份配置里编译出来的 / The candidates come from this
@@ -425,11 +396,7 @@ impl Engine {
             let req_match = eval_match_chain(
                 &rule.matchers,
                 |m| m.operator,
-                |m| {
-                    // 直接传递 Arc<RwLock<T>>，让 matcher 内部按需获取锁
-                    // Pass Arc<RwLock<T>> directly, let matcher acquire locks on-demand
-                    matcher_matches(&m.matcher, &ctx)
-                },
+                |m| m.matcher.matches(&facts, geo),
             );
             if let Some((observer, observed_ctx)) = request.observed {
                 observer.rule_evaluated(

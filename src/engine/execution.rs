@@ -29,7 +29,6 @@ use crate::observe::{
 use crate::proto_utils::parse_quick;
 
 use super::concurrency::PermitGuard;
-use super::matcher_adapter::MatcherContext;
 use super::observation::{ObservedRequest, report_decision, report_rule_cache_hit};
 use super::response::{StaticAddresses, static_reply, write_static_reply};
 use super::response_log::{ResponseInfo, ResponseLog, Source};
@@ -790,15 +789,14 @@ impl Engine {
         // 编译规则照完整路径的样子求值，GeoIP、GeoSite 数据一样读（见 `CompiledRule::matchers`）
         // The compiled rules are evaluated as on the full path, reading the GeoIP and GeoSite data
         // alike (see `CompiledRule::matchers`)
-        let query = MatcherContext {
+        let facts = crate::matcher::RequestFacts {
             qname: qname_str,
+            qtype,
             qclass,
             client_ip: peer.ip(),
             edns_present: q.edns_present,
-            qtype,
-            geoip_manager: Some(&self.geoip_manager),
-            geosite_manager: Some(&self.geosite_manager),
         };
+        let geo = crate::matcher::GeoManagers::new(&self.geoip_manager, &self.geosite_manager);
         // 第一条命中的规则或规则缓存给的是跳转时，和完整路径一样跟过去（见 `decide`），按目标的键再查一遍，至多跳
         // response_jump_limit 次；再要跳的、目标不存在的交给完整路径，由它回 SERVFAIL。走过的跳转在答上时照完整路径的
         // 样子上报
@@ -1009,7 +1007,7 @@ impl Engine {
                 // 3. Compiled rules: what the first rule matching decides on the spot
                 let matched = self
                     .compiled_for(&state, pipeline_id)
-                    .and_then(|compiled| fast_static_match_with_rule(compiled, &query));
+                    .and_then(|compiled| fast_static_match_with_rule(compiled, &facts, geo));
                 match matched {
                     Some((PrecomputedAction::Jump(target), rule)) => (
                         cfg.pipeline(target),
@@ -4534,8 +4532,6 @@ mod tests {
         RuntimePipelineConfig {
             settings,
             pipeline_select: Vec::new(),
-            select_needs_geosite: false,
-            select_needs_geoip: false,
             pipelines: Vec::new(),
             pipeline_id_index: FxHashMap::default(),
             warnings: Vec::new(),
@@ -6739,15 +6735,17 @@ mod tests {
                     );
                     let fast = fast_static_match_with_rule(
                         compiled,
-                        &MatcherContext {
+                        &crate::matcher::RequestFacts {
                             qname: domain,
+                            qtype: RecordType::A,
                             qclass: DNSClass::IN,
                             client_ip,
                             edns_present: false,
-                            qtype: RecordType::A,
-                            geoip_manager: Some(&engine.geoip_manager),
-                            geosite_manager: Some(&engine.geosite_manager),
                         },
+                        crate::matcher::GeoManagers::new(
+                            &engine.geoip_manager,
+                            &engine.geosite_manager,
+                        ),
                     );
                     let agrees = match (&fast, &full) {
                         // 快速路径只把转发交出去 / The fast path hands on forwards only
