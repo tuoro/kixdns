@@ -17,8 +17,8 @@ use serde_json::{Value, json};
 
 use crate::engine::Engine;
 use crate::engine::test_support::{
-    Throttling, Upstream, answering_upstream, ask, counting_settings, engine_from, first_a, peer,
-    silent_upstream, upstream,
+    Throttling, Upstream, answering_rcode, answering_upstream, ask, counting_settings, engine_from,
+    first_a, peer, silent_upstream, upstream,
 };
 use crate::observe::{
     CacheHit, CacheHitKind, EngineObserver, RequestContext, RequestOutcome, RuleEvaluated,
@@ -31,19 +31,6 @@ const ANSWER: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 1);
 const FALLBACK: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 53);
 /// on_miss 给的地址 / The address on_miss answers
 const OTHERWISE: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 99);
-
-/// 对每个查询都回 `rcode`、不带答案的本机上游 / A local upstream answering every query with
-/// `rcode` and no answers
-async fn failing(rcode: ResponseCode) -> Upstream {
-    upstream(move |query| {
-        let mut reply = Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
-        reply.metadata.recursion_desired = query.metadata.recursion_desired;
-        reply.metadata.response_code = rcode;
-        reply.add_queries(query.queries.iter().cloned());
-        vec![(Duration::ZERO, reply.to_vec().unwrap())]
-    })
-    .await
-}
 
 /// 面板的「上游回 SERVFAIL 或 REFUSED 时改问」备用组：主 pipeline 把请求一起转发给 `upstreams`，
 /// 回答是 SERVFAIL 或 REFUSED 时跳到 `fallback`，那里转发给 `backup`
@@ -94,7 +81,7 @@ fn rcode(reply: &[u8]) -> ResponseCode {
 /// One upstream answering SERVFAIL: the answer check sees it and the fallback group is asked
 #[tokio::test]
 async fn one_upstream_answering_servfail_falls_back() {
-    let broken = failing(ResponseCode::ServFail).await;
+    let broken = answering_rcode(ResponseCode::ServFail).await;
     let backup = answering_upstream(FALLBACK, 300).await;
     let engine = fallback_group(&[&broken.address], &backup.address, json!({}));
 
@@ -107,8 +94,8 @@ async fn one_upstream_answering_servfail_falls_back() {
 /// Two upstreams asked together, both answering SERVFAIL: as with one, the fallback group is asked
 #[tokio::test]
 async fn two_upstreams_answering_servfail_fall_back() {
-    let first = failing(ResponseCode::ServFail).await;
-    let second = failing(ResponseCode::ServFail).await;
+    let first = answering_rcode(ResponseCode::ServFail).await;
+    let second = answering_rcode(ResponseCode::ServFail).await;
     let backup = answering_upstream(FALLBACK, 300).await;
     let engine = fallback_group(
         &[&first.address, &second.address],
@@ -265,8 +252,8 @@ async fn answering_then_failing(rcode: ResponseCode, fail: Arc<AtomicBool>) -> U
 /// One answering REFUSED and one SERVFAIL: the fallback group is asked just the same
 #[tokio::test]
 async fn refused_and_servfail_together_fall_back() {
-    let refused = failing(ResponseCode::Refused).await;
-    let servfail = failing(ResponseCode::ServFail).await;
+    let refused = answering_rcode(ResponseCode::Refused).await;
+    let servfail = answering_rcode(ResponseCode::ServFail).await;
     let backup = answering_upstream(FALLBACK, 300).await;
     let engine = fallback_group(
         &[&refused.address, &servfail.address],
@@ -283,7 +270,7 @@ async fn refused_and_servfail_together_fall_back() {
 /// the fallback group is asked
 #[tokio::test]
 async fn a_failure_reply_beside_a_transport_error_falls_back() {
-    let servfail = failing(ResponseCode::ServFail).await;
+    let servfail = answering_rcode(ResponseCode::ServFail).await;
     let silent = silent_upstream().await.to_string();
     let backup = answering_upstream(FALLBACK, 300).await;
     let (engine, _) = observed_fallback_group(
@@ -327,8 +314,8 @@ async fn transport_errors_alone_still_answer_servfail() {
 /// no answer (no answer check is reported)
 #[tokio::test]
 async fn a_failure_reply_the_check_rejects_leaves_on_miss_without_an_answer() {
-    let first = failing(ResponseCode::ServFail).await;
-    let second = failing(ResponseCode::ServFail).await;
+    let first = answering_rcode(ResponseCode::ServFail).await;
+    let second = answering_rcode(ResponseCode::ServFail).await;
     let backup = answering_upstream(FALLBACK, 300).await;
     let (engine, seen) = observed_fallback_group(
         &[&first.address, &second.address],
@@ -599,8 +586,8 @@ async fn a_carried_failure_reply_reaches_the_client_without_a_cookie() {
 #[tokio::test]
 async fn a_forward_after_a_response_jump_falls_back_too() {
     let entry = answering_upstream(ANSWER, 300).await;
-    let first = failing(ResponseCode::ServFail).await;
-    let second = failing(ResponseCode::ServFail).await;
+    let first = answering_rcode(ResponseCode::ServFail).await;
+    let second = answering_rcode(ResponseCode::ServFail).await;
     let backup = answering_upstream(FALLBACK, 300).await;
     let engine = engine_from(json!({
         "settings": counting_settings(json!({})),
@@ -637,7 +624,7 @@ async fn a_forward_after_a_response_jump_falls_back_too() {
 /// single-upstream path: its SERVFAIL is a Success, and the answer check falls back
 #[tokio::test]
 async fn a_set_left_with_one_upstream_by_a_doh_pause_takes_the_single_path() {
-    let servfail = failing(ResponseCode::ServFail).await;
+    let servfail = answering_rcode(ResponseCode::ServFail).await;
     let doh = Throttling::spawn(Some("30")).await;
     let backup = answering_upstream(FALLBACK, 300).await;
     let (engine, seen) = observed_fallback_group(
