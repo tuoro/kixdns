@@ -562,7 +562,7 @@ pub async fn forward_upstream(
     packet: &[u8],
     upstream: &str,
     timeout_dur: Duration,
-    transport: Option<Transport>,
+    transport: Transport,
     pre_split_upstreams: Option<&std::sync::Arc<Vec<std::sync::Arc<str>>>>,
     observed: Observed<'_>,
     asker: Option<std::net::IpAddr>,
@@ -698,13 +698,10 @@ async fn forward_upstream_as_is(
     packet: &[u8],
     upstream: &str,
     timeout_dur: Duration,
-    transport: Option<Transport>,
+    default_transport: Transport,
     pre_split_upstreams: Option<&std::sync::Arc<Vec<std::sync::Arc<str>>>>,
     observed: Observed<'_>,
 ) -> anyhow::Result<(Bytes, Arc<str>)> {
-    // 如果 transport 为 None，使用默认 UDP
-    let default_transport = transport.unwrap_or(Transport::Udp);
-
     // 使用预分割数据或动态分割 / Use pre-split data or dynamic splitting
     // 使用 Arc<str> 避免克隆 / Use Arc<str> to avoid cloning
     let upstreams: Upstreams = if let Some(pre_split) = pre_split_upstreams {

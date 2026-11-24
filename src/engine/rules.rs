@@ -511,7 +511,7 @@ async fn run_response_actions(
                     packet,
                     &upstream_addr,
                     request.state.pipeline.upstream_timeout(),
-                    Some(use_transport),
+                    use_transport,
                     pre_split_upstreams.as_ref(),
                     request.observed,
                     request.asker(),

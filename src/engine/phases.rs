@@ -775,7 +775,7 @@ impl<'a> Forwarding<'a> {
             &self.packet,
             decision.upstream,
             request.state.pipeline.upstream_timeout(),
-            Some(decision.transport),
+            decision.transport,
             decision.pre_split_upstreams,
             request.observed,
             request.asker(),
