@@ -8,18 +8,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-
 use hickory_proto::op::{Message, ResponseCode};
 use hickory_proto::rr::{DNSClass, RecordType};
-
 use hickory_proto::serialize::binary::BinDecodable;
 use smallvec::SmallVec;
 
-use crate::cache::CacheEntry;
-use crate::matcher::RuntimePipelineConfig;
+use crate::cache::{CacheEntry, CachedQuestion};
+use crate::ecs_scope::EcsReach;
 use crate::matcher::advanced_rule::{
     PrecomputedAction, PrecomputedAnswer, fast_static_match_with_rule,
 };
+use crate::matcher::{Requester, RequesterKey, RuntimePipelineConfig};
 use crate::observe::{
     CacheHit, CacheHitKind, DecisionDetail, DecisionKind, DecisionMade, EngineObserver,
     RequestContext, RequestOutcome, RequestStatus, RuleAnswer, RuleMatched, RulePhase,
@@ -27,17 +26,18 @@ use crate::observe::{
 use crate::proto_utils::parse_quick;
 
 use super::concurrency::PermitGuard;
+use super::core::Engine;
 use super::observation::{ObservedRequest, report_decision, report_rule_cache_hit};
+use super::phases;
+use super::pipeline::{
+    NO_PIPELINE, PipelineSelectionContext, RuleEvaluationContext, select_pipeline,
+};
+use super::refresh::{RefreshCheck, RefreshTarget};
 use super::response::{StaticAddresses, static_reply, write_static_reply};
 use super::response_log::{ResponseInfo, ResponseLog, Source};
-use super::rules::RuleCacheRecord;
+use super::rules::{Decision, ResponseContext, RuleCacheRecord};
 use super::types::{EngineInner, FastPathResponse};
 use super::utils::InflightCleanupGuard;
-use crate::cache::CachedQuestion;
-use crate::ecs_scope::EcsReach;
-use crate::engine::refresh::{RefreshCheck, RefreshTarget};
-use crate::engine::rules::{Decision, ResponseContext};
-use crate::matcher::{Requester, RequesterKey};
 
 /// The address the engine judges a client by. A dual-stack socket (an inbound DoH
 /// listener on `[::]`, say) reports an IPv4 client as an IPv4-mapped IPv6 address
@@ -221,11 +221,6 @@ fn report_compiled_rule(
         },
     );
 }
-
-use super::core::Engine;
-use super::pipeline::{
-    NO_PIPELINE, PipelineSelectionContext, RuleEvaluationContext, select_pipeline,
-};
 
 // ============================================================================
 // Constants / 常量
@@ -504,7 +499,7 @@ impl Engine {
                 event = "failure_not_cached",
                 qname = %entry.qname,
                 pipeline = %entry.pipeline_id,
-                rcode = %entry.rcode,
+                rcode = %crate::observe::rcode_name(entry.rcode.into()),
                 "failure reply is not cached"
             );
             return;
@@ -836,23 +831,20 @@ impl Engine {
                 if age == phases::Age::Stale
                     && let Some(kind) = phases::stale_at_once(self, &cfg.settings, slot, &hit)
                 {
-                    let context = phases::CacheLookupContext {
-                        state: &state,
-                        qname: qname_str,
-                        qtype,
-                        qclass,
-                        flags: q.flags,
-                        pipeline_id,
-                        slot,
-                        tx_id: q.tx_id,
-                        start,
-                        peer: &peer,
-                        requester,
-                        observed: None,
-                    };
+                    // 和完整路径一样照读出的请求查（见 `Request::lookup`）/ Looked up by the request as
+                    // read, as on the full path (see `Request::lookup`)
+                    let head = RequestHead::quick(&q, name_of(pipeline));
+                    let request = head.request(&state, packet, peer, q.client_subnet, start);
                     let mut log = response_log(pipeline);
                     let reply = crate::proto_utils::reply_as_asked(
-                        phases::serve_stale(self, &context, &hit, &view, kind, &mut log.info),
+                        phases::serve_stale(
+                            self,
+                            &request.lookup(pipeline_id, slot),
+                            &hit,
+                            &view,
+                            kind,
+                            &mut log.info,
+                        ),
                         packet,
                     );
                     if let Some(observer) = observed {
@@ -1313,28 +1305,12 @@ impl Engine {
         }
 
         let request = Request {
-            state,
-            packet,
-            qname: &head.qname,
-            qtype: head.qtype,
-            qclass: head.qclass,
-            tx_id: head.tx_id,
-            flags: head.flags,
-            edns_version: head.edns_version,
-            question_end: head.question_end,
-            peer,
-            // Who is asking, as far as rules and ECS can tell / 规则和 ECS 能分辨的请求方
-            requester: Requester {
-                address: peer.ip(),
-                edns: head.edns_present,
-                ecs: client_ecs,
-            },
-            start,
             refresh,
             observed: journal
                 .observed
                 .as_ref()
                 .map(|observed| (observed.observer, &observed.ctx)),
+            ..head.request(state, packet, peer, client_ecs, start)
         };
         let pipeline = state.pipeline.pipeline(&head.pipeline_id);
         let mut route = Route::new(self, &request, &head.pipeline_id, pipeline);
@@ -1883,6 +1859,42 @@ impl RequestHead {
             pipeline_id,
         }
     }
+
+    /// 这样读出来的请求：`packet` 是它的包，来自 `peer`、带着 `ecs`，从 `start` 起照配置 `state` 处理。它不是后台刷新，
+    /// 也不上报观察者，是的话由调用的一方改这两项
+    /// The request read so: `packet` its packet, from `peer` with `ecs`, handled under the
+    /// configuration `state` from `start` on. It is no background refresh and reports to no
+    /// observer, the caller setting the two where it is or does
+    fn request<'a>(
+        &'a self,
+        state: &'a Arc<EngineInner>,
+        packet: &'a [u8],
+        peer: SocketAddr,
+        ecs: Option<crate::ecs::EcsKey>,
+        start: Instant,
+    ) -> Request<'a> {
+        Request {
+            state,
+            packet,
+            qname: &self.qname,
+            qtype: self.qtype,
+            qclass: self.qclass,
+            tx_id: self.tx_id,
+            flags: self.flags,
+            edns_version: self.edns_version,
+            question_end: self.question_end,
+            peer,
+            // Who is asking, as far as rules and ECS can tell / 规则和 ECS 能分辨的请求方
+            requester: Requester {
+                address: peer.ip(),
+                edns: self.edns_present,
+                ecs,
+            },
+            start,
+            refresh: None,
+            observed: None,
+        }
+    }
 }
 
 /// 一个请求在整个处理过程中不变的部分：它的包、问题、谁在问、用的配置快照，和后台刷新时要更新的条目
@@ -2271,8 +2283,6 @@ impl Route {
         self.jumped = Some((packet, carried));
     }
 }
-
-use super::phases;
 
 #[cfg(test)]
 #[allow(unnameable_test_items)]
@@ -5273,6 +5283,38 @@ mod tests {
 
         let dedupe_hash = stale_com_keys(&engine).slot;
         (engine, dedupe_hash)
+    }
+
+    /// 上游失败、回 SERVFAIL 时记的那条 warn 带着失败的完整原因（上游是没回答、拒绝了连接还是别的什么），不带每次都一样的
+    /// RCODE 字段
+    /// The warning logged when the upstream failed and SERVFAIL goes out carries the failure's
+    /// whole cause (whether the upstream did not answer, refused the connection or what else),
+    /// with no RCODE field that is the same every time
+    #[tokio::test]
+    async fn an_upstream_failure_is_logged_with_its_cause() {
+        let (engine, _) = engine_without_an_answering_upstream(false);
+        let (warnings, guard) = support::Warnings::capture();
+        let reply = engine
+            .handle_packet(&stale_com_query(), "127.0.0.1:12345".parse().unwrap())
+            .await
+            .expect("answered");
+        drop(guard);
+        assert_eq!(
+            Message::from_vec(&reply).unwrap().metadata.response_code,
+            ResponseCode::ServFail
+        );
+        let lines = warnings.lines();
+        let failed: Vec<_> = lines
+            .iter()
+            .filter(|line| line.contains("event=\"upstream_failure\""))
+            .collect();
+        assert_eq!(failed.len(), 1, "{lines:#?}");
+        assert!(
+            failed[0].contains("all upstreams failed: "),
+            "{}",
+            failed[0]
+        );
+        assert!(!failed[0].contains("rcode="), "{}", failed[0]);
     }
 
     /// The keys of the `stale.com` query in the default pipeline / 默认 pipeline 里 `stale.com` 查询的键

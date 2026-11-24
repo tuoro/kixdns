@@ -18,6 +18,7 @@ use crate::proto_utils;
 use bytes::{Bytes, BytesMut};
 use hickory_proto::op::{Message, ResponseCode};
 use hickory_proto::rr::{DNSClass, Record, RecordType};
+use hickory_proto::serialize::binary::BinDecodable;
 use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -49,7 +50,6 @@ pub enum ForwardResult {
         carried: ForwardEcs,
     },
 }
-use hickory_proto::serialize::binary::BinDecodable;
 
 /// Immutable cache lookup data shared by normal and refresh-wait paths.
 pub struct CacheLookupContext<'a> {
@@ -408,7 +408,7 @@ pub(crate) fn serve_stale(
         kind = ?kind,
         qname = %context.qname,
         qtype = ?context.qtype,
-        rcode = ?hit.rcode,
+        rcode = %crate::observe::rcode_name(hit.rcode.into()),
         original_ttl = hit.original_ttl,
         stale_for_secs = hit
             .inserted_at
@@ -426,11 +426,11 @@ pub(crate) fn serve_stale(
         view,
         ServedTtl::Stale(settings.serve_stale_ttl),
     );
-    // 发起后台刷新，重新决定一次。规则给的应答（没有上游的那种）也一样：它是对上游那次应答的检查结果，不重新决定的话
-    // 每次命中都把它续上，一直用下去
-    // Start a background refresh to decide again. An answer the rules gave (one with no
-    // upstream) is no different: it is what the check of that one reply came to, and not
-    // decided again it would be renewed on every hit and served for ever
+    // 发起后台刷新，重新决定一次。规则据上游应答给出的（没有上游的那种）也一样：它是对上游那次应答的检查结果，过期了就得
+    // 照上游现在的回答再检查一遍
+    // Start a background refresh to decide again. An answer the rules gave by an upstream's
+    // answer (one with no upstream) is no different: it is what the check of that one reply
+    // came to, and once expired it is to be checked again on what the upstream answers now
     engine.spawn_background_refresh(context.state, hit, context.slot, context.requester);
     if let Some((observer, ctx)) = context.observed {
         observer.cache_hit(ctx, &cache_hit_of(hit, kind, 0));
@@ -502,11 +502,11 @@ pub(crate) async fn handle_forward_decision<'a>(
 ) -> anyhow::Result<ForwardResult> {
     response.upstream = Some(Source::Upstream(Arc::clone(decision.upstream)));
     let mut forwarding = Forwarding::new(engine, request, route, decision);
-    let (reply, reused) = match forwarding.fetch(response).await {
+    let reply = match forwarding.fetch(response).await {
         Fetched::Joined(answer) => return Ok(ForwardResult::Success(answer)),
-        Fetched::Own { reply, reused } => (reply, reused),
+        Fetched::Asked(reply) => forwarding.weigh(reply),
+        Fetched::Reused(ctx) => forwarding.reuse(ctx),
     };
-    let reply = forwarding.weigh(reply, reused);
     // 应答回来以后的处理单独在堆上分配：它的状态（解析出来的报文、响应动作的结果等）只在应答回来
     // 以后才用得着，放在这个函数里，等上游的每个查询都得替它多留一千多字节
     // What happens once the reply is in is allocated on its own: its state (the parsed
@@ -573,10 +573,11 @@ struct Forwarding<'a> {
 enum Fetched {
     /// 等到的别人那次同样的转发的应答 / The answer of the same forward another made, waited on
     Joined(Bytes),
-    /// 这次转发自己的应答或失败；`reused` 时是规则越过、这里复用的那份
-    /// This forward's own reply or failure; with `reused`, the one a rule continued past,
-    /// reused here
-    Own { reply: Reply, reused: bool },
+    /// 这次转发自己问来的应答或失败 / The reply or the failure this forward asked for itself
+    Asked(Reply),
+    /// 规则越过、这里复用的应答，连同解析好的报文（见 [`Forwarding::reuse`]）/ The answer a rule
+    /// continued past, reused here with its parsed message (see [`Forwarding::reuse`])
+    Reused(ResponseContext),
 }
 
 impl<'a> Forwarding<'a> {
@@ -636,20 +637,13 @@ impl<'a> Forwarding<'a> {
     async fn fetch(&mut self, response: &mut ResponseInfo) -> Fetched {
         let allow_reuse = self.decision.allow_reuse;
         if let Some(ctx) = self.route.reused_response.take_if(|_| allow_reuse) {
-            return Fetched::Own {
-                reply: Ok((ctx.raw, ctx.upstream)),
-                reused: true,
-            };
+            return Fetched::Reused(ctx);
         }
-        let reply = match self.wait_on_another(response).await {
+        Fetched::Asked(match self.wait_on_another(response).await {
             Some(Ok(answer)) => return Fetched::Joined(answer),
             Some(Err(gave_up)) => Err(gave_up),
             None => self.ask().await,
-        };
-        Fetched::Own {
-            reply,
-            reused: false,
-        }
+        })
     }
 
     /// 等已经在问同一个问题的那个请求：等到了给出它的应答，卡住、不等了给出那个失败；没有可等的（空着就登记条目）给
@@ -786,7 +780,7 @@ impl<'a> Forwarding<'a> {
     /// 掂量这次转发拿到的应答或失败，记进 trail：它决定此后得到的每份应答适用于谁
     /// Weigh the reply or failure this forward got, and note it in the trail: it decides whom
     /// every answer reached from here applies to
-    fn weigh(&mut self, reply: Reply, reused: bool) -> Weighed {
+    fn weigh(&mut self, reply: Reply) -> Weighed {
         // 流控没让等的失败是这台设备自己的事（见 `UpstreamFailure::withheld`）：这个请求登记的条目、规则 continue 以后还
         // 留着的条目，现在都放下，等在上面的别的请求各自去问，不拿这一个的结果；这个请求此后得到的应答也一律不写缓存——规则在
         // 上游失败时给的静态应答、改问备用上游得到的回答、continue 到后面的规则或者跳到别的规则组得到的回答都一样。缓存是所有
@@ -855,13 +849,28 @@ impl<'a> Forwarding<'a> {
             reject_failure_reply_on_refresh(request.refresh.is_some(), &answer.raw).map(|()| answer)
         });
         match &reply {
-            // 这里复用的、规则越过的应答：它那次转发已经记在 trail 里 / An answer a rule continued
-            // past, reused here: the trail already has its forward
-            Ok(_) if reused => {}
             Ok(answer) => self.route.trail.record_reply(self.forward_ecs, &answer.raw),
             Err(_) => self.route.trail.record_failure(self.forward_ecs),
         }
         reply
+    }
+
+    /// 复用规则越过的应答 `ctx`（continue 之后的 `allow`）：它那次转发已经记在 trail 里，报文也已经由 hickory 解析好，不再读
+    /// 一遍（见 [`Self::read`]）。刷新照样拒收失败应答（见 [`Self::weigh`]）：越过的可能是响应动作转发拿到的
+    /// Reuse `ctx`, the answer a rule continued past (an `allow` after a continue): the trail
+    /// has its forward already and hickory has parsed its message, which is not read again (see
+    /// [`Self::read`]). A refresh still rejects a failure reply (see [`Self::weigh`]): the
+    /// answer passed may be one a response action's forward got
+    fn reuse(&self, ctx: ResponseContext) -> Weighed {
+        reject_failure_reply_on_refresh(self.request.refresh.is_some(), &ctx.raw)?;
+        Ok(Answer {
+            rcode: ctx.msg.metadata.response_code,
+            ttl: extract_ttl(&ctx.msg),
+            raw: ctx.raw,
+            upstream: ctx.upstream,
+            msg: Some(ctx.msg),
+            checked: false,
+        })
     }
 
     /// 读 `upstream` 给的应答 `raw`。响应规则要读解析好的报文，所以总用 hickory 的。没有响应规则时，结构经得起检查的应答
@@ -1024,7 +1033,7 @@ impl<'a> Forwarding<'a> {
                         upstream = %decision.upstream,
                         qname = %request.qname,
                         client_ip = %request.peer.ip(),
-                        error = %e,
+                        error = %format_args!("{e:#}"),
                         "flow control kept the query from the upstream, answering from the cache"
                     );
                 } else {
@@ -1036,7 +1045,7 @@ impl<'a> Forwarding<'a> {
                         qtype = ?request.qtype,
                         client_ip = %request.peer.ip(),
                         pipeline = %route.pipeline,
-                        error = %e,
+                        error = %format_args!("{e:#}"),
                         "upstream failed, answering from the cache"
                     );
                 }
@@ -1049,7 +1058,7 @@ impl<'a> Forwarding<'a> {
                         upstream = %decision.upstream,
                         qname = %request.qname,
                         client_ip = %request.peer.ip(),
-                        error = %e,
+                        error = %format_args!("{e:#}"),
                         "flow control kept the query from the upstream"
                     );
                 } else {
@@ -1059,9 +1068,8 @@ impl<'a> Forwarding<'a> {
                        upstream = %decision.upstream,
                        qname = %request.qname,
                        qtype = ?request.qtype,
-                       rcode = ?ResponseCode::ServFail,
                        client_ip = %request.peer.ip(),
-                       error = %e,
+                       error = %format_args!("{e:#}"),
                        pipeline = %route.pipeline,
                        transport = ?decision.transport,
                        "upstream failed"
