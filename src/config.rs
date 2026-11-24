@@ -1159,16 +1159,16 @@ pub struct ValidationReport {
 }
 
 /// 一份配置编译成运行时配置，热重载、面板的校验和试用都走这里，拒掉的和启动时会让内核起不来的一样：会悄悄做成
-/// 别的事的写法（见 [`problems`]）、编译不了的匹配器和正则，以及监听地址和 DoH 的前提（见
-/// [`GlobalSettings::listeners`]）。以前热重载不查监听地址，`bind_udp` 写错了照样重载成功，等到重启内核才起不来。
+/// 别的事的写法（见 [`problems`]，一条不落地放在错误 [`Problems`] 里）、编译不了的匹配器和正则，以及监听地址和 DoH 的
+/// 前提（见 [`GlobalSettings::listeners`]）。以前热重载不查监听地址，`bind_udp` 写错了照样重载成功，等到重启内核才起不来。
 /// 启动不走这里：那时 [`problems`] 记成错误、照旧加载
 /// A configuration compiled into its runtime form, which hot reload and the panel's validation
 /// and trial all go through, refusing what would stop the kernel at startup: what silently does
-/// something else (see [`problems`]), matchers and regexes that do not compile, and the
-/// listener addresses and DoH prerequisites (see [`GlobalSettings::listeners`]). Hot reload
-/// used not to check the listeners, so a mistyped `bind_udp` reloaded fine and the kernel then
-/// failed to start at the next restart. Startup does not come here: there [`problems`] are
-/// logged as errors and loaded as before
+/// something else (see [`problems`], every one of them in the error, a [`Problems`]), matchers
+/// and regexes that do not compile, and the listener addresses and DoH prerequisites (see
+/// [`GlobalSettings::listeners`]). Hot reload used not to check the listeners, so a mistyped
+/// `bind_udp` reloaded fine and the kernel then failed to start at the next restart. Startup does
+/// not come here: there [`problems`] are logged as errors and loaded as before
 pub fn compile(cfg: PipelineConfig) -> Result<RuntimePipelineConfig> {
     refuse_problems(&cfg)?;
     let runtime = RuntimePipelineConfig::from_config(cfg).context("compile configuration")?;
@@ -1590,11 +1590,43 @@ impl<'de> Visitor<'de> for Unread<'_> {
     }
 }
 
-/// [`problems`] 有一条就失败，列出全部 / Fail on any of [`problems`], listing them all
+/// 一份配置因为 [`problems`] 被拒（见 [`refuse_problems`]）：那些问题，每条一句。显示成用 `; ` 连起来的一句；要逐条列出的
+/// （控制通道校验的回答和 `config` 结果的 `last_reload`）用 [`Problems::of`] 从错误里取出来
+/// A configuration refused for its [`problems`] (see [`refuse_problems`]): those problems, a
+/// sentence each. It displays as one sentence, the problems joined by `; `; what lists them one
+/// by one (the control channel's validation answer and the `config` result's `last_reload`)
+/// takes them out of the error with [`Problems::of`]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Problems(pub Vec<String>);
+
+impl Problems {
+    /// `error` 是因为这些问题拒掉配置时的那些问题，别的错误时为空 / The problems `error` refused a
+    /// configuration for, empty for any other error
+    pub fn of(error: &anyhow::Error) -> &[String] {
+        error
+            .downcast_ref::<Self>()
+            .map(|problems| problems.0.as_slice())
+            .unwrap_or_default()
+    }
+}
+
+impl std::fmt::Display for Problems {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0.join("; "))
+    }
+}
+
+impl std::error::Error for Problems {}
+
+/// [`problems`] 有一条就失败，列出全部（见 [`Problems`]）/ Fail on any of [`problems`], listing
+/// them all (see [`Problems`])
 pub fn refuse_problems(cfg: &PipelineConfig) -> Result<()> {
     let found = problems(cfg);
-    anyhow::ensure!(found.is_empty(), "{}", found.join("; "));
-    Ok(())
+    if found.is_empty() {
+        Ok(())
+    } else {
+        Err(Problems(found).into())
+    }
 }
 
 /// 一条规则里几个 forward 的 ecs 写得不一样：它们合成一次转发，只能发一个 ECS，所以一个也不发
@@ -3564,6 +3596,11 @@ mod validation_tests {
             message.contains("WHATEVER") && message.contains("\"gone\""),
             "{message}"
         );
+        assert_eq!(
+            super::Problems::of(&err),
+            super::problems(&super::parse_config(&config.to_string()).unwrap())
+        );
+        assert_eq!(super::Problems::of(&err).len(), 2);
     }
 
     /// 只列出启动时才读的设置；重载即生效的改了不算，改回去以后也不再列
