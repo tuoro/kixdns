@@ -1447,8 +1447,6 @@ impl Engine {
                     ecs,
                     allow_reuse,
                 } => {
-                    let (response_matchers, response_actions_on_match, response_actions_on_miss) =
-                        crate::matcher::ResponsePhase::parts(response_phase.as_deref());
                     let forwarded = phases::handle_forward_decision(
                         self,
                         request,
@@ -1457,9 +1455,7 @@ impl Engine {
                             upstream: &upstream,
                             pre_split_upstreams: pre_split_upstreams.as_ref(),
                             rule_name: &rule_name,
-                            response_matchers,
-                            response_actions_on_match,
-                            response_actions_on_miss,
+                            response: response_phase.as_deref(),
                             transport,
                             ecs: ecs.as_ref(),
                             allow_reuse,
