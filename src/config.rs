@@ -1230,55 +1230,43 @@ pub fn problems(cfg: &PipelineConfig) -> Vec<String> {
             cfg.settings.doh_path
         ));
     }
-    for (index, select) in cfg.pipeline_select.iter().enumerate() {
-        let place = format!("pipeline_select[{index}]");
-        if !pipelines.contains(select.pipeline.as_str()) {
-            found.push(format!("{place}: no pipeline \"{}\"", select.pipeline));
-        }
-        if let Some(problem) = ignored_negation(
-            "matchers",
-            select.matchers.iter().map(|m| m.operator),
-            select.matcher_operator,
-        ) {
-            found.push(format!("{place}: {problem}"));
-        }
-        for matcher in &select.matchers {
-            if let Matcher::DomainSuffix { value } | Matcher::DomainRegex { value } =
-                &matcher.matcher
-                && value.is_empty()
-            {
-                found.push(format!("{place}: {EMPTY_DOMAIN_MATCHER}"));
-            }
-            if let Matcher::DomainExact { value } = &matcher.matcher
-                && value.is_empty()
-            {
-                found.push(format!("{place}: {EMPTY_EXACT_MATCHER}"));
-            }
-        }
-    }
     // 一个 id 写了几次，在它第一次出现的地方报一次 / An id written several times is raised once,
     // where it first appears
     let mut written: rustc_hash::FxHashMap<&str, usize> = rustc_hash::FxHashMap::default();
     for pipeline in &cfg.pipelines {
         *written.entry(pipeline.id.as_str()).or_default() += 1;
     }
-    for (index, pipeline) in cfg.pipelines.iter().enumerate() {
-        if let Some(times) = written.remove(pipeline.id.as_str())
-            && times > 1
-        {
-            found.push(format!(
-                "pipelines[{index}]: {times} pipelines are written with the id \"{}\"; a jump or pipeline_select finds only one of them by it, and the rules of the others do not run as written; give each pipeline its own id",
-                pipeline.id
-            ));
+    for (place, entry) in entries(cfg) {
+        let mut report = |problem: String| found.push(format!("{place}: {problem}"));
+        match entry {
+            Entry::Select(select) => {
+                if !pipelines.contains(select.pipeline.as_str()) {
+                    report(format!("no pipeline \"{}\"", select.pipeline));
+                }
+                if let Some(problem) = ignored_negation(
+                    "matchers",
+                    select.matchers.iter().map(|m| m.operator),
+                    select.matcher_operator,
+                ) {
+                    report(problem);
+                }
+            }
+            Entry::Pipeline(pipeline) => {
+                if let Some(times) = written.remove(pipeline.id.as_str())
+                    && times > 1
+                {
+                    report(format!(
+                        "{times} pipelines are written with the id \"{}\"; a jump or pipeline_select finds only one of them by it, and the rules of the others do not run as written; give each pipeline its own id",
+                        pipeline.id
+                    ));
+                }
+            }
+            Entry::Rule(rule) => rule_problems(rule, &pipelines, report),
         }
-    }
-    // 规则按位置报，和读不懂的键一样：名字可以重复，按名字说不清是哪一条 / Rules are raised by place,
-    // as the keys not read are: names may repeat, and a name may not tell which rule it is
-    for (i, pipeline) in cfg.pipelines.iter().enumerate() {
-        for (j, rule) in pipeline.rules.iter().enumerate() {
-            rule_problems(rule, &pipelines, |problem| {
-                found.push(format!("pipelines[{i}].rules[{j}]: {problem}"))
-            });
+        for (within, matcher) in entry.matchers() {
+            if let Some(problem) = matcher.problem() {
+                found.push(format!("{place}.{within}: {problem}"));
+            }
         }
     }
     for key in cfg.unread_keys.iter().filter(|key| !retired(key)) {
@@ -1375,26 +1363,10 @@ pub fn warnings(cfg: &PipelineConfig) -> Vec<String> {
             "settings.bootstrap is unset, so upstream host names such as \"{host}\" are resolved by the system resolver; should that be KixDNS itself, resolving one comes back round to KixDNS and the upstream cannot be reached: set bootstrap to plain DNS servers written as IP:port"
         ));
     }
-    for (index, select) in cfg.pipeline_select.iter().enumerate() {
-        if select.matchers.iter().any(|matcher| {
-            matches!(&matcher.matcher, Matcher::GeoipCountry { country_codes } if country_codes.is_empty())
-        }) {
-            found.push(format!("pipeline_select {}: {NO_COUNTRY_CODE}", index + 1));
-        }
-    }
-    for pipeline in &cfg.pipelines {
-        for rule in &pipeline.rules {
-            let request = rule.matchers.iter().any(|matcher| {
-                matches!(&matcher.matcher, Matcher::GeoipCountry { country_codes } if country_codes.is_empty())
-            });
-            let response = rule.response_matchers.iter().any(|matcher| {
-                matches!(&matcher.matcher, ResponseMatcher::ResponseAnswerIpGeoipCountry { country_codes } if country_codes.is_empty())
-            });
-            if request || response {
-                found.push(format!(
-                    "pipeline \"{}\" rule \"{}\": {NO_COUNTRY_CODE}",
-                    pipeline.id, rule.name
-                ));
+    for (place, entry) in entries(cfg) {
+        for (within, matcher) in entry.matchers() {
+            if let Some(warning) = matcher.warning() {
+                found.push(format!("{place}.{within}: {warning}"));
             }
         }
     }
@@ -1661,6 +1633,114 @@ fn ignored_negation(
     ))
 }
 
+/// 配置里按位置排的每一项：pipeline_select 的每一条、每个 pipeline 和它的每条规则，各带着自己的路径，写法和读不懂的键
+/// 一样（`pipeline_select[0]`、`pipelines[1]`、`pipelines[1].rules[2]`）。[`problems`] 和 [`warnings`] 都照它说在哪：规则名
+/// 可以重复，按名字说不清是哪一条
+/// Every entry of a configuration by place: each pipeline_select entry, each pipeline and each
+/// of its rules, with its path written as for the keys not read (`pipeline_select[0]`,
+/// `pipelines[1]`, `pipelines[1].rules[2]`). Both [`problems`] and [`warnings`] say where by
+/// it: rule names may repeat, and a name may not tell which rule it is
+fn entries(cfg: &PipelineConfig) -> impl Iterator<Item = (String, Entry<'_>)> {
+    let selects = cfg
+        .pipeline_select
+        .iter()
+        .enumerate()
+        .map(|(i, select)| (format!("pipeline_select[{i}]"), Entry::Select(select)));
+    let pipelines = cfg.pipelines.iter().enumerate().flat_map(|(i, pipeline)| {
+        let rules = pipeline
+            .rules
+            .iter()
+            .enumerate()
+            .map(move |(j, rule)| (format!("pipelines[{i}].rules[{j}]"), Entry::Rule(rule)));
+        std::iter::once((format!("pipelines[{i}]"), Entry::Pipeline(pipeline))).chain(rules)
+    });
+    selects.chain(pipelines)
+}
+
+/// [`entries`] 给出的一项 / An entry [`entries`] gives
+#[derive(Clone, Copy)]
+enum Entry<'a> {
+    Select(&'a PipelineSelectRule),
+    Pipeline(&'a Pipeline),
+    Rule(&'a Rule),
+}
+
+impl<'a> Entry<'a> {
+    /// 这一项的匹配器，各带着在这一项里的路径（`matchers[1]`、`response_matchers[0]`）/ This entry's
+    /// matchers, each with its path within the entry (`matchers[1]`, `response_matchers[0]`)
+    fn matchers(self) -> impl Iterator<Item = (String, AnyMatcher<'a>)> {
+        let (request, response): (&[MatcherWithOp], &[ResponseMatcherWithOp]) = match self {
+            Entry::Select(select) => (&select.matchers, &[]),
+            Entry::Pipeline(_) => (&[], &[]),
+            Entry::Rule(rule) => (&rule.matchers, &rule.response_matchers),
+        };
+        let request = request
+            .iter()
+            .enumerate()
+            .map(|(k, m)| (format!("matchers[{k}]"), AnyMatcher::Request(&m.matcher)));
+        let response = response.iter().enumerate().map(|(k, m)| {
+            (
+                format!("response_matchers[{k}]"),
+                AnyMatcher::Response(&m.matcher),
+            )
+        });
+        request.chain(response)
+    }
+}
+
+/// 请求或回答的一个匹配器 / A request or answer matcher
+#[derive(Clone, Copy)]
+enum AnyMatcher<'a> {
+    Request(&'a Matcher),
+    Response(&'a ResponseMatcher),
+}
+
+impl AnyMatcher<'_> {
+    /// 这个匹配器会悄悄做成别的事的写法（见 [`problems`]）/ How this matcher is written to
+    /// silently do something else (see [`problems`])
+    fn problem(self) -> Option<String> {
+        match self {
+            Self::Request(Matcher::DomainSuffix { value } | Matcher::DomainRegex { value })
+            | Self::Response(
+                ResponseMatcher::RequestDomainSuffix { value }
+                | ResponseMatcher::RequestDomainRegex { value },
+            ) if value.is_empty() => Some(EMPTY_DOMAIN_MATCHER.to_owned()),
+            Self::Request(Matcher::DomainExact { value })
+            | Self::Response(ResponseMatcher::RequestDomainExact { value })
+                if value.is_empty() =>
+            {
+                Some(EMPTY_EXACT_MATCHER.to_owned())
+            }
+            // 以前写错的 rcode 悄悄当成 OTHER，匹配所有不常见的 RCODE，这条规则几乎永远不中
+            // A misspelt rcode used to pass for OTHER, matching every uncommon RCODE, so the
+            // rule hardly ever matched
+            Self::Response(ResponseMatcher::ResponseRcode { value })
+                if !value.eq_ignore_ascii_case("OTHER")
+                    && crate::engine::utils::parse_rcode(value).is_none() =>
+            {
+                Some(format!(
+                    "response_rcode \"{value}\" is none of NOERROR, FORMERR, SERVFAIL, NXDOMAIN, NOTIMP, REFUSED, OTHER"
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// 这个匹配器照样加载、却值得知道的写法（见 [`warnings`]）/ How this matcher is written
+    /// that loads all the same yet is worth knowing (see [`warnings`])
+    fn warning(self) -> Option<&'static str> {
+        match self {
+            Self::Request(Matcher::GeoipCountry { country_codes })
+            | Self::Response(ResponseMatcher::ResponseAnswerIpGeoipCountry { country_codes })
+                if country_codes.is_empty() =>
+            {
+                Some(NO_COUNTRY_CODE)
+            }
+            _ => None,
+        }
+    }
+}
+
 fn rule_problems(
     rule: &Rule,
     pipelines: &rustc_hash::FxHashSet<&str>,
@@ -1700,42 +1780,6 @@ fn rule_problems(
         && rule.actions.iter().any(|action| {
             matches!(action, Action::Forward { upstream: Some(upstreams), .. } if names_an_address(upstreams))
         });
-    for matcher in &rule.matchers {
-        if let Matcher::DomainSuffix { value } | Matcher::DomainRegex { value } = &matcher.matcher
-            && value.is_empty()
-        {
-            report(EMPTY_DOMAIN_MATCHER.to_string());
-        }
-        if let Matcher::DomainExact { value } = &matcher.matcher
-            && value.is_empty()
-        {
-            report(EMPTY_EXACT_MATCHER.to_string());
-        }
-    }
-    for matcher in &rule.response_matchers {
-        // 以前写错的 rcode 悄悄当成 OTHER，匹配所有不常见的 RCODE，这条规则几乎永远不中
-        // A misspelt rcode used to pass for OTHER, matching every uncommon RCODE, so the rule
-        // hardly ever matched
-        if let ResponseMatcher::ResponseRcode { value } = &matcher.matcher
-            && !value.eq_ignore_ascii_case("OTHER")
-            && crate::engine::utils::parse_rcode(value).is_none()
-        {
-            report(format!(
-                "response_rcode \"{value}\" is none of NOERROR, FORMERR, SERVFAIL, NXDOMAIN, NOTIMP, REFUSED, OTHER"
-            ));
-        }
-        if let ResponseMatcher::RequestDomainSuffix { value }
-        | ResponseMatcher::RequestDomainRegex { value } = &matcher.matcher
-            && value.is_empty()
-        {
-            report(EMPTY_DOMAIN_MATCHER.to_string());
-        }
-        if let ResponseMatcher::RequestDomainExact { value } = &matcher.matcher
-            && value.is_empty()
-        {
-            report(EMPTY_EXACT_MATCHER.to_string());
-        }
-    }
     // 回答动作里的 forward 各自转发，不合并 / The forwards among the answer actions forward
     // each on its own and do not merge
     let actions = rule
@@ -2225,6 +2269,47 @@ mod validation_tests {
         }
     }
 
+    /// 警告和问题一样按位置说在哪：`pipeline_select[i].matchers[k]`、`pipelines[i].rules[j].matchers[k]`、
+    /// `.response_matchers[k]`。三条都叫 r 的规则也分得清。以前警告写成 `pipeline_select 1`（从 1 数）、
+    /// `pipeline "main" rule "r"`，和问题的写法不一样，重名的规则分不清
+    /// Warnings say where as problems do: `pipeline_select[i].matchers[k]`,
+    /// `pipelines[i].rules[j].matchers[k]`, `.response_matchers[k]`, which tells apart three rules
+    /// all named r. Warnings used to be placed as `pipeline_select 1` (counting from 1) and
+    /// `pipeline "main" rule "r"`, unlike problems, and rules sharing a name were not told apart
+    #[test]
+    fn warnings_are_placed_as_problems_are() {
+        let no_country = serde_json::json!([{ "type": "geoip_country", "country_codes": [] }]);
+        let any = serde_json::json!([{ "type": "any" }]);
+        let allow = serde_json::json!([{ "type": "allow" }]);
+        let config = serde_json::json!({
+            "settings": { "default_upstream": "1.1.1.1:53" },
+            "pipeline_select": [
+                { "pipeline": "main", "matchers": any },
+                { "pipeline": "main", "matchers": [{ "type": "any" }, no_country[0]] }
+            ],
+            "pipelines": [{ "id": "main", "rules": [
+                rule("r", any.clone(), allow.clone()),
+                rule("r", no_country.clone(), allow.clone()),
+                {
+                    "name": "r",
+                    "matchers": any,
+                    "actions": [{ "type": "forward" }],
+                    "response_matchers": [{ "type": "response_answer_ip_geoip_country", "country_codes": "" }],
+                    "response_actions_on_match": allow
+                }
+            ] }]
+        });
+        let warned = super::warnings(&super::parse_config(&config.to_string()).expect("parses"));
+        assert_eq!(
+            warned,
+            [
+                "pipeline_select[1].matchers[1]: a geoip matcher written with no country code never matches",
+                "pipelines[0].rules[1].matchers[0]: a geoip matcher written with no country code never matches",
+                "pipelines[0].rules[2].response_matchers[0]: a geoip matcher written with no country code never matches",
+            ]
+        );
+    }
+
     /// 白写的取反报出来：第一个匹配器上的 `not`，只有一个匹配器时规则级的 `not`，入口、请求和回答的匹配器都一样。第一个上
     /// 的 `or`、规则级的取反配几个匹配器（第一个起头，后面的取反）照常
     /// A negation written for nothing is raised: `not` on the first matcher, or a chain-level
@@ -2302,8 +2387,8 @@ mod validation_tests {
         assert_eq!(
             problems_of(rule("SERVFAILL", "WARN")),
             [
-                "pipelines[0].rules[0]: response_rcode \"SERVFAILL\" is none of NOERROR, FORMERR, SERVFAIL, NXDOMAIN, NOTIMP, REFUSED, OTHER",
                 "pipelines[0].rules[0]: log level \"WARN\" is none of trace, debug, info, warn, error",
+                "pipelines[0].rules[0].response_matchers[0]: response_rcode \"SERVFAILL\" is none of NOERROR, FORMERR, SERVFAIL, NXDOMAIN, NOTIMP, REFUSED, OTHER",
             ]
         );
         for (rcode, level) in [("OTHER", "warn"), ("other", "debug"), ("servfail", "error")] {
@@ -2454,9 +2539,9 @@ mod validation_tests {
         });
         let found = problems_of(config);
         for place in [
-            "pipeline_select[0]",
-            "pipelines[0].rules[0]",
-            "pipelines[0].rules[1]",
+            "pipeline_select[0].matchers[0]",
+            "pipelines[0].rules[0].matchers[0]",
+            "pipelines[0].rules[1].response_matchers[0]",
         ] {
             assert!(
                 found
@@ -2959,11 +3044,13 @@ mod validation_tests {
     }
 
     /// 会悄悄做成别的事的写法，每一种都报出来，按位置说在哪，和读不懂的键一样：`settings.` 下的设置、
-    /// `pipeline_select[i]`、`pipelines[i].rules[j]`。规则名可以重复，以前按名字说在哪，重名时分不清是哪一条。不以 `/`
-    /// 开头的 doh_path（DoH 对每个请求都回 404）以前不算问题，空的 request_domain_suffix 以前让整份配置读不进来
+    /// `pipeline_select[i]`、`pipelines[i].rules[j]`，匹配器的再往下写到 `.matchers[k]`、`.response_matchers[k]`。规则名
+    /// 可以重复，以前按名字说在哪，重名时分不清是哪一条。不以 `/` 开头的 doh_path（DoH 对每个请求都回 404）以前不算问题，
+    /// 空的 request_domain_suffix 以前让整份配置读不进来
     /// Every way of writing that silently does something else is named with its place, a path
     /// as for the keys not read: a setting under `settings.`, `pipeline_select[i]`,
-    /// `pipelines[i].rules[j]`. Rule names may repeat, and the name a rule used to be raised by
+    /// `pipelines[i].rules[j]`, a matcher's going on to `.matchers[k]` or
+    /// `.response_matchers[k]`. Rule names may repeat, and the name a rule used to be raised by
     /// could not tell which it was. A doh_path not starting with `/` (DoH answering every query
     /// with 404) used to be no problem, and an empty request_domain_suffix used to keep the whole
     /// configuration from being read
@@ -3007,7 +3094,7 @@ mod validation_tests {
                 "\"dns-query\" does not start with \"/\"",
             ),
             ("pipeline_select[0]", "no pipeline \"gone\""),
-            ("pipeline_select[0]", "empty domain matcher"),
+            ("pipeline_select[0].matchers[0]", "empty domain matcher"),
             ("pipelines[0].rules[0]", "1.1.1.1:99999"),
             ("pipelines[0].rules[1]", "nonsense"),
             ("pipelines[0].rules[2]", "unknown prefix \"http://\""),
@@ -3018,9 +3105,16 @@ mod validation_tests {
             ("pipelines[0].rules[7]", "cname target"),
             ("pipelines[0].rules[8]", "256 bytes"),
             ("pipelines[0].rules[9]", "\"gone\", which does not exist"),
-            ("pipelines[0].rules[10]", "empty domain matcher"),
-            ("pipelines[0].rules[11]", "empty domain matcher"),
-            ("pipelines[0].rules[12]", "empty domain matcher"),
+            ("pipelines[0].rules[10].matchers[0]", "empty domain matcher"),
+            ("pipelines[0].rules[11].matchers[0]", "empty domain matcher"),
+            (
+                "pipelines[0].rules[12].response_matchers[0]",
+                "empty domain matcher",
+            ),
+            (
+                "pipelines[0].rules[12].response_matchers[1]",
+                "empty domain matcher",
+            ),
             ("pipelines[0].rules[12]", "udp+tcp://dns.example:53"),
         ] {
             assert!(
