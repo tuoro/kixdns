@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -39,7 +40,7 @@ use crate::observe::{
     CacheHit, CacheHitKind, ConfigLoaded, ConfigReloadFailed, DecisionDetail, DecisionMade,
     EngineObserver, RequestContext, RequestOutcome, RequestStatus, RuleAnswer, RuleCacheLookup,
     RuleEvaluated, RuleMatched, RulePhase, TracingObserver, UpstreamAttempt, UpstreamOutcome,
-    UpstreamResult, UpstreamSkipReason, UpstreamSkipped,
+    UpstreamResult, UpstreamSkipReason, UpstreamSkipped, rcode_name,
 };
 use crate::panel_querylog::{self, OwnLines, QueryLog, WallClock};
 use crate::panel_trace;
@@ -1784,7 +1785,7 @@ impl EngineObserver for PanelMetrics {
                     |key| {
                         key.push_str(event.upstream);
                         key.push('\0');
-                        let _ = write!(key, "{rcode:?}");
+                        key.push_str(&rcode_name(rcode.into()));
                     },
                     |key| self.increment(&self.upstream_rcodes, key),
                 );
@@ -1799,7 +1800,7 @@ impl EngineObserver for PanelMetrics {
                     "响应码：{}；耗时：{} ms；截断：{}",
                     event
                         .rcode
-                        .map_or_else(|| "unknown".to_owned(), |rcode| rcode.to_string()),
+                        .map_or(Cow::Borrowed("unknown"), |rcode| rcode_name(rcode.into())),
                     event.latency.as_millis(),
                     event.truncated.unwrap_or(false)
                 )),
@@ -2150,7 +2151,7 @@ async fn run_diagnostic(
             "domain": domain,
             "record_type": record_type,
             "client_ip": client.ip().to_string(),
-            "response_code": response.metadata.response_code.to_string(),
+            "response_code": rcode_name(response.metadata.response_code.into()),
             "elapsed_ms": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             "truncated": response.metadata.truncation,
             "answers": response.answers.iter().map(ToString::to_string).collect::<Vec<_>>(),
@@ -3499,7 +3500,7 @@ mod tests {
             ]
         };
         let rcodes =
-            |address: &str| count(&metrics.upstream_rcodes, &format!("{address}\0NoError"));
+            |address: &str| count(&metrics.upstream_rcodes, &format!("{address}\0NOERROR"));
         for (address, _) in upstreams {
             assert_eq!(upstream_series(address), [Some(1); 5], "{address}");
             assert_eq!(rcodes(address), Some(1), "{address}");
@@ -4226,6 +4227,46 @@ mod tests {
         );
     }
 
+    /// 指标的 rcode 标签和配置、查询日志里的写法一样：NOERROR、NXDOMAIN 这样的助记名，扩展 RCODE 16 是 BADVERS，
+    /// 没有名字的写成 RCODE 加数字。以前用 hickory 的 Debug，写成 `NoError`，16 成了 BADSIG
+    /// The metrics' rcode labels are spelt as in the config and the query log: mnemonics such as
+    /// NOERROR and NXDOMAIN, the extended RCODE 16 being BADVERS, and one without a name RCODE and
+    /// its number. hickory's Debug used to write them, as `NoError`, and 16 as BADSIG
+    #[test]
+    fn rcode_labels_are_spelt_as_in_the_config() {
+        use crate::config::Transport;
+        use crate::observe::{EngineObserver, UpstreamOutcome};
+        use hickory_proto::op::ResponseCode;
+        let metrics = PanelMetrics::default();
+        let ctx = request(1, "127.0.0.1:5353", "example.com");
+        for rcode in [
+            ResponseCode::NoError,
+            ResponseCode::ServFail,
+            ResponseCode::from(1, 0),
+            ResponseCode::from(0xFF, 0xF),
+        ] {
+            metrics.upstream_result(
+                &ctx,
+                &udp_result(UpstreamOutcome::Success, Transport::Udp, Some(rcode), 1),
+            );
+        }
+        let mut output = String::new();
+        metrics.render_counters(&mut output);
+        let labels: Vec<&str> = output
+            .lines()
+            .filter_map(|line| line.strip_prefix("kixdns_upstream_rcodes_total{"))
+            .filter_map(|line| line.split("rcode=\"").nth(1))
+            .filter_map(|rest| rest.split('"').next())
+            .collect();
+        let mut labels = labels;
+        labels.sort_unstable();
+        assert_eq!(
+            labels,
+            ["BADVERS", "NOERROR", "RCODE4095", "SERVFAIL"],
+            "{output}"
+        );
+    }
+
     #[test]
     fn latency_rcode_via_and_stale_reason_series_render() {
         use crate::config::Transport;
@@ -4318,10 +4359,10 @@ mod tests {
             "kixdns_upstream_latency_ms_count{upstream=\"1.1.1.1:53\",transport=\"udp\"} 2"
         ));
         assert!(has(
-            "kixdns_upstream_rcodes_total{upstream=\"1.1.1.1:53\",rcode=\"NoError\"} 1"
+            "kixdns_upstream_rcodes_total{upstream=\"1.1.1.1:53\",rcode=\"NOERROR\"} 1"
         ));
         assert!(has(
-            "kixdns_upstream_rcodes_total{upstream=\"1.1.1.1:53\",rcode=\"NXDomain\"} 1"
+            "kixdns_upstream_rcodes_total{upstream=\"1.1.1.1:53\",rcode=\"NXDOMAIN\"} 1"
         ));
         assert!(has(
             "kixdns_upstream_via_total{upstream=\"1.1.1.1:53\",transport=\"udp\",via=\"tcp\"} 1"
@@ -5493,6 +5534,9 @@ mod diagnostic_tests {
         assert_eq!(body["candidate"], true);
         assert_eq!(body["record_type"], "A");
         assert_eq!(body["client_ip"], "10.8.0.3");
+        // 响应码和配置里的写法一样，不是 hickory 的 Display（`No Error`）/ The response code is
+        // spelt as in the config, not as hickory's Display (`No Error`)
+        assert_eq!(body["response_code"], "NOERROR");
         assert!(answered(&body, "10.0.0.1"), "{body}");
     }
 

@@ -39,6 +39,7 @@
 //! # }
 //! ```
 
+use std::borrow::Cow;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -670,6 +671,28 @@ pub struct TracingObserver;
 
 const TRACE_TARGET: &str = "kixdns::observe";
 
+/// 响应码的助记名，和配置里写的一样（NOERROR、NXDOMAIN……），RFC 6895 里到 NOTZONE 为止的每一个都有；头部加上 OPT
+/// 的 16 只会是 BADVERS（TSIG 的 BADSIG 写在 TSIG 记录里，头部是 NOTAUTH）；其余写成 `RCODE` 加数字。查询日志、响应
+/// 日志、指标和诊断都用它，不用 hickory 的 Debug（`NoError`）或 Display（`No Error`），那两种不是固定的写法
+/// The mnemonic of a response code, as written in the config (NOERROR, NXDOMAIN, …), for each
+/// of RFC 6895's up to NOTZONE; 16 from the header and an OPT together can only be BADVERS
+/// (TSIG's BADSIG goes in the TSIG record, with NOTAUTH in the header); any other is `RCODE`
+/// and its number. The query log, the response log, the metrics and the diagnostics all use
+/// it rather than hickory's Debug (`NoError`) or Display (`No Error`), neither a fixed spelling
+pub(crate) fn rcode_name(code: u16) -> Cow<'static, str> {
+    const NAMES: [&str; 11] = [
+        "NOERROR", "FORMERR", "SERVFAIL", "NXDOMAIN", "NOTIMP", "REFUSED", "YXDOMAIN", "YXRRSET",
+        "NXRRSET", "NOTAUTH", "NOTZONE",
+    ];
+    match code {
+        16 => Cow::Borrowed("BADVERS"),
+        _ => NAMES.get(usize::from(code)).map_or_else(
+            || Cow::Owned(format!("RCODE{code}")),
+            |name| Cow::Borrowed(*name),
+        ),
+    }
+}
+
 /// Response code from a DNS header: the low four bits of byte 3. The
 /// extended bits an OPT record may carry are not read; this is a log field,
 /// not a parser.
@@ -703,7 +726,10 @@ impl EngineObserver for TracingObserver {
             request_id = ctx.request_id,
             status = ?outcome.status,
             latency_us = outcome.latency.as_micros() as u64,
-            rcode = outcome.response.and_then(header_rcode).map(tracing::field::display),
+            rcode = outcome
+                .response
+                .and_then(header_rcode)
+                .map(|rcode| tracing::field::display(rcode_name(rcode.into()))),
             response_bytes = outcome.response.map(<[u8]>::len),
             error = outcome.error,
             "request finished"
@@ -834,7 +860,9 @@ impl EngineObserver for TracingObserver {
             outcome = ?event.outcome,
             via = ?event.via,
             latency_us = event.latency.as_micros() as u64,
-            rcode = event.rcode.map(tracing::field::display),
+            rcode = event
+                .rcode
+                .map(|rcode| tracing::field::display(rcode_name(rcode.into()))),
             truncated = event.truncated,
             error = event.error.map(tracing::field::display),
             "upstream result"
