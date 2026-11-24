@@ -663,12 +663,13 @@ pub struct ConfigReloadFailed<'a> {
     pub path: &'a Path,
     /// Human-readable error including its cause chain.
     pub error: &'a str,
-    /// What the reload refused the configuration for (its problems, settings
-    /// that make no sense, matchers that do not compile), a sentence each, all
-    /// of them (see `config::Problems`); `error` holds them joined. Empty when
-    /// the reload failed for another reason (the file unreadable, say).
-    /// 重载拒掉配置的原因（配置问题、说不通的设置、编译不了的匹配器），每条一句，一条不落（见 `config::Problems`）；
-    /// `error` 是它们连起来的一句。因为别的原因失败时（比如文件读不了）为空。
+    /// What the reload refused the configuration for (its problems, the
+    /// listener addresses and DoH prerequisites, settings that make no sense,
+    /// matchers that do not compile), a sentence each, all of them (see
+    /// `config::Problems`); `error` holds them joined. Empty when the reload
+    /// failed for another reason (the file unreadable, say).
+    /// 重载拒掉配置的原因（配置问题、监听地址和 DoH 的前提、说不通的设置、编译不了的匹配器），每条一句，一条不落
+    /// （见 `config::Problems`）；`error` 是它们连起来的一句。因为别的原因失败时（比如文件读不了）为空。
     pub problems: &'a [String],
 }
 

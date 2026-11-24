@@ -409,12 +409,11 @@ async fn run_dns_server(
     let watch = watcher::ConfigWatch::new(&config);
     let (cfg, config_source) = load_config_with_source(&config).context("load initial config")?;
     let version = cfg.version.clone();
-    // 起不来时问题和说不通的设置、编译不了的匹配器、监听地址和 DoH 的前提一起，一次列全在那条致命错误里，每条开头就写着
-    // 是哪个设置或匹配器，和重载、校验时一样（见 `config::compile_at_startup`）
-    // When it cannot start, the problems are listed all at once in the fatal error together with
-    // the settings that make no sense, the matchers that do not compile and the listener addresses
-    // and DoH prerequisites, each starting with the setting or matcher it is about, as on a reload
-    // and in validation (see `config::compile_at_startup`)
+    // 起不来时问题和让它起不来的原因一次列全在那条致命错误里（见 `config::Problems`），每条开头就写着是哪个设置或匹配器，
+    // 和重载、校验时一样（见 `config::compile_at_startup`）
+    // When it cannot start, the problems and the reasons it cannot are listed all at once in the
+    // fatal error (see `config::Problems`), each starting with the setting or matcher it is about,
+    // as on a reload and in validation (see `config::compile_at_startup`)
     let (cfg, listeners, problems) = kixdns::config::compile_at_startup(cfg)?;
     // 起得来时问题照样加载（超过上限的设置按上限用，见 `config::problems`），升级以后已经在用的配置照样起得来；重载和面板
     // 的校验会拒绝它们。和重载拒绝时一样记 error，默认日志级别就看得到
