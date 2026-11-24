@@ -42,12 +42,14 @@ pub enum OnTheSpot {
 
 impl Engine {
     /// 让快速路径当场处理 `packet`：答得上的写进 `reply`（先清空），缓存命中的 TTL 按它在缓存里停留的时间调低。答得上的有
-    /// 静态应答、缓存命中、不支持的 EDNS 版本的 BADVERS、ECS 不合规的 FORMERR，以及请求头不是标准查询的 NOTIMP 和 FORMERR
-    /// （见 `proto_utils::header_reply`）。三个监听器都从这里进来
+    /// 静态应答、缓存命中、不支持的 EDNS 版本的 BADVERS、OPT 的选项不合规（选项结构不对、ECS 不合规，见
+    /// `proto_utils::malformed_options`）的 FORMERR，以及请求头不是标准查询的 NOTIMP 和 FORMERR（见
+    /// `proto_utils::header_reply`）。三个监听器都从这里进来
     /// Let the fast path handle `packet` on the spot: what it can answer is written to `reply`
     /// (cleared first), a cache hit's TTLs lowered by its time in the cache. It answers a static
-    /// answer, a cache hit, the BADVERS for an unsupported EDNS version, the FORMERR for an
-    /// improper ECS, and the NOTIMP and FORMERR for a header that is no standard query (see
+    /// answer, a cache hit, the BADVERS for an unsupported EDNS version, the FORMERR for improper
+    /// OPT options (an option malformed, an improper ECS, see `proto_utils::malformed_options`),
+    /// and the NOTIMP and FORMERR for a header that is no standard query (see
     /// `proto_utils::header_reply`). All three listeners come in through here
     pub fn on_the_spot(&self, packet: &[u8], peer: SocketAddr, reply: &mut BytesMut) -> OnTheSpot {
         let answer = if proto_utils::is_standard_query_header(packet) {
@@ -64,10 +66,13 @@ impl Engine {
                 Some(FastPathResponse::AsyncNeeded(pre_parsed)) => {
                     return OnTheSpot::Forward(Some(pre_parsed));
                 }
-                // ECS 不合规的查询快速解析不收，当场回 FORMERR（RFC 7871 第 6 节），不去问上游
-                // A query with an improper ECS, which the quick parse does not take, is answered
-                // FORMERR on the spot (RFC 7871 section 6) rather than asked of an upstream
-                None if proto_utils::malformed_ecs(packet) => proto_utils::formerr_reply(packet),
+                // OPT 的选项不合规的查询快速解析不收，当场回 FORMERR（ECS 见 RFC 7871 第 6 节），不去问上游
+                // A query with improper OPT options, which the quick parse does not take, is
+                // answered FORMERR on the spot (for ECS, RFC 7871 section 6) rather than asked of
+                // an upstream
+                None if proto_utils::malformed_options(packet) => {
+                    proto_utils::formerr_reply(packet)
+                }
                 None => return OnTheSpot::Forward(None),
             }
         } else {

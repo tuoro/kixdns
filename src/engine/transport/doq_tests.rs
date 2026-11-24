@@ -703,6 +703,50 @@ async fn a_doq_connection_is_replaced_only_when_it_failed() {
     }
 }
 
+/// 一个查询超时、这期间连接上没读到过别的回答：连接关掉，它上面别的查询马上失败，换一条新连接重发、答上，不用等到
+/// 各自的期限
+/// A query timing out with no other answer read on its connection meanwhile: the connection is
+/// closed, and the other queries on it fail at once, are sent again on a fresh one and
+/// answered, without waiting out their deadlines
+#[tokio::test]
+async fn a_stalled_doq_connection_is_closed_and_its_queries_sent_again() {
+    /// 上游收到了几次 `waiting` / How many times the upstream received `waiting`
+    static WAITING: AtomicUsize = AtomicUsize::new(0);
+    let (server, client_tls) = localhost_tls(&[b"doq"]);
+    let addr = spawn_doq_upstream(server, Duration::ZERO, |_, label| match label {
+        "stalled" => DoqReply::Silence,
+        "waiting" if WAITING.fetch_add(1, Ordering::Relaxed) == 0 => DoqReply::Silence,
+        _ => DoqReply::Answer(Duration::ZERO),
+    })
+    .await;
+    let client = doq_test_client(format!("doq://{addr}?sni=localhost"), client_tls, false);
+    client
+        .send(&udp_test_query("warm.example"), Duration::from_secs(2))
+        .await
+        .expect("a fresh connection answers");
+    let stalled = client.pooled.load_full().expect("a pooled connection");
+    let (stalled_query, waiting_query) = (
+        udp_test_query("stalled.example"),
+        udp_test_query("waiting.example"),
+    );
+    let started = tokio::time::Instant::now();
+    let (timed_out, waiting) = tokio::join!(
+        client.send(&stalled_query, Duration::from_millis(300)),
+        client.send(&waiting_query, Duration::from_secs(3)),
+    );
+    assert!(timed_out.is_err(), "the upstream never answers `stalled`");
+    waiting.expect("sent again on a fresh connection and answered");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "answered well before its own deadline"
+    );
+    assert!(
+        stalled.conn.close_reason().is_some(),
+        "the stalled connection is closed"
+    );
+    assert_eq!(WAITING.load(Ordering::Relaxed), 2, "sent once more");
+}
+
 /// 握手被压住 250 ms、回答再等 250 ms：300 ms 预算的请求不跑满 500 ms，到时限就失败
 /// A handshake held back 250 ms and an answer after another 250 ms: a request with a 300 ms
 /// budget does not run the full 500 ms but fails at its limit

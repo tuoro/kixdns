@@ -29,14 +29,16 @@ use webpki_roots::TLS_SERVER_ROOTS;
 const ATTEMPT_DELAY: Duration = Duration::from_millis(250);
 
 /// 用 `attempt` 连上 `addresses` 里的一个（RFC 8305 第 4、5 节）：地址按族交替排开，第一个地址那一族在前；起一个尝试，
-/// 它过了 [`ATTEMPT_DELAY`] 还没连上、或者失败了，就接着起下一个，先连上的那个用，别的放弃；都失败时报最后那个失败。
-/// TCP、DoT、直连的 DoH 和 DoQ 都这样连：前面的地址不回应时，后面的不用等到建连的时限才轮到
+/// 它过了 [`ATTEMPT_DELAY`] 还没连上、或者失败了，就接着起下一个，先连上的那个用，别的放弃；都失败时按失败的先后列出每个
+/// 地址和它的失败，日志里看得出连过哪些。TCP、DoT、直连的 DoH 和 DoQ 都这样连：前面的地址不回应时，后面的不用等到建连的
+/// 时限才轮到
 /// Connects through `attempt` to one of `addresses` (RFC 8305 sections 4 and 5): the addresses
 /// alternate by family, the first address's family first; one attempt is started, and once it is
 /// not through after [`ATTEMPT_DELAY`], or has failed, the next one is, the first to connect
-/// being used and the rest given up; with all failed the last failure is reported. TCP, DoT,
-/// direct DoH and DoQ all connect so: with an early address not answering, the later ones have
-/// their turn well within the connect's time limit
+/// being used and the rest given up; with all failed every address is reported with its failure,
+/// in the order they failed, so a log shows what was dialled. TCP, DoT, direct DoH and DoQ all
+/// connect so: with an early address not answering, the later ones have their turn well within
+/// the connect's time limit
 pub(super) async fn staggered<T, F>(
     addresses: Vec<SocketAddr>,
     attempt: impl Fn(SocketAddr) -> F,
@@ -48,19 +50,20 @@ where
 
     let mut waiting = interleaved(addresses).into_iter();
     let mut attempts = futures::stream::FuturesUnordered::new();
-    let mut failed = None;
+    let mut failed = Vec::new();
     loop {
         match waiting.next() {
-            Some(address) => attempts.push(attempt(address)),
+            Some(address) => attempts.push(attempt(address).map(move |outcome| (address, outcome))),
             None if attempts.is_empty() => {
-                return Err(failed.unwrap_or_else(|| anyhow::anyhow!("no address to connect to")));
+                anyhow::ensure!(!failed.is_empty(), "no address to connect to");
+                anyhow::bail!("{}", failed.join("; "));
             }
             None => {}
         }
         tokio::select! {
-            Some(outcome) = attempts.next() => match outcome {
+            Some((address, outcome)) = attempts.next() => match outcome {
                 Ok(connected) => return Ok(connected),
-                Err(error) => failed = Some(error),
+                Err(error) => failed.push(format!("connect {address}: {error:#}")),
             },
             () = tokio::time::sleep(ATTEMPT_DELAY), if !waiting.as_slice().is_empty() => {}
         }
@@ -216,9 +219,9 @@ impl std::fmt::Display for ConnectFailed {
 
 impl std::error::Error for ConnectFailed {}
 
-/// 建一条连接最多花多久（解析名字、TCP 或 QUIC 握手、TLS 握手）/ The most a connect may take
-/// (resolving the name, the TCP or QUIC handshake, the TLS one)
-const CONNECT_BUDGET: Duration = Duration::from_secs(5);
+/// 建一条连接最多花多久（解析名字、TCP 或 QUIC 握手、TLS 握手），经 reqwest 的 DoH 也是 / The most a connect may
+/// take (resolving the name, the TCP or QUIC handshake, the TLS one), DoH through reqwest's too
+pub(super) const CONNECT_BUDGET: Duration = Duration::from_secs(5);
 /// 建连第一次失败以后退避多久 / How long to back off after a first failed connect
 pub(super) const CONNECT_BACKOFF: Duration = Duration::from_millis(250);
 /// 建连接连失败时退避最多多久 / The longest backing off after failed connects in a row

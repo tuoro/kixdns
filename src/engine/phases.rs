@@ -10,7 +10,7 @@ use crate::engine::response::extract_ttl;
 use crate::engine::response_log::{ResponseInfo, Source};
 use crate::engine::rules::{self, ResponseActionResult, ResponseContext};
 use crate::engine::types::{EngineInner, InflightEntry, InflightQuestion};
-use crate::engine::upstream::{UpstreamFailure, reject_failure_reply_on_refresh};
+use crate::engine::upstream::{UpstreamFailure, is_failure_reply, reject_failure_reply_on_refresh};
 use crate::engine::utils::{InflightCleanupGuard, set_id};
 use crate::matcher::{Requester, RuntimeResponseMatcherWithOp};
 use crate::observe::{CacheHit, CacheHitKind};
@@ -466,8 +466,7 @@ pub(crate) fn handle_static_decision(
         answers,
     );
     let ttl = route.static_ttl(super::response::least_ttl(answers));
-    route.cache(engine, request, &reply, rcode, None, ttl);
-    reply
+    route.cache(engine, request, reply, rcode, None, ttl)
 }
 
 /// 转发决定自己说的：问哪些上游、怎样问、回答检查做什么。请求本身见 `Request`，它沿着规则走到了哪里见 `Route`
@@ -598,7 +597,7 @@ impl<'a> Forwarding<'a> {
                 );
                 tracing::debug!(
                     ecs_mode = ?mode,
-                    modified = modified.len() != request.packet.len(),
+                    modified = matches!(modified, Cow::Owned(_)),
                     "ECS request rewriting applied / 已应用 ECS 请求改写"
                 );
                 (
@@ -994,8 +993,9 @@ impl<'a> Forwarding<'a> {
         };
         if actions.is_empty() {
             let ttl = ttl_to_cache(self.engine, ttl, request.state.pipeline.min_ttl());
-            self.route
-                .cache(self.engine, request, &raw, rcode, Some(upstream), ttl);
+            let raw = self
+                .route
+                .cache(self.engine, request, raw, rcode, Some(upstream), ttl);
             self.hand_over(&raw);
             return Ok(ForwardResult::Success(raw));
         }
@@ -1078,18 +1078,21 @@ impl<'a> Forwarding<'a> {
         ForwardResult::Success(answer)
     }
 
-    /// 执行 `actions`：带着回答检查看过的上游应答 `ctx`，或者上游失败以后不带，那时给出的结果是兜底（刷新到不了那里，
-    /// 见 [`Self::settle`]）。据应答给出的、continue 或跳转以后给出的，不论静态应答还是转发拿到的，都不比这一路上回答检查
-    /// 据过的哪份应答在缓存里留得久（见 `Route::answer_ttl`）。上游失败以后给出的静态应答是兜底，不缓存，此后规则给出的静态
+    /// 执行 `actions`：带着回答检查看过的上游应答 `ctx`，或者上游失败以后不带。回答检查看到的是失败应答（见
+    /// `upstream::is_failure_reply`）时和不带一样，算上游失败，那时给出的结果是兜底（刷新到不了那里，见 [`Self::settle`]、
+    /// [`Self::weigh`]）。据上游回答给出的、continue 或跳转以后给出的，不论静态应答还是转发拿到的，都不比这一路上回答检查
+    /// 据过的哪份回答在缓存里留得久（见 `Route::answer_ttl`）。上游失败以后给出的静态应答是兜底，不缓存，此后规则给出的静态
     /// 应答也都不缓存；转发拿到的照常缓存，故障期间备用上游的回答也是这个问题的回答（见 `Route::fell_back`）
     /// Run `actions`: with the upstream answer `ctx` the answer check read, or without one after
-    /// an upstream failure, when what they give is a fallback (a refresh never gets there, see
-    /// [`Self::settle`]). What is given by the answer, or after a continue or a jump on it, be
-    /// it a static answer or one a forward fetched, stays in the cache no longer than any answer
-    /// the checks on the way went by may (see `Route::answer_ttl`). A static answer given after
-    /// an upstream failure is a fallback and not cached, nor is any static answer the rules give
-    /// after it; one a forward fetches is cached as usual, a backup upstream's answer during the
-    /// failure answering the question all the same (see `Route::fell_back`)
+    /// an upstream failure. A failure reply the check read (see `upstream::is_failure_reply`)
+    /// counts as one without, an upstream failure, when what they give is a fallback (a refresh
+    /// never gets there, see [`Self::settle`], [`Self::weigh`]). What is given by an upstream
+    /// answer, or after a continue or a jump on it, be it a static answer or one a forward
+    /// fetched, stays in the cache no longer than any answer the checks on the way went by may
+    /// (see `Route::answer_ttl`). A static answer given after an upstream failure is a fallback
+    /// and not cached, nor is any static answer the rules give after it; one a forward fetches
+    /// is cached as usual, a backup upstream's answer during the failure answering the question
+    /// all the same (see `Route::fell_back`)
     async fn act(
         mut self,
         actions: &'a [Action],
@@ -1098,13 +1101,11 @@ impl<'a> Forwarding<'a> {
     ) -> anyhow::Result<ForwardResult> {
         let request = self.request;
         let min_ttl = request.state.pipeline.min_ttl();
-        match &ctx {
-            Some(ctx) => {
-                self.route
-                    .went_by(ttl_to_cache(self.engine, extract_ttl(&ctx.msg), min_ttl))
-            }
-            None => self.route.fell_back = true,
-        }
+        self.route.went_by(
+            ctx.as_ref()
+                .filter(|ctx| !is_failure_reply(ctx.msg.metadata.response_code))
+                .map(|ctx| ttl_to_cache(self.engine, extract_ttl(&ctx.msg), min_ttl)),
+        );
         let ctx = rules::ApplyResponseActionsContext {
             engine: self.engine,
             request,
@@ -1134,17 +1135,18 @@ impl<'a> Forwarding<'a> {
                 // reject_failure_reply_on_refresh)
                 // 响应动作转发拿到的应答（见 reject_failure_reply_on_refresh）
                 reject_failure_reply_on_refresh(request.refresh.is_some(), &ctx.raw)?;
-                self.route.cache(
+                let ttl = ttl_to_cache(self.engine, extract_ttl(&ctx.msg), min_ttl);
+                let raw = self.route.cache(
                     self.engine,
                     request,
-                    &ctx.raw,
+                    ctx.raw,
                     ctx.msg.metadata.response_code,
                     Some(ctx.upstream.clone()),
-                    ttl_to_cache(self.engine, extract_ttl(&ctx.msg), min_ttl),
+                    ttl,
                 );
-                self.hand_over(&ctx.raw);
+                self.hand_over(&raw);
                 response.upstream = Some(Source::Upstream(ctx.upstream));
-                Ok(ForwardResult::Success(ctx.raw))
+                Ok(ForwardResult::Success(raw))
             }
             ResponseActionResult::Static {
                 bytes, rcode, ttl, ..
@@ -1156,8 +1158,9 @@ impl<'a> Forwarding<'a> {
                 // `Route::fell_back`): the cache is shared by every requester, and cached it
                 // would go on serving after the upstream recovered, until the entry expired
                 let ttl = self.route.static_ttl(ttl);
-                self.route
-                    .cache(self.engine, request, &bytes, rcode, None, ttl);
+                let bytes = self
+                    .route
+                    .cache(self.engine, request, bytes, rcode, None, ttl);
                 self.hand_over(&bytes);
                 response.upstream = Some(Source::Static);
                 Ok(ForwardResult::Success(bytes))

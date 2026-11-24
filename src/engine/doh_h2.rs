@@ -41,11 +41,11 @@ pub(crate) type H2Sender = SendRequest<Bytes>;
 /// long, and a request sent on one would only wait for its timeout
 pub(crate) const DOH_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
-/// 连接的接收窗口，DoQ 的连接和经 reqwest 的 HTTP/2 也用它（见 `transport::doq_transport`、
+/// 连接的接收窗口，DoQ 的连接和经 reqwest 的 HTTP/2 也用它（见 `transport::doq::doq_transport`、
 /// `DohClient::build_client`）。每个流的窗口用协议默认的 64 KiB，正好装下最长的 DNS 消息；连接的窗口大得多，同时在途的
 /// 回答不用等窗口更新，又给一条连接上缓冲的字节封了顶。hyper 用 PING 估算带宽时延积再放大窗口，DNS 回答很小，用不着
 /// The connection's receive window, which DoQ connections and HTTP/2 through reqwest use too
-/// (see `transport::doq_transport` and `DohClient::build_client`). Each stream keeps the
+/// (see `transport::doq::doq_transport` and `DohClient::build_client`). Each stream keeps the
 /// protocol's default 64 KiB, which holds the longest DNS message; the connection's is much
 /// larger, so answers in flight together never wait for a window update, while it caps what one
 /// connection can have buffered. hyper widens its windows from PING-based bandwidth-delay

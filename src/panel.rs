@@ -190,12 +190,13 @@ struct ActiveConfig {
     /// Settings the current configuration changes that take a restart to apply (see
     /// `ConfigLoaded::restart_pending`)
     restart_pending: Vec<String>,
-    /// 启动时读的配置里、重载和面板保存会拒绝的写法（见 `config::problems`）。启动时照旧加载、各记一条 error，
-    /// 也经控制通道报出来，面板不用翻日志；重载成功说明新配置没有这样的写法，就清空
+    /// 启动时读的配置里、重载和面板保存会拒绝的写法（见 `config::problems`），每条截到 [`MAX_ERROR_LENGTH`]。启动时照旧
+    /// 加载、各记一条 error，也经控制通道报出来，面板不用翻日志；重载成功说明新配置没有这样的写法，就清空
     /// What the configuration read at startup writes that a reload or a save from the panel
-    /// refuses (see `config::problems`). Startup loads it as before and logs an error for each,
-    /// and they are reported over the control channel too, so the panel need not search the
-    /// log; a successful reload means the new configuration has none, and they are cleared
+    /// refuses (see `config::problems`), each cut to [`MAX_ERROR_LENGTH`]. Startup loads it as
+    /// before and logs an error for each, and they are reported over the control channel too, so
+    /// the panel need not search the log; a successful reload means the new configuration has
+    /// none, and they are cleared
     problems: Vec<String>,
     /// 配置文件为什么监视不了（见 `watcher::ConfigWatch`），监视着时为 None。监视不了时文件改了不会重载，面板保存的配置
     /// 也不生效，等不到重载序号变
@@ -209,9 +210,10 @@ struct ActiveConfig {
     /// None when it started or none is configured. The DoH settings are read at startup alone, and
     /// validation and reloads read no certificate, so it changes at the next start only
     doh_error: Option<String>,
-    /// 当前配置照样加载、值得知道的写法（见 `config::warnings`），每次生效换成那份配置的
+    /// 当前配置照样加载、值得知道的写法（见 `config::warnings`），每条截到 [`MAX_ERROR_LENGTH`]，每次生效换成那份配置的
     /// What the current configuration writes that loads all the same yet is worth knowing (see
-    /// `config::warnings`), replaced by those of each configuration as it takes effect
+    /// `config::warnings`), each cut to [`MAX_ERROR_LENGTH`], replaced by those of each
+    /// configuration as it takes effect
     warnings: Vec<String>,
 }
 
@@ -1004,7 +1006,7 @@ impl PanelMetrics {
             .iter()
             .map(|setting| setting.to_string())
             .collect();
-        active.warnings = config.warnings.to_vec();
+        active.warnings = clipped(config.warnings);
         if config.generation > 1 {
             active.problems.clear();
             self.reload_success.fetch_add(1, Ordering::Relaxed);
@@ -1139,10 +1141,11 @@ impl PanelMetrics {
         })
     }
 
-    /// 启动时读的配置有这些问题（见 `ActiveConfig::problems`）/ The configuration read at startup
-    /// has these problems (see `ActiveConfig::problems`)
-    pub fn startup_problems(&self, problems: Vec<String>) {
-        self.active_config.write().problems = problems;
+    /// 启动时读的配置有这些问题（见 `ActiveConfig::problems`），和重载被拒时一样每条截到 [`MAX_ERROR_LENGTH`]
+    /// The configuration read at startup has these problems (see `ActiveConfig::problems`), each
+    /// cut to [`MAX_ERROR_LENGTH`] as on a refused reload
+    pub fn startup_problems(&self, problems: &[String]) {
+        self.active_config.write().problems = clipped(problems);
     }
 
     /// 配置文件监视不了，因为 `error`（见 `ActiveConfig::watch_error`）/ The configuration file
@@ -1908,17 +1911,27 @@ pub async fn serve_admin(
 
     if let Ok(metadata) = std::fs::symlink_metadata(&path) {
         if !metadata.file_type().is_socket() {
-            anyhow::bail!("管理 Socket 路径已存在且不是 Socket：{}", path.display());
+            anyhow::bail!(
+                "control socket path {} exists and is not a socket",
+                path.display()
+            );
         }
-        std::fs::remove_file(&path).context("删除遗留管理 Socket 失败")?;
+        std::fs::remove_file(&path)
+            .with_context(|| format!("remove the stale control socket {}", path.display()))?;
     }
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).context("创建管理 Socket 目录失败")?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create the control socket directory {}", parent.display()))?;
     }
 
-    let listener = UnixListener::bind(&path).context("绑定管理 Socket 失败")?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660))
-        .context("设置管理 Socket 权限失败")?;
+    let listener = UnixListener::bind(&path)
+        .with_context(|| format!("bind the control socket {}", path.display()))?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660)).with_context(|| {
+        format!(
+            "set the permissions of the control socket {}",
+            path.display()
+        )
+    })?;
     tracing::info!(path = %path.display(), "panel control socket started");
 
     loop {
@@ -2744,7 +2757,7 @@ async fn validate_body(body: Bytes) -> Response<Full<Bytes>> {
                 "valid": true,
                 "pipeline_count": report.pipeline_count,
                 "rule_count": report.rule_count,
-                "warnings": report.warnings,
+                "warnings": clipped(&report.warnings),
             }),
         ),
         Ok(Err(rejection)) => respond(rejection),
@@ -2903,7 +2916,8 @@ fn truncate(value: &str, max_length: usize) -> String {
     value.chars().take(max_length).collect()
 }
 
-/// 配置的问题逐条截到 [`MAX_ERROR_LENGTH`] / A configuration's problems, each cut to [`MAX_ERROR_LENGTH`]
+/// 配置的问题或警告逐条截到 [`MAX_ERROR_LENGTH`] / A configuration's problems or warnings, each cut to
+/// [`MAX_ERROR_LENGTH`]
 fn clipped(problems: &[String]) -> Vec<String> {
     problems
         .iter()
@@ -5339,7 +5353,7 @@ mod diagnostic_tests {
         );
         assert_eq!(problems.len(), 1, "{problems:?}");
         let metrics = Arc::new(PanelMetrics::new(false));
-        metrics.startup_problems(problems.clone());
+        metrics.startup_problems(&problems);
         let mut fixed = raw.clone();
         fixed["settings"].as_object_mut().unwrap().remove("min_tll");
         let engine = engine_for(raw, Arc::clone(&metrics));
@@ -5351,6 +5365,40 @@ mod diagnostic_tests {
 
         engine.reload(runtime_for(fixed));
         assert_eq!(metrics.config_json()["problems"], serde_json::json!([]));
+    }
+
+    /// 启动时读的配置的问题、每份配置的警告和重载被拒时的问题一样，每条截到 [`super::MAX_ERROR_LENGTH`]：控制通道报的配置
+    /// 文字都一样长
+    /// The problems of the configuration read at startup and the warnings of each configuration
+    /// are each cut to [`super::MAX_ERROR_LENGTH`] as a refused reload's problems are, so every
+    /// configuration text the control channel reports is held to one length
+    #[test]
+    fn startup_problems_and_warnings_are_cut_as_reload_problems_are() {
+        use crate::observe::{ConfigLoaded, ConfigReloadFailed, EngineObserver};
+        let long = "x".repeat(super::MAX_ERROR_LENGTH + 1);
+        let long = std::slice::from_ref(&long);
+        let metrics = PanelMetrics::new(false);
+        metrics.startup_problems(long);
+        metrics.config_loaded(&ConfigLoaded {
+            path: None,
+            generation: 1,
+            source: None,
+            restart_pending: &[],
+            warnings: long,
+            pipelines: &[],
+            rules: &[],
+            upstreams: &[],
+        });
+        let cut = serde_json::json!(["x".repeat(super::MAX_ERROR_LENGTH)]);
+        let config = metrics.config_json();
+        assert_eq!(config["problems"], cut, "startup problems");
+        assert_eq!(config["warnings"], cut, "warnings");
+        metrics.config_reload_failed(&ConfigReloadFailed {
+            path: std::path::Path::new("pipeline.json"),
+            error: "refused",
+            problems: long,
+        });
+        assert_eq!(metrics.config_json()["last_reload"]["problems"], cut);
     }
 
     /// 控制通道的 config 报出配置文件为什么监视不了：那时改配置文件、面板保存都不会生效。监视着时为 null；这是进程的事，
@@ -5419,8 +5467,8 @@ mod diagnostic_tests {
             ] }]
         });
         let warnings = serde_json::json!([
-            "background_refresh_rule has no effect: a background refresh replays the original request through its own rules; the entry can be removed",
-            "settings.prefetch is no longer read and has no effect; the entry can be removed",
+            "background_refresh_rule: has no effect, as a background refresh replays the original request through its own rules; the entry can be removed",
+            "settings.prefetch: no longer read, so it has no effect; the entry can be removed",
             "settings.cache_capacity: 2000000 is very large and may take a lot of memory",
             "settings.request_timeout_ms: 3000 is under 2.5 times upstream_timeout_ms (2000), which may cut the resend and the TCP fallback short",
             "pipeline_select[0].matchers[0]: geoip_country with no country code never matches",
@@ -6441,6 +6489,45 @@ mod diagnostic_tests {
                 && step["decision"] == "jump"
                 && step["target"] == "fallback"),
             "{entry}"
+        );
+    }
+
+    /// 控制通道起不来时，错误和别的日志一样写英文，连着路径：路径上已经有不是 socket 的文件，或者它的目录建不出来
+    /// When the control socket cannot start, the error is in English as every other log is, with
+    /// the path: a file that is no socket already at the path, or a directory for it that cannot
+    /// be made
+    #[tokio::test]
+    async fn control_socket_errors_say_what_failed_and_where_in_english() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let serve = |path: std::path::PathBuf| {
+            let metrics = Arc::new(PanelMetrics::new(false));
+            let engine = engine_for(
+                json!({ "settings": { "default_upstream": "127.0.0.1:9" }, "pipelines": [] }),
+                Arc::clone(&metrics),
+            );
+            async move {
+                let error = super::serve_admin(path, engine, metrics)
+                    .await
+                    .expect_err("does not start");
+                format!("{error:#}")
+            }
+        };
+        let file = dir.path().join("panel.sock");
+        std::fs::write(&file, "not a socket").expect("write a file");
+        assert_eq!(
+            serve(file.clone()).await,
+            format!(
+                "control socket path {} exists and is not a socket",
+                file.display()
+            )
+        );
+        let error = serve(file.join("panel.sock")).await;
+        assert!(
+            error.starts_with(&format!(
+                "create the control socket directory {}: ",
+                file.display()
+            )),
+            "{error}"
         );
     }
 }

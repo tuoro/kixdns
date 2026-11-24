@@ -55,14 +55,15 @@ impl RequesterTest {
     fn hash_outcome<H: Hasher>(
         &self,
         requester: Requester,
-        geoip_manager: Option<&Arc<parking_lot::RwLock<geoip::GeoIpManager>>>,
+        geoip_manager: &parking_lot::RwLock<geoip::GeoIpManager>,
         hasher: &mut H,
     ) {
         match self {
             Self::InNet(net) => net.contains(&requester.address).hash(hasher),
             Self::Private => geoip::is_private_ip(requester.address).hash(hasher),
             Self::Country(codes) => geoip_manager
-                .is_some_and(|manager| manager.read().matches_any_tag(requester.address, codes))
+                .read()
+                .matches_any_tag(requester.address, codes)
                 .hash(hasher),
             Self::Edns => requester.edns.hash(hasher),
             Self::Subnet {
@@ -121,7 +122,7 @@ impl RequesterScope {
     pub fn key(
         &self,
         requester: Requester,
-        geoip_manager: Option<&Arc<parking_lot::RwLock<geoip::GeoIpManager>>>,
+        geoip_manager: &parking_lot::RwLock<geoip::GeoIpManager>,
     ) -> RequesterKey {
         let judge = |subnets: bool| {
             let mut tests = self

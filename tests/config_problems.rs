@@ -156,7 +156,7 @@ fn a_background_refresh_rule_only_warns_at_startup_and_on_reload() {
     let warnings = || {
         std::fs::read_to_string(&log)
             .unwrap()
-            .matches("background_refresh_rule has no effect")
+            .matches("background_refresh_rule: has no effect")
             .count()
     };
     assert_eq!(warnings(), 1, "startup warns once");

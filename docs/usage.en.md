@@ -66,6 +66,8 @@ The logging subscriber is text formatted by default. Without journald (a termina
 
 When a DoH upstream answers 429 Too Many Requests, one warning is logged as its pause starts, naming the upstream, the seconds and whether Retry-After set them (see the configuration document); further 429s during the pause, and the forwards that leave it out meanwhile, log at debug level only.
 
+Warnings that every query or packet may run into, such as an upstream failing, a request timing out, a jump past the limit, an upstream answer that does not answer the query or an inbound DoH TLS handshake failing, are logged once in 10 seconds per place, the rest only counted: each carries a `skipped` field, how many went unlogged at that place since the one before, 0 meaning none were missed. Where a warning names an upstream (an upstream failing, an upstream answer that does not answer the query), each upstream counts on its own, so one that stays down keeps the failures of no other from showing. When the log level does not reach warn (the default error, say), these warnings are neither logged nor counted.
+
 For response statistics, enable `RUST_LOG=warn,kixdns::engine::phases=info`.
 `event="dns_response"` records one answer produced by the engine,
 including fast-path, fresh/stale cache, static and singleflight answers. It is

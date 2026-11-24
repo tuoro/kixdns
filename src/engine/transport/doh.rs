@@ -5,7 +5,7 @@
 //! pool, and a 429 pauses the upstream
 
 use super::address::build_doh_url;
-use super::connect::{KEEPALIVE_INTERVAL, KEEPALIVE_TIME, build_tls_client_config};
+use super::connect::{CONNECT_BUDGET, KEEPALIVE_INTERVAL, KEEPALIVE_TIME, build_tls_client_config};
 use super::{MAX_DNS_MESSAGE_SIZE, retry_budget};
 use crate::engine::bootstrap::{Bootstrap, Resolver};
 use crate::engine::doh_h2::{self, H2Link};
@@ -375,6 +375,13 @@ impl DohClient {
             // DoH 服务器没有理由跳转，跟着跳可能把查询发到别处，包括明文 HTTP；3xx 和别的非成功状态一样算失败
             .redirect(reqwest::redirect::Policy::none())
             .dns_resolver(Arc::new(self.resolver.clone()))
+            // 建连和直连一样最多 CONNECT_BUDGET（解析名字、TCP 和 TLS 握手都算）：握手卡住的到时报建连错误，算没连上，
+            // 不当成在建好的连接上超时（见 [`is_transport_error`]）
+            // A connect takes CONNECT_BUDGET at most as a direct one does (resolving the name and
+            // the TCP and TLS handshakes all count): a handshake stuck reports a connect error by
+            // then, which is no connection, not a timeout on a connection made (see
+            // [`is_transport_error`])
+            .connect_timeout(CONNECT_BUDGET)
             // HTTP/2 的窗口和直连的一样，理由见 `doh_h2::CONNECTION_WINDOW` / The HTTP/2 windows of the
             // direct connection, for the reasons given at `doh_h2::CONNECTION_WINDOW`
             .http2_initial_stream_window_size(MAX_DNS_MESSAGE_SIZE as u32)
@@ -603,14 +610,17 @@ impl DohClient {
 
     /// 问一次，最多 `timeout_dur`：握手时选了 h2 的上游先等直连的连接，再在上面发请求、读回答；别的经 reqwest。等连接用掉的
     /// 时间算在这一次里，等不到算没连上（见 [`DohNotConnected`]）：握手慢说明不了哪条建好的连接坏了。连上以后请求本身超时
-    /// 才是传输错误，可以重试（见 [`is_transport_error`]）；正文迟迟不来也算在这个时限里
+    /// 才是传输错误，可以重试（见 [`is_transport_error`]）；正文迟迟不来也算在这个时限里。经 reqwest 的看不到建连和请求
+    /// 的分界：建连到 [`CONNECT_BUDGET`] 报建连错误，算没连上，比它短的时限在建连时到了只能算超时
     /// Asks once, within `timeout_dur`: an upstream that picked h2 first waits for its direct
     /// connection, then sends the request on it and reads the answer; any other goes through
     /// reqwest. The wait for the connection counts against this one budget, and running out there
     /// is no connection (see [`DohNotConnected`]): a slow handshake says nothing of a connection
     /// made being broken. Once connected, the request itself timing out is a transport error,
     /// open to a retry (see [`is_transport_error`]); a body slow to come counts against the same
-    /// limit
+    /// limit. Through reqwest the line between connecting and the request is not seen: a connect
+    /// reports a connect error at [`CONNECT_BUDGET`], which is no connection, while a limit
+    /// shorter than that running out during the connect can only be a timeout
     async fn send_once(
         &self,
         state: &DohUpstream,

@@ -150,6 +150,43 @@ async fn a_log_written_before_the_forwards_logs_every_query() {
     assert_eq!(logged, 2);
 }
 
+/// log 动作的那条日志说是哪个 Pipeline 的规则、问的什么类型，请求阶段和回答阶段的 log 都一样
+/// A log action's line says which pipeline the rule is in and what type is asked, in the
+/// request phase and the answer phase alike
+#[tokio::test]
+async fn a_log_names_the_pipeline_and_the_query_type() {
+    let (warnings, _guard) = Warnings::capture();
+    let upstream = answering_upstream(UPSTREAM, 60).await;
+    let engine = engine_from(json!({
+        "settings": counting_settings(json!({})),
+        "pipelines": [{ "id": "main", "rules": [{
+            "name": "all", "matchers": [{ "type": "any" }],
+            "actions": [
+                { "type": "log", "level": "warn" },
+                { "type": "forward", "upstream": upstream.address }
+            ],
+            "response_matchers": [{ "type": "response_rcode", "value": "NOERROR" }],
+            "response_actions_on_match": [{ "type": "log", "level": "warn" }, { "type": "allow" }]
+        }]}]
+    }));
+    assert_eq!(
+        first_a(&ask(&engine, &query(), peer()).await),
+        Some(UPSTREAM)
+    );
+    let logged: Vec<String> = warnings
+        .lines()
+        .into_iter()
+        .filter(|line| line.contains("matcher_log"))
+        .collect();
+    assert_eq!(logged.len(), 2, "{logged:#?}");
+    for line in &logged {
+        assert!(
+            line.contains(" pipeline=main ") && line.contains(" qtype=A "),
+            "{line}"
+        );
+    }
+}
+
 /// continue 以后从被越过的规则的下一条接着走：写在前面、不作决定的规则不再执行一遍，它的 log 一个查询只记一次，不论后面
 /// continue 了几次
 /// After a continue evaluation resumes at the rule after the one continued past: a rule written

@@ -226,14 +226,18 @@ impl Through {
 
     /// `server` 对 `query` 答的地址和各自的 TTL。一份查询过了这次问的时限（[`ASK_BUDGET`]）的三分之一还没有回答就再发
     /// 一份，和还没答过的上游一样（见 `upstream::hedge_timeout`）；前面发的照样等着，谁的回答先到用谁的（见
-    /// [`UdpExchange`]）：丢了一个包的查询不用等满整个时限。一份发不出去也不让这次问失败，记下来，到了时候照样再发，和 UDP
-    /// 转发一样（见 `upstream::forward_udp_smart`）
+    /// [`UdpExchange`]）：丢了一个包的查询不用等满整个时限。一份发不出去也不让这次问失败，记下来，到了再发的时候照样再发，
+    /// 直到时限。UDP 转发（见 `upstream::forward_udp_smart`）不一样：它一共只发两份，第一份发不出去就马上发第二份；这里
+    /// 一直按间隔再发，发不出去时马上再发只会空转
     /// The addresses `server` answers `query` with, and their TTLs. A copy left unanswered for a
     /// third of the asking's time limit ([`ASK_BUDGET`]) has another sent, as for an upstream yet to
     /// answer (see `upstream::hedge_timeout`); the earlier ones are still waited for, the first
     /// reply to come being used (see [`UdpExchange`]): a query with a packet lost does not wait
     /// out the whole limit. Nor does a copy that cannot be sent fail the asking: it is logged, and
-    /// another goes when the time comes, as UDP forwarding does (see `upstream::forward_udp_smart`)
+    /// another goes when the time to send again comes, up to the time limit. UDP forwarding (see
+    /// `upstream::forward_udp_smart`) differs: it sends two copies in all, the second at once when
+    /// the first cannot be sent; here copies keep going at the interval, and sending again at once
+    /// while sending fails would only spin
     async fn records(&self, server: &str, query: &[u8]) -> anyhow::Result<Vec<(IpAddr, u32)>> {
         let resend_after = super::upstream::hedge_timeout(ASK_BUDGET);
         let mut exchange = UdpExchange::new(&self.udp, query, server);

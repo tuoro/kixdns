@@ -10,7 +10,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
-use hickory_proto::op::{Message, MessageType, OpCode};
+use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
 use hickory_proto::rr::rdata::{A, AAAA};
 use hickory_proto::rr::{RData, Record, RecordType};
 use hickory_proto::serialize::binary::BinDecodable;
@@ -171,6 +171,19 @@ fn answer_of(query: &Message, address: Ipv4Addr, ttl: u32) -> Replies {
         RData::A(A(address)),
     ));
     vec![(Duration::ZERO, reply.to_vec().unwrap())]
+}
+
+/// 对每个查询都回 `rcode`、不带答案的本机上游 / A local upstream answering every query with
+/// `rcode` and no answers
+pub(crate) async fn answering_rcode(rcode: ResponseCode) -> Upstream {
+    upstream(move |query| {
+        let mut reply = Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
+        reply.metadata.recursion_desired = query.metadata.recursion_desired;
+        reply.metadata.response_code = rcode;
+        reply.add_queries(query.queries.iter().cloned());
+        vec![(Duration::ZERO, reply.to_vec().unwrap())]
+    })
+    .await
 }
 
 /// 本机的 bootstrap 服务器：不管问的是什么名字，A 回 127.0.0.1，AAAA 回 ::1，TTL 都是 `ttl`
