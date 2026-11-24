@@ -265,26 +265,20 @@ impl Engine {
         source: Option<&str>,
     ) {
         let pool_keys = super::upstream::pool_keys(&new_cfg);
-        let mut inner = EngineInner::new(new_cfg);
+        let inner = EngineInner::new(new_cfg);
         // Store, generation and event stay together under the reload lock, so
         // the reported generation is the one this reload allocated.
         // 存储、代数与事件在重载锁内一起完成，事件中的代数就是本次分配的值。
         let mut geo_sources = self.reload_lock.lock();
-        // Geo 数据先跟上新配置，新规则一生效就能用上新的标签和文件
-        // The Geo data follows the new configuration first, so the new rules
-        // find the new tags and files from their first query
-        geo_sources.follow(&inner.pipeline, &self.geosite_manager, &self.geoip_manager);
         // serve_stale 重载即生效，能续用多久决定了应答过了 TTL 还留多久
         // serve_stale takes effect on reload, and how long an answer may be served stale
         // decides how long it stays past its TTL
         self.cache
             .set_kept(super::phases::kept_past_ttl(&inner.pipeline.settings));
-        // 按 Geo 数据现在的代数存。监视线程这时换了数据、改了状态，rcu 就重来一遍，用上新的代数
-        // Stored at the Geo data's generation now. When a watcher swaps data and changes
-        // the state meanwhile, rcu starts over and takes the new generation
-        inner.set_geo(geo_sources.generation());
-        let inner = Arc::new(inner);
-        self.state.rcu(|_| inner.at_geo(geo_sources.generation()));
+        // 新配置连同它要的 Geo 数据一起存进状态，新规则从第一个请求起就用新的标签和文件
+        // The new configuration goes into the state with the Geo data it needs, so the new
+        // rules find the new tags and files from their first query
+        geo_sources.follow(inner);
         let generation = self.config_generation.fetch_add(1, Ordering::Relaxed) + 1;
         self.report_config_loaded(generation, path, source);
         // 新配置不再用到的上游，连接池就此丢掉。此前它们一直留到重启：TCP 和 DoT 连接开着，
@@ -639,9 +633,11 @@ impl Engine {
         let qclass = DNSClass::from(q.qclass);
         let qtype = hickory_proto::rr::RecordType::from(q.qtype);
         let qname_str = q.qname;
-        // 选 pipeline、求值规则都看这一份，GeoIP、GeoSite 数据和完整路径一样读（见 `RuntimeRule::matchers`）
-        // Choosing the pipeline and evaluating the rules both look at this one, reading the GeoIP
-        // and GeoSite data as the full path does (see `RuntimeRule::matchers`)
+        // 选 pipeline、算键、求值规则都看这一份，GeoIP、GeoSite 数据也是它带着的那份（见 `EngineInner::geo`），交给完整
+        // 路径的也是它
+        // Choosing the pipeline, working out the keys and evaluating the rules all look at this
+        // one, the GeoIP and GeoSite data being the copy it carries (see `EngineInner::geo`), and
+        // this one goes on to the full path too
         let facts = crate::matcher::RequestFacts {
             qname: qname_str,
             qtype,
@@ -649,7 +645,7 @@ impl Engine {
             client_ip: peer.ip(),
             edns_present: q.edns_present,
         };
-        let pipeline_opt = self.pick_pipeline(cfg, &facts);
+        let pipeline_opt = self.pick_pipeline(&state, &facts);
 
         let name_of = |pipeline: Option<&crate::matcher::RuntimePipeline>| {
             pipeline.map_or_else(|| Arc::from(NO_PIPELINE), |pipeline| pipeline.id.clone())
@@ -724,7 +720,7 @@ impl Engine {
                 qclass,
                 flags: q.flags,
                 requester: pipeline.map_or(RequesterKey::NONE, |p| {
-                    p.requester.key(requester, &self.geoip_manager)
+                    p.requester.key(requester, &state.geo.geoip)
                 }),
                 client_ecs: q.client_subnet,
             }
@@ -880,9 +876,8 @@ impl Engine {
             // 2. Check Rule Cache (L1): the rule cache comes first, as on the full path (see
             // `apply_rules`), and a decision kept there needs no rules evaluated. The fast path
             // used to evaluate the compiled rules first, for nothing when a forward was kept
-            let cached = pipeline.and_then(|p| {
-                self.cached_decision(&self.rule_question(cache_namespace, p, &facts), start)
-            });
+            let cached = pipeline
+                .and_then(|p| self.cached_decision(&Self::rule_question(&state, p, &facts), start));
             let (next, hop) = if let Some(record) = cached {
                 match &record.entry.decision {
                     Decision::Static { rcode, answers } => {
@@ -905,7 +900,7 @@ impl Engine {
                 // 3. 规则：第一条命中的规则当场作出的决定
                 // 3. The rules: what the first rule matching decides on the spot
                 let matched =
-                    pipeline.and_then(|pipeline| fast_static_match(pipeline, &facts, self.geo()));
+                    pipeline.and_then(|pipeline| fast_static_match(pipeline, &facts, &state.geo));
                 match matched {
                     Some((PrecomputedAction::Jump(target), rule)) => (
                         cfg.pipeline(target),
@@ -986,7 +981,7 @@ impl Engine {
         peer: SocketAddr,
     ) -> Result<Bytes, UnreadableQuery> {
         let state = self.state.load_full();
-        let head = self.read_request(packet, client_address(peer).ip(), &state.pipeline)?;
+        let head = self.read_request(packet, client_address(peer).ip(), &state)?;
         Ok(self
             .handle_packet_full(packet, peer, PreParsedData { head, state })
             .await)
@@ -1042,7 +1037,7 @@ impl Engine {
         target: RefreshTarget,
         state: Arc<EngineInner>,
     ) -> anyhow::Result<Bytes> {
-        let head = self.read_request(packet, client_address(peer).ip(), &state.pipeline)?;
+        let head = self.read_request(packet, client_address(peer).ip(), &state)?;
         let answered = self
             .answer(packet, peer, &state, &head, Some(&target))
             .await;
@@ -1229,7 +1224,7 @@ impl Engine {
             ..head.request(state, packet, peer, client_ecs, start)
         };
         let pipeline = state.pipeline.pipeline(&head.pipeline_id);
-        let mut route = Route::new(self, &request, &head.pipeline_id, pipeline);
+        let mut route = Route::new(&request, &head.pipeline_id, pipeline);
         let result = self
             .decide(&request, pipeline, &mut route, &mut journal.log.info)
             .await;
@@ -1275,7 +1270,7 @@ impl Engine {
         &self,
         packet: &[u8],
         client: IpAddr,
-        cfg: &RuntimePipelineConfig,
+        state: &EngineInner,
     ) -> Result<RequestHead, UnreadableQuery> {
         let pipeline_of = |head: (&str, RecordType, DNSClass, bool)| {
             let (qname, qtype, qclass, edns_present) = head;
@@ -1286,7 +1281,7 @@ impl Engine {
                 client_ip: client,
                 edns_present,
             };
-            self.pick_pipeline(cfg, &facts)
+            self.pick_pipeline(state, &facts)
                 .map_or_else(|| Arc::from(NO_PIPELINE), |pipeline| pipeline.id.clone())
         };
         let mut qname_buf = [0u8; 256];
@@ -1323,15 +1318,16 @@ impl Engine {
         })
     }
 
-    /// `cfg` 为请求 `facts` 选的 pipeline（见 [`select_pipeline`]），快速路径和完整路径都从这里选
-    /// The pipeline `cfg` picks for request `facts` (see [`select_pipeline`]), the fast path and
-    /// the full path both picking here
+    /// 状态 `state` 的配置按它的 Geo 数据为请求 `facts` 选的 pipeline（见 [`select_pipeline`]），快速路径和完整路径
+    /// 都从这里选
+    /// The pipeline the configuration of state `state` picks for request `facts` by its Geo data
+    /// (see [`select_pipeline`]), the fast path and the full path both picking here
     fn pick_pipeline<'a>(
         &self,
-        cfg: &'a RuntimePipelineConfig,
+        state: &'a EngineInner,
         facts: &crate::matcher::RequestFacts<'_>,
     ) -> Option<&'a crate::matcher::RuntimePipeline> {
-        select_pipeline(cfg, &self.listener_label, facts, self.geo())
+        select_pipeline(&state.pipeline, &self.listener_label, facts, &state.geo)
     }
 
     /// 决定怎么回答 `request`：不支持的 EDNS 版本回 BADVERS；查缓存；然后沿着规则走（跳转、continue、静态应答、转发），
@@ -1442,7 +1438,7 @@ impl Engine {
                     // target looks up, so a target answering by who is asking is looked up as well.
                     // Once an answer check has gone by an upstream's answer (a jump after a continue)
                     // the keys stay, and the lookup under them has missed already
-                    if route.enter(self, request, p)
+                    if route.enter(request, p)
                         && !background_refresh
                         && let Some(answer) = self
                             .answer_from_cache(
@@ -1866,14 +1862,9 @@ impl Request<'_> {
     /// 这个请求在 id 为 `id` 的 pipeline（`pipeline` 是它，选不到时为 None）下的键：按它的规则分辨请求方
     /// This request's keys under the pipeline of id `id` (`pipeline` being it, None when none was
     /// picked): requesters told apart by its rules
-    fn keys(
-        &self,
-        engine: &Engine,
-        id: &str,
-        pipeline: Option<&crate::matcher::RuntimePipeline>,
-    ) -> CacheKeys {
+    fn keys(&self, id: &str, pipeline: Option<&crate::matcher::RuntimePipeline>) -> CacheKeys {
         let requester = pipeline.map_or(RequesterKey::NONE, |p| {
-            p.requester.key(self.requester, &engine.geoip_manager)
+            p.requester.key(self.requester, &self.state.geo.geoip)
         });
         self.question(id, self.state.cache_namespace(id), requester)
             .keys()
@@ -2042,7 +2033,6 @@ impl Route {
     /// 从选中的 `pipeline_id` 出发（`pipeline` 是它，选不到时为 None）
     /// Starting from the picked `pipeline_id` (`pipeline` being it, None when none was picked)
     fn new(
-        engine: &Engine,
         request: &Request<'_>,
         pipeline_id: &Arc<str>,
         pipeline: Option<&crate::matcher::RuntimePipeline>,
@@ -2050,7 +2040,7 @@ impl Route {
         Self {
             pipeline: Arc::clone(pipeline_id),
             key_pipeline: Arc::clone(pipeline_id),
-            keys: request.keys(engine, pipeline_id, pipeline),
+            keys: request.keys(pipeline_id, pipeline),
             resume_at: 0,
             reused_response: None,
             jumped: None,
@@ -2081,12 +2071,7 @@ impl Route {
     /// `RuntimePipeline::answered_through`). No forward is done before any answer has been gone
     /// by (a forward either answers or goes on through an answer check), so a change of keys
     /// finds no trail or bound to clear
-    fn enter(
-        &mut self,
-        engine: &Engine,
-        request: &Request<'_>,
-        p: &crate::matcher::RuntimePipeline,
-    ) -> bool {
+    fn enter(&mut self, request: &Request<'_>, p: &crate::matcher::RuntimePipeline) -> bool {
         self.pipeline = p.id.clone();
         self.resume_at = 0;
         // 留着复用的应答属于取到它的那个 pipeline：那边的转发、按那边的 ECS 拿到的，这里的 allow 不拿它
@@ -2098,7 +2083,7 @@ impl Route {
         }
         self.key_pipeline = p.id.clone();
         // The keys follow the pipeline / 键随 pipeline 改变
-        self.keys = request.keys(engine, &p.id, Some(p));
+        self.keys = request.keys(&p.id, Some(p));
         true
     }
 
@@ -2598,7 +2583,7 @@ mod tests {
         engine.reload(jump_config(&upstream.address, "192.0.2.2"));
         let pre_parsed = PreParsedData {
             head: engine
-                .read_request(&request, peer.ip(), &old_state.pipeline)
+                .read_request(&request, peer.ip(), &old_state)
                 .expect("a query"),
             state: old_state,
         };
@@ -6707,6 +6692,16 @@ mod tests {
             r#"{"entries":[{"country_code":"JP","ips":["198.51.100.0/24"]}]}"#,
         )
         .expect("write geoip");
+        let mut geoip_data = crate::matcher::geoip::GeoIpManager::default();
+        geoip_data.load_from_v2ray_file(&geoip).expect("load geoip");
+        let mut geosite_data = crate::matcher::geosite::GeoSiteManager::default();
+        geosite_data
+            .load_from_v2ray_string(r#"{"entries":[{"tag":"cn","domains":["domain:example.cn"]}]}"#)
+            .expect("load geosite");
+        let data = crate::matcher::GeoManagers {
+            geoip: Arc::new(geoip_data),
+            geosite: Arc::new(geosite_data),
+        };
 
         let mut disagreements = Vec::new();
         for rules in &rule_sets {
@@ -6715,18 +6710,7 @@ mod tests {
                 "pipelines": [{ "id": "main", "rules": rules }]
             });
             let engine = engine_from(raw);
-            engine
-                .geoip_manager
-                .write()
-                .load_from_v2ray_file(&geoip)
-                .expect("load geoip");
-            engine
-                .geosite_manager
-                .write()
-                .load_from_v2ray_string(
-                    r#"{"entries":[{"tag":"cn","domains":["domain:example.cn"]}]}"#,
-                )
-                .expect("load geosite");
+            engine.change_geo(|geo| *geo = data.clone());
             let state = engine.state.load_full();
             let pipeline = &state.pipeline.pipelines[0];
 
@@ -6744,7 +6728,7 @@ mod tests {
                         &facts,
                         &RuleEvaluationContext::new(0, true),
                     );
-                    let fast = fast_static_match(pipeline, &facts, engine.geo());
+                    let fast = fast_static_match(pipeline, &facts, &state.geo);
                     let agrees = match (&fast, &full) {
                         // 快速路径只把转发交出去 / The fast path hands on forwards only
                         (None, full) => !matches!(full, Decision::Static { .. }),

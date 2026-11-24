@@ -163,7 +163,7 @@ async fn a_geosite_tag_first_used_after_a_reload_is_loaded() {
     assert_eq!(ask(&engine, "x.ads.test").await, Some(MATCHED));
     assert_eq!(ask(&engine, "x.cn.test").await, Some(OTHER));
     assert!(
-        !engine.geosite_manager.read().has_tag("cn"),
+        !engine.geo().geosite.has_tag("cn"),
         "a tag no longer used must not stay loaded"
     );
 }
@@ -255,13 +255,12 @@ async fn after_a_reload_the_watch_follows_the_new_file() {
     // the new file's change is read in, the old file's has been handled
     replace(&old, &geosite_dat(&[("ads", "old-again.test")]));
     replace(&new, &geosite_dat(&[("ads", "new-again.test")]));
-    let manager = &engine.geosite_manager;
     wait_for("the watch must read the new file's change", || {
-        manager.read().matches("ads", "www.new-again.test")
+        engine.geo().geosite.matches("ads", "www.new-again.test")
     })
     .await;
     assert!(
-        !manager.read().matches("ads", "www.old-again.test"),
+        !engine.geo().geosite.matches("ads", "www.old-again.test"),
         "the old file must no longer be watched"
     );
 }
@@ -282,9 +281,8 @@ async fn the_watch_reloading_json_keeps_the_tags_a_dat_file_provides() {
     .unwrap();
 
     let engine = engine(geosite_config_any_of(&[&dat, &json], &["cn", "ads"]));
-    let manager = &engine.geosite_manager;
-    assert!(manager.read().matches("cn", "www.baidu.com"));
-    assert!(manager.read().matches("ads", "before.example"));
+    assert!(engine.geo().geosite.matches("cn", "www.baidu.com"));
+    assert!(engine.geo().geosite.matches("ads", "before.example"));
 
     std::fs::write(
         &json,
@@ -292,11 +290,11 @@ async fn the_watch_reloading_json_keeps_the_tags_a_dat_file_provides() {
     )
     .unwrap();
     wait_for("the watch must read the changed JSON file", || {
-        manager.read().matches("ads", "after.example")
+        engine.geo().geosite.matches("ads", "after.example")
     })
     .await;
     assert!(
-        manager.read().matches("cn", "www.baidu.com"),
+        engine.geo().geosite.matches("cn", "www.baidu.com"),
         "reading the JSON file again must not take the .dat file's tags with it"
     );
 }
@@ -325,17 +323,18 @@ async fn after_a_reload_the_geoip_watch_follows_the_new_file() {
 
     replace(&old, network("203.0.113.0/24").as_bytes());
     replace(&new, network("192.0.2.0/24").as_bytes());
-    let manager = &engine.geoip_manager;
     let tags: [Arc<str>; 1] = [Arc::from("TESTNET")];
     wait_for("the watch must read the new file's change", || {
-        manager
-            .read()
+        engine
+            .geo()
+            .geoip
             .matches_any_tag("192.0.2.1".parse().unwrap(), &tags)
     })
     .await;
     assert!(
-        !manager
-            .read()
+        !engine
+            .geo()
+            .geoip
             .matches_any_tag("203.0.113.1".parse().unwrap(), &tags),
         "the old file must no longer be watched"
     );
@@ -360,12 +359,12 @@ async fn only_the_geoip_tags_rules_use_are_loaded() {
     let rule = |codes: &[&str]| json!({ "type": "geoip_country", "country_codes": codes });
 
     let engine = engine(config(settings.clone(), rule(&["testnet"])));
-    assert_eq!(engine.geoip_manager.read().ip_range_count(), 1);
+    assert_eq!(engine.geo().geoip.ip_range_count(), 1);
     let other: SocketAddr = "203.0.113.7:53000".parse().unwrap();
     assert_eq!(ask_from(&engine, "a.test", other).await, Some(OTHER));
 
     engine.reload(config(settings, rule(&["TESTNET", "OTHERNET"])));
-    assert_eq!(engine.geoip_manager.read().ip_range_count(), 2);
+    assert_eq!(engine.geo().geoip.ip_range_count(), 2);
     assert_eq!(ask_from(&engine, "b.test", other).await, Some(MATCHED));
 }
 
@@ -404,7 +403,7 @@ async fn the_mmdb_answers_country_codes_and_the_data_file_named_tags() {
 
     let engine = engine(config(settings.clone(), rule(&["US", "TESTNET"])));
     {
-        let manager = engine.geoip_manager.read();
+        let manager = engine.geo().geoip;
         assert!(manager.has_mmdb());
         assert_eq!(
             manager.ip_range_count(),
@@ -417,7 +416,7 @@ async fn the_mmdb_answers_country_codes_and_the_data_file_named_tags() {
 
     engine.reload(config(settings.clone(), rule(&["US"])));
     {
-        let manager = engine.geoip_manager.read();
+        let manager = engine.geo().geoip;
         assert!(manager.has_mmdb());
         assert_eq!(
             manager.ip_range_count(),
@@ -429,7 +428,7 @@ async fn the_mmdb_answers_country_codes_and_the_data_file_named_tags() {
 
     engine.reload(config(settings, rule(&["TESTNET"])));
     {
-        let manager = engine.geoip_manager.read();
+        let manager = engine.geo().geoip;
         assert!(!manager.has_mmdb(), "the MMDB must not be read");
         assert_eq!(manager.ip_range_count(), 1);
     }
@@ -480,12 +479,12 @@ async fn a_hot_reload_reads_an_mmdb_replaced_in_place() {
     assert_eq!(ask_from(&engine, "after.test", client).await, Some(MATCHED));
 }
 
-/// 存在却读不了的 MMDB，文件不换就不再读：别的配置改了的热重载不动 GeoIP 数据的指纹，用到它的 pipeline 留着缓存；换成读得
+/// 存在却读不了的 MMDB，文件不换就不再读：别的配置改了的热重载不动 GeoIP 数据，用到它的 pipeline 留着缓存；换成读得
 /// 了的，下一次热重载就读进来。在用的库被换成读不了的，那一次热重载读它、留着在用的，之后也不再读。以前读不了的和不存在的
 /// 一样记成缺着的，文件又在，每次热重载都重读一遍、换一代，等于清掉这些 pipeline 的缓存
 /// An MMDB that is there yet cannot be read is not read again until the file changes: a hot
-/// reload changing other parts of the configuration leaves the GeoIP data's fingerprints, and
-/// the caches of the pipelines using it, alone; once it is replaced by a readable one, the next
+/// reload changing other parts of the configuration leaves the GeoIP data, and the caches of
+/// the pipelines using it, alone; once it is replaced by a readable one, the next
 /// hot reload reads it in. When the database in use is replaced by an unreadable one, that one
 /// hot reload reads it and keeps the database in use, and later ones do not read it again. An
 /// unreadable file used to count as missing, as a file not there does, and being there it was
@@ -505,29 +504,35 @@ async fn an_unreadable_mmdb_is_read_again_only_once_it_changes() {
         cfg.settings.default_upstream = upstream.to_string();
         cfg
     };
-    let generation = |engine: &Engine| engine.reload_lock.lock().generation();
+    // 状态里的 GeoIP 数据，读了一遍就是新的一份 / The GeoIP data in the state, a new one for every read
+    let geoip = |engine: &Engine| engine.geo().geoip;
     let client: SocketAddr = "198.51.100.7:53000".parse().unwrap();
     let engine = engine(cfg("127.0.0.1:9"));
-    let unreadable = generation(&engine);
+    let unreadable = geoip(&engine);
     for upstream in ["127.0.0.1:10", "127.0.0.1:11"] {
         engine.reload(cfg(upstream));
-        assert_eq!(generation(&engine), unreadable, "an unrelated reload");
+        assert!(
+            Arc::ptr_eq(&geoip(&engine), &unreadable),
+            "an unrelated reload"
+        );
     }
 
     let entries = r#"{"entries":[{"country_code":"JP","ips":["198.51.100.0/24"]}]}"#;
     std::fs::write(&source, entries).unwrap();
     crate::matcher::geoip_converter::convert_dat_to_mmdb(&source, &mmdb, None).unwrap();
     engine.reload(cfg("127.0.0.1:9"));
-    assert_ne!(generation(&engine), unreadable, "a readable database");
+    assert!(
+        !Arc::ptr_eq(&geoip(&engine), &unreadable),
+        "a readable database"
+    );
     assert_eq!(ask_from(&engine, "a.test", client).await, Some(MATCHED));
 
     replace(&mmdb, b"broken again");
     engine.reload(cfg("127.0.0.1:10"));
-    let broken = generation(&engine);
+    let broken = geoip(&engine);
     engine.reload(cfg("127.0.0.1:11"));
-    assert_eq!(
-        generation(&engine),
-        broken,
+    assert!(
+        Arc::ptr_eq(&geoip(&engine), &broken),
         "the broken file is not read again"
     );
     assert_eq!(
@@ -609,12 +614,11 @@ async fn an_empty_geosite_file_keeps_the_tags_in_use() {
     // 文件再写好时照常读进来，那句话跟着去掉 / A good file written again is read in as usual,
     // and the sentence goes
     replace(&path, &geosite_dat(&[("testa", "geo2.test")]));
-    let manager = &engine.geosite_manager;
     wait_for("the good file must be read", || {
-        manager.read().matches("testa", "x.geo2.test")
+        engine.geo().geosite.matches("testa", "x.geo2.test")
     })
     .await;
-    assert!(!manager.read().matches("testa", "x.geo.test"));
+    assert!(!engine.geo().geosite.matches("testa", "x.geo.test"));
     assert_eq!(engine.geo_data_warnings(), Vec::<String>::new());
 }
 
@@ -637,15 +641,14 @@ async fn an_emptied_geosite_file_hands_a_shared_tag_back() {
     )
     .unwrap();
     let engine = engine(geosite_config_any_of(&[&first, &last], &["shared", "only"]));
-    let manager = &engine.geosite_manager;
-    assert!(manager.read().matches("shared", "x.last.test"));
+    assert!(engine.geo().geosite.matches("shared", "x.last.test"));
 
     replace(&last, b"");
     wait_for("the shared tag must take the earlier file's data", || {
-        manager.read().matches("shared", "x.first.test")
+        engine.geo().geosite.matches("shared", "x.first.test")
     })
     .await;
-    let manager = manager.read();
+    let manager = engine.geo().geosite;
     assert!(!manager.matches("shared", "x.last.test"));
     assert!(
         manager.matches("only", "x.only.test"),
@@ -676,18 +679,13 @@ async fn a_reload_reading_an_emptied_geosite_file_hands_a_shared_tag_back() {
     std::fs::write(&other, geosite_dat(&[("else", "else.test")])).unwrap();
     let tags = ["shared", "only"];
     let engine = engine(geosite_config_any_of(&[&first, &last], &tags));
-    assert!(
-        engine
-            .geosite_manager
-            .read()
-            .matches("shared", "x.last.test")
-    );
+    assert!(engine.geo().geosite.matches("shared", "x.last.test"));
 
     // 多了一个文件，热重载把每个文件重新读一遍 / One more file, so the hot reload reads every
     // file again
     replace(&last, b"");
     engine.reload(geosite_config_any_of(&[&first, &last, &other], &tags));
-    let manager = engine.geosite_manager.read();
+    let manager = engine.geo().geosite;
     assert!(manager.matches("shared", "x.first.test"));
     assert!(!manager.matches("shared", "x.last.test"));
     assert!(
@@ -731,11 +729,11 @@ async fn an_empty_geoip_file_keeps_the_tags_in_use() {
     .await;
 
     replace(&path, &geoip_dat("TESTNET", [198, 51, 100, 0], 24));
-    let manager = &engine.geoip_manager;
     let tags: [Arc<str>; 1] = [Arc::from("TESTNET")];
     wait_for("the good file must be read", || {
-        manager
-            .read()
+        engine
+            .geo()
+            .geoip
             .matches_any_tag("198.51.100.1".parse().unwrap(), &tags)
     })
     .await;
@@ -772,7 +770,7 @@ async fn a_reload_reading_an_empty_geosite_file_keeps_the_tags_still_in_use() {
     engine.reload(geosite_config(&[&path, &other], "testa"));
     assert_eq!(ask(&engine, "second.geo.test").await, Some(MATCHED));
     assert!(
-        !engine.geosite_manager.read().has_tag("testb"),
+        !engine.geo().geosite.has_tag("testb"),
         "only tags the rules use are kept"
     );
     assert_eq!(
@@ -794,12 +792,11 @@ async fn a_reload_reading_an_empty_geosite_file_keeps_the_tags_still_in_use() {
 
     // 文件再写好时照常读进来 / A good file written again is read in as usual
     replace(&path, &geosite_dat(&[("testa", "geo2.test")]));
-    let manager = &engine.geosite_manager;
     wait_for("the good file must be read", || {
-        manager.read().matches("testa", "x.geo2.test")
+        engine.geo().geosite.matches("testa", "x.geo2.test")
     })
     .await;
-    assert!(!manager.read().matches("testa", "x.geo.test"));
+    assert!(!engine.geo().geosite.matches("testa", "x.geo.test"));
 }
 
 /// GeoIP 的 .dat 数据文件也一样：成了空文件以后热重载改了规则用到的标签，原来在用、现在还用的标签照旧留着
@@ -833,11 +830,11 @@ async fn a_reload_reading_an_empty_geoip_file_keeps_the_tags_still_in_use() {
     );
 
     replace(&path, &geoip_dat("TESTNET", [198, 51, 100, 0], 24));
-    let manager = &engine.geoip_manager;
     let tags: [Arc<str>; 1] = [Arc::from("TESTNET")];
     wait_for("the good file must be read", || {
-        manager
-            .read()
+        engine
+            .geo()
+            .geoip
             .matches_any_tag("198.51.100.1".parse().unwrap(), &tags)
     })
     .await;
@@ -893,7 +890,7 @@ async fn geosite_tags_count_once_whatever_their_case() {
     assert_eq!(used, ["gone", "testa"]);
     let engine = engine(cfg);
     assert_eq!(ask(&engine, "www.geo.test").await, Some(MATCHED));
-    assert_eq!(engine.geosite_manager.read().missing_tags(&used), ["gone"]);
+    assert_eq!(engine.geo().geosite.missing_tags(&used), ["gone"]);
 }
 
 /// 配置了、启动时还不存在的数据文件也被监视（它所在的目录在就行）：文件一出现就读进来，不必等热重载。它在文件里的先后照
@@ -917,12 +914,12 @@ async fn a_missing_geosite_file_is_read_once_it_appears() {
         &geosite_dat(&[("ads", "first.test"), ("cn", "cn.test")]),
     );
     wait_for("the file that appeared is read in", || {
-        engine.geosite_manager.read().matches("cn", "x.cn.test")
+        engine.geo().geosite.matches("cn", "x.cn.test")
     })
     .await;
     assert_eq!(ask(&engine, "b.cn.test").await, Some(MATCHED));
     // 两个文件都写着 ads，后面的说了算 / Both files write ads, and the later decides
-    let manager = engine.geosite_manager.read();
+    let manager = engine.geo().geosite;
     assert!(manager.matches("ads", "x.last.test"));
     assert!(!manager.matches("ads", "x.first.test"));
 }

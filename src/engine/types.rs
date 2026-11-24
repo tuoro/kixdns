@@ -1,10 +1,9 @@
 use crate::config::{Action, EcsMode, GlobalSettings, MatchOperator};
 use crate::ecs::EcsKey;
 use crate::engine::Engine;
-use crate::engine::geo::GeoGeneration;
 use crate::matcher::{
-    RequesterKey, ResponsePhase, RuntimeMatcher, RuntimePipeline, RuntimePipelineConfig,
-    RuntimeResponseMatcher,
+    GeoManagers, RequesterKey, ResponsePhase, RuntimeMatcher, RuntimePipeline,
+    RuntimePipelineConfig, RuntimeResponseMatcher,
 };
 use crate::proto_utils::QueryFlags;
 use bytes::Bytes;
@@ -360,14 +359,18 @@ pub enum FastPathResponse {
 
 pub struct EngineInner {
     pub pipeline: RuntimePipelineConfig,
-    /// 每个 pipeline 影响应答的配置指纹，加上它用到的 Geo 数据的代数（见 [`Self::at_geo`]）
+    /// 每个 pipeline 影响应答的配置指纹，加上它用到的 Geo 数据的指纹（见 [`Self::at_geo`]）
     /// Each pipeline's response-affecting configuration fingerprint, combined with the
-    /// generations of the Geo data it uses (see [`Self::at_geo`])
+    /// fingerprints of the Geo data it uses (see [`Self::at_geo`])
     pub cache_namespaces: FxHashMap<Arc<str>, u64>,
     /// 只按配置算出的指纹 / The fingerprints from the configuration alone
     config_namespaces: FxHashMap<Arc<str>, u64>,
-    /// `cache_namespaces` 算进去的 Geo 数据代数 / The Geo data generations `cache_namespaces` takes in
-    geo: GeoGeneration,
+    /// 匹配器判断时读的 Geo 数据，`cache_namespaces` 按它算：请求 load 一次状态，判断和命名空间就是同一份数据（见
+    /// [`GeoManagers`]）
+    /// The Geo data matchers judge by, from which `cache_namespaces` is worked out: a request
+    /// loads the state once, and its judgements and namespaces go by the same data (see
+    /// [`GeoManagers`])
+    pub(crate) geo: GeoManagers,
     /// 不在任何一个配置了的 pipeline 下的请求用的命名空间（没写 pipeline 的配置里所有请求都是）：只有全局设置的指纹。
     /// 以前这样的请求恒用 0，重载改了全局设置也分不开新旧
     /// The namespace of requests under no configured pipeline (every request of a configuration
@@ -377,11 +380,12 @@ pub struct EngineInner {
 }
 
 impl EngineInner {
-    /// 从运行时配置建，算出各 pipeline 的缓存命名空间 / Built from a runtime configuration, with the
-    /// cache namespaces of its pipelines
+    /// 从运行时配置建，算出各 pipeline 的缓存命名空间；还没有 Geo 数据，存进去之前由 `GeoSources` 带上 / Built from a
+    /// runtime configuration, with the cache namespaces of its pipelines; it has no Geo data yet,
+    /// which `GeoSources` gives it before it is stored
     pub(crate) fn new(cfg: RuntimePipelineConfig) -> Self {
         let config_namespaces = build_cache_namespaces(&cfg);
-        let geo = GeoGeneration::default();
+        let geo = GeoManagers::default();
         let no_pipeline_namespace = {
             let mut hasher = DefaultHasher::new();
             hash_global_settings_semantics(&cfg.settings, &mut hasher);
@@ -396,27 +400,27 @@ impl EngineInner {
         }
     }
 
-    /// 命名空间就地换成 Geo 数据第 `geo` 代的（见 [`Self::at_geo`]），给还没存进去的新状态用
-    /// Moves the namespaces to Geo data generation `geo` in place (see [`Self::at_geo`]),
-    /// for a new state not stored yet
-    pub(crate) fn set_geo(&mut self, geo: GeoGeneration) {
+    /// 就地换成 Geo 数据 `geo`，命名空间跟着换（见 [`Self::at_geo`]），给还没存进去的新状态用
+    /// Takes the Geo data `geo` in place, the namespaces with it (see [`Self::at_geo`]), for a
+    /// new state not stored yet
+    pub(crate) fn set_geo(&mut self, geo: GeoManagers) {
         self.cache_namespaces = with_geo(&self.pipeline, &self.config_namespaces, &geo);
         self.geo = geo;
     }
 
-    /// 同样的配置，命名空间换成 Geo 数据第 `geo` 代的：用到某份 Geo 数据的 pipeline，那份数据每换一代就换一个命名空间，
-    /// 按旧数据得出的应答和规则决定不再查到；没用到的 pipeline 不变。已经是这一代的就原样交回
-    /// The same configuration with the namespaces of Geo data generation `geo`: a pipeline
-    /// using some Geo data moves to a new namespace with every generation of that data, so
+    /// 同样的配置，换成 Geo 数据 `geo` 和按它算的命名空间：用到某个标签的 pipeline，那个标签的数据换了样子就换一个
+    /// 命名空间，按旧数据得出的应答和规则决定不再查到；没用到的 pipeline 不变。已经是这份数据的就原样交回
+    /// The same configuration with the Geo data `geo` and the namespaces worked out from it: a
+    /// pipeline using some tag moves to a new namespace once that tag's data changes, so
     /// answers and rule decisions reached with the old data are no longer found; pipelines
-    /// not using it stay as they are. A state already at this generation is handed back as
-    /// it is.
+    /// not using it stay as they are. A state already holding this data is handed back as it
+    /// is.
     ///
-    /// 换代时整份复制：Geo 数据一天换几次，请求路径上的状态因此保持原来的布局，不多一层间接
-    /// A new generation copies the whole state: Geo data changes a few times a day, and the
-    /// state on the request path keeps its layout this way, without another indirection
-    pub(crate) fn at_geo(self: &Arc<Self>, geo: GeoGeneration) -> Arc<Self> {
-        if self.geo == geo {
+    /// 换数据时整份复制：Geo 数据一天换几次，请求路径上的状态因此保持原来的布局，不多一层间接
+    /// New data copies the whole state: Geo data changes a few times a day, and the state on
+    /// the request path keeps its layout this way, without another indirection
+    pub(crate) fn at_geo(self: &Arc<Self>, geo: GeoManagers) -> Arc<Self> {
+        if self.geo.is(&geo) {
             return Arc::clone(self);
         }
         Arc::new(Self {
@@ -437,12 +441,12 @@ impl EngineInner {
     }
 }
 
-/// 配置指纹加上各 pipeline 读的 Geo 标签的数据的代数 / The configuration fingerprints combined with
-/// the generations of the data of the Geo tags each pipeline reads
+/// 配置指纹加上各 pipeline 读的 Geo 标签的数据的指纹 / The configuration fingerprints combined with
+/// the fingerprints of the data of the Geo tags each pipeline reads
 fn with_geo(
     cfg: &RuntimePipelineConfig,
     config_namespaces: &FxHashMap<Arc<str>, u64>,
-    geo: &GeoGeneration,
+    geo: &GeoManagers,
 ) -> FxHashMap<Arc<str>, u64> {
     cfg.pipelines
         .iter()
@@ -456,7 +460,7 @@ fn with_geo(
             } else {
                 let mut hasher = DefaultHasher::new();
                 base.hash(&mut hasher);
-                geo.hash_into(&pipeline.geo_data, &mut hasher);
+                geo.hash_data(&pipeline.geo_data, &mut hasher);
                 hasher.finish()
             };
             (pipeline.id.clone(), namespace)
@@ -508,13 +512,13 @@ fn hash_global_settings_semantics(settings: &GlobalSettings, hasher: &mut impl H
         cache_background_refresh: _,
         cache_refresh_threshold_percent: _,
         cache_refresh_min_ttl: _,
-        // Geo 数据的设置决定读进哪些名单和网段。应答取决于它们的只有读 Geo 数据的 pipeline，那些 pipeline 按数据的代数换命名
-        // 空间（见 `with_geo`；配置重载换了文件也是新的一代），其余的不必跟着换。以前它们算进了每个 pipeline 的命名空间：面板
+        // Geo 数据的设置决定读进哪些名单和网段。应答取决于它们的只有读 Geo 数据的 pipeline，那些 pipeline 按数据的指纹换命名
+        // 空间（见 `with_geo`；配置重载换了文件、读出来的数据不同，指纹也就不同），其余的不必跟着换。以前它们算进了每个 pipeline 的命名空间：面板
         // 按内容给 Geo 数据和拦截列表的文件起名，每次更新都换一个文件，名单一更新整份缓存就作废。后两个现在什么也不做
         // The Geo settings decide which lists and networks are read in. Only the pipelines
         // reading Geo data have answers that depend on them, and those move namespace with
-        // the data's generation (see `with_geo`; a reload changing the files is a new
-        // generation too), so the rest need not follow. They used to go into every
+        // the data's fingerprints (see `with_geo`; a reload changing the files to other data
+        // changes them too), so the rest need not follow. They used to go into every
         // pipeline's namespace: the panel names the files of Geo data and blocklists by their
         // content, every update brings another file, and every list update dropped the whole
         // cache. The last two do nothing at present
@@ -927,13 +931,13 @@ mod tests {
         }
     }
 
-    /// Geo 数据的设置不进命名空间的哈希：读 Geo 数据的 pipeline 按数据的代数换命名空间（见 `with_geo`），其余的不跟着换。
+    /// Geo 数据的设置不进命名空间的哈希：读 Geo 数据的 pipeline 按数据的指纹换命名空间（见 `with_geo`），其余的不跟着换。
     /// 以前改哪一个都让所有 pipeline 换命名空间
     /// The Geo settings stay out of the namespace hash: the pipelines reading Geo data move
-    /// namespace with the data's generation (see `with_geo`), and the rest do not follow.
+    /// namespace with the data's fingerprints (see `with_geo`), and the rest do not follow.
     /// Changing any of them used to move every pipeline
     #[test]
-    fn geo_settings_leave_namespaces_to_the_geo_generation() {
+    fn geo_settings_leave_namespaces_to_the_geo_data() {
         type Change = fn(&mut crate::config::GlobalSettings);
         let changes: [(&str, Change); 3] = [
             ("geoip_db_path", |s| {

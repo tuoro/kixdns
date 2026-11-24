@@ -55,16 +55,13 @@ impl RequesterTest {
     fn hash_outcome<H: Hasher>(
         &self,
         requester: Requester,
-        geoip_manager: &parking_lot::RwLock<geoip::GeoIpManager>,
+        geoip: &geoip::GeoIpManager,
         hasher: &mut H,
     ) {
         match self {
             Self::InNet(net) => net.contains(&requester.address).hash(hasher),
             Self::Private => geoip::is_private_ip(requester.address).hash(hasher),
-            Self::Country(codes) => geoip_manager
-                .read()
-                .matches_any_tag(requester.address, codes)
-                .hash(hasher),
+            Self::Country(codes) => geoip.matches_any_tag(requester.address, codes).hash(hasher),
             Self::Edns => requester.edns.hash(hasher),
             Self::Subnet {
                 prefix_v4,
@@ -116,14 +113,12 @@ impl RequesterScope {
         }
     }
 
-    /// The requester's part of a key: how each test judges `requester`. Empty
-    /// for a scope without tests.
-    /// 键里属于请求方的部分：每项依据对 `requester` 的判定。没有依据时为空。
-    pub fn key(
-        &self,
-        requester: Requester,
-        geoip_manager: &parking_lot::RwLock<geoip::GeoIpManager>,
-    ) -> RequesterKey {
+    /// The requester's part of a key: how each test judges `requester`, the GeoIP country by
+    /// `geoip`, the request's own copy of the data (see [`GeoManagers`]). Empty for a scope
+    /// without tests.
+    /// 键里属于请求方的部分：每项依据对 `requester` 的判定，GeoIP 国家按 `geoip` 判断，也就是这个请求自己那一份数据
+    /// （见 [`GeoManagers`]）。没有依据时为空。
+    pub fn key(&self, requester: Requester, geoip: &geoip::GeoIpManager) -> RequesterKey {
         let judge = |subnets: bool| {
             let mut tests = self
                 .tests
@@ -133,7 +128,7 @@ impl RequesterScope {
             tests.peek()?;
             let mut hasher = rustc_hash::FxHasher::default();
             for test in tests {
-                test.hash_outcome(requester, geoip_manager, &mut hasher);
+                test.hash_outcome(requester, geoip, &mut hasher);
             }
             Some(hasher.finish())
         };

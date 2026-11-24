@@ -95,15 +95,15 @@ impl<T: Bound> AddrRange<T> {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct GeoIpTagIndex {
     ipv4_ranges: Vec<AddrRange<u32>>,
     ipv6_ranges: Vec<AddrRange<u128>>,
     /// 合并好的网段的指纹，[`Self::finalize`] 时算出：同样的网段不论怎么写、按什么先后写都是这个数（见
-    /// [`GeoIpManager::fingerprints`]）
+    /// [`GeoIpManager::fingerprint`]）
     /// The fingerprint of the merged ranges, worked out by [`Self::finalize`]: the same networks
     /// give this number however and in whatever order they are written (see
-    /// [`GeoIpManager::fingerprints`])
+    /// [`GeoIpManager::fingerprint`])
     fingerprint: u64,
 }
 
@@ -130,14 +130,12 @@ impl GeoIpTagIndex {
     }
 }
 
-/// 一个数据文件解析出的 GeoIP 索引，尚未进入管理器。读取、解码、建索引、finalize 都在解析时、管理器的锁外做完，
-/// 调用方只在把它换进去时短暂持写锁（见 [`GeoIpManager::apply_parsed`]）。finalize 是整个重载里最重的一段：要排序
-/// 并合并每个标签的全部网段
+/// 一个数据文件解析出的 GeoIP 索引，尚未进入管理器。读取、解码、建索引、finalize 都在解析时做完，装进管理器只是换进去
+/// （见 [`GeoIpManager::apply_parsed`]）。finalize 是整个重载里最重的一段：要排序并合并每个标签的全部网段
 /// GeoIP indexes parsed out of one data file, not yet applied to a manager. Reading,
-/// decoding, building the indexes and finalising are all done while parsing, outside the
-/// manager's lock, and callers hold the write lock only while swapping them in (see
-/// [`GeoIpManager::apply_parsed`]). Finalising is the heaviest part of a reload: it sorts and
-/// merges every tag's networks
+/// decoding, building the indexes and finalising are all done while parsing, so applying them
+/// only swaps them in (see [`GeoIpManager::apply_parsed`]). Finalising is the heaviest part of
+/// a reload: it sorts and merges every tag's networks
 pub struct ParsedGeoIp {
     tag_indexes: FxHashMap<Arc<str>, GeoIpTagIndex>,
     count: usize,
@@ -172,18 +170,10 @@ impl ParsedGeoIp {
     }
 }
 
-/// 一个 GeoIP 管理器里的数据的指纹：每个标签的网段的，和 MMDB 的（见 [`GeoIpManager::fingerprints`]）
-/// The fingerprints of the data in a GeoIP manager: each tag's networks', and the MMDB's (see
-/// [`GeoIpManager::fingerprints`])
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct GeoIpFingerprints {
-    /// 每个标签（大写）的网段的 / Each tag's (uppercase) networks'
-    pub tags: FxHashMap<Arc<str>, u64>,
-    /// MMDB 的，没有 MMDB 时是 None / The MMDB's, None without one
-    pub mmdb: Option<u64>,
-}
-
-/// 默认的管理器没有 MMDB、也没有标签 / The default manager has no MMDB and no tags
+/// 默认的管理器没有 MMDB、也没有标签。建好以后只读：引擎状态带着一份（见 `matcher::GeoManagers`），换数据时建一个新的
+/// 整份换进去
+/// The default manager has no MMDB and no tags. Read-only once built: the engine state carries
+/// one (see `matcher::GeoManagers`), and new data goes into a new one swapped in whole
 #[derive(Default)]
 pub struct GeoIpManager {
     /// MaxMind DB 和它每条数据记录的国家代码；重载时文件没变就和在用的那份共用（见 [`Self::use_mmdb`]）
@@ -207,9 +197,9 @@ pub struct GeoIpManager {
 /// its insert, and grew past a hundred MiB with the distinct addresses asked about.
 struct Mmdb {
     reader: maxminddb::Reader<Vec<u8>>,
-    /// 文件内容的指纹：同样的库再读一遍还是这个数（见 [`GeoIpManager::fingerprints`]）/ The
+    /// 文件内容的指纹：同样的库再读一遍还是这个数（见 [`GeoIpManager::fingerprint`]）/ The
     /// fingerprint of the file's content, the same number for the same database read again (see
-    /// [`GeoIpManager::fingerprints`])
+    /// [`GeoIpManager::fingerprint`])
     fingerprint: u64,
     /// 数据记录在文件里的位置 → 国家代码 / A data record's offset in the file → its country code
     countries: FxHashMap<usize, Option<Arc<str>>>,
@@ -355,11 +345,10 @@ impl GeoIpManager {
         }
     }
 
-    /// 和这个管理器用同一份 MMDB、还没有标签的管理器：监视到数据文件变了时，新的标签在它上面、锁外装好，写锁下只把整个
-    /// 管理器换进去（见 `engine::geo` 的 `reload_geoip_file`）
+    /// 和这个管理器用同一份 MMDB、还没有标签的管理器：监视到数据文件变了时，新的标签装进它，再把它整个换进去（见
+    /// `engine::geo` 的 `reload_geoip_file`）
     /// A manager with this one's very MMDB and no tags yet: when a watched data file changes, the
-    /// new tags go into it outside the lock, and the write lock is held only to swap the whole
-    /// manager in (see `reload_geoip_file` in `engine::geo`)
+    /// new tags go into it, and it is swapped in whole (see `reload_geoip_file` in `engine::geo`)
     pub fn sharing_mmdb(&self) -> Self {
         Self {
             mmdb: self.mmdb.clone(),
@@ -367,18 +356,17 @@ impl GeoIpManager {
         }
     }
 
-    /// 眼下的数据的指纹：数据真换了样子才变，读它的 pipeline 跟着换缓存命名空间（见 `engine::geo::GeoGeneration`）
-    /// The fingerprints of the data right now, changing only once the data really changes, and
-    /// the pipelines reading it move to a new cache namespace with them (see
-    /// `engine::geo::GeoGeneration`)
-    pub fn fingerprints(&self) -> GeoIpFingerprints {
-        GeoIpFingerprints {
-            tags: self
-                .tag_indexes
-                .iter()
-                .map(|(tag, index)| (Arc::clone(tag), index.fingerprint))
-                .collect(),
-            mmdb: self.mmdb.as_ref().map(|mmdb| mmdb.fingerprint),
+    /// 判断 `tag`（大写）用的数据的指纹，没有数据时是 None：有 MMDB 时国家代码看 MMDB 的，和判断时一样（见
+    /// [`Self::matches_any_tag`]）。数据真换了样子才变，读它的 pipeline 跟着换缓存命名空间（见
+    /// `matcher::GeoManagers::hash_data`）
+    /// The fingerprint of the data `tag` (uppercase) is judged by, None without data: with an
+    /// MMDB a country code goes by the MMDB's, as it is judged (see [`Self::matches_any_tag`]).
+    /// It changes only once the data really changes, and the pipelines reading it move to a new
+    /// cache namespace with it (see `matcher::GeoManagers::hash_data`)
+    pub fn fingerprint(&self, tag: &str) -> Option<u64> {
+        match &self.mmdb {
+            Some(mmdb) if is_country_tag(tag) => Some(mmdb.fingerprint),
+            _ => self.tag_indexes.get(tag).map(|index| index.fingerprint),
         }
     }
 
@@ -557,25 +545,22 @@ impl GeoIpManager {
         self.tag_indexes.keys().map(|tag| tag.to_string()).collect()
     }
 
-    /// 把 `in_use` 里属于 `tags`（不分大小写）的标签连同数据搬过来，给出搬过来的标签。重新读数据文件什么都没读出来
-    /// 时，用它把在用的数据带进新建的管理器（见 `engine::geo` 的 `load_geoip`）；`in_use` 之后只该被换掉
-    /// Moves the tags among `tags` (ignoring case) over from `in_use`, data and all, giving the
-    /// tags moved. When reading the data file again gives nothing, this carries the data in use
-    /// into the manager being built (see `load_geoip` in `engine::geo`); `in_use` is only to be
-    /// replaced afterwards
-    pub fn keep_tags_of(&mut self, in_use: &mut GeoIpManager, tags: &[String]) -> Vec<String> {
-        let kept: Vec<Arc<str>> = in_use
-            .tag_indexes
-            .keys()
-            .filter(|tag| tags.iter().any(|wanted| wanted.eq_ignore_ascii_case(tag)))
-            .cloned()
-            .collect();
-        for tag in &kept {
-            if let Some(index) = in_use.tag_indexes.remove(tag) {
-                self.tag_indexes.insert(Arc::clone(tag), index);
+    /// 把 `in_use` 里属于 `tags`（不分大小写）的标签连同数据抄过来，给出抄过来的标签。重新读数据文件什么都没读出来
+    /// 时，用它把在用的数据带进新建的管理器（见 `engine::geo` 的 `load_geoip`）：只在数据文件坏了时走到，抄一份不必
+    /// 为此让匹配多绕一层
+    /// Copies the tags among `tags` (ignoring case) over from `in_use`, data and all, giving the
+    /// tags copied. When reading the data file again gives nothing, this carries the data in use
+    /// into the manager being built (see `load_geoip` in `engine::geo`): it is reached only with
+    /// a broken data file, so copying spares matching a level of indirection for it
+    pub fn keep_tags_of(&mut self, in_use: &GeoIpManager, tags: &[String]) -> Vec<String> {
+        let mut kept = Vec::new();
+        for (tag, index) in &in_use.tag_indexes {
+            if tags.iter().any(|wanted| wanted.eq_ignore_ascii_case(tag)) {
+                self.tag_indexes.insert(Arc::clone(tag), index.clone());
+                kept.push(tag.to_string());
             }
         }
-        kept.iter().map(|tag| tag.to_string()).collect()
+        kept
     }
 
     /// 用解析结果整体替换索引

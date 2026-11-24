@@ -4,15 +4,17 @@
 //! needs no rules evaluated, as on the full path; when evaluating, GeoSite conditions are
 //! judged as on the full path too, instead of a rule using them being handed on whole.
 
-use std::sync::mpsc;
-use std::time::Duration;
+use std::sync::Arc;
 
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RecordType};
 use serde_json::{Value, json};
 
-use crate::engine::test_support::{ask, counting_settings, engine_from, peer};
+use crate::engine::rules::Decision;
+use crate::engine::test_support::{counting_settings, engine_from, peer};
 use crate::engine::{Engine, FastPathResponse};
+use crate::matcher::RequestFacts;
+use crate::matcher::geosite::GeoSiteManager;
 
 fn query(name: &str) -> Vec<u8> {
     let mut query = Message::new(0x5b5b, MessageType::Query, OpCode::Query);
@@ -33,11 +35,11 @@ fn engine_with(ads: Value, rest: Value, more: Value) -> Engine {
         "settings": counting_settings(json!({})),
         "pipelines": pipelines
     }));
-    engine
-        .geosite_manager
-        .write()
-        .load_from_v2ray_string(r#"{"entries":[{"tag":"ads","domains":["domain:ads.example"]}]}"#)
+    let mut ads = GeoSiteManager::default();
+    ads.load_from_v2ray_string(r#"{"entries":[{"tag":"ads","domains":["domain:ads.example"]}]}"#)
         .expect("load geosite");
+    let ads = Arc::new(ads);
+    engine.change_geo(|geo| geo.geosite = Arc::clone(&ads));
     engine
 }
 
@@ -73,12 +75,12 @@ async fn a_geosite_rule_is_answered_on_the_fast_path() {
     assert_eq!(fast_rcode(&engine, "example.com."), None);
 }
 
-/// 规则缓存存着决定时，快速路径不再求值规则：GeoSite 名单正在写入、读它要等的时候，存着的跳转照样当场跟过去，在目标里
-/// 答上。以前快速路径先把编译规则求值一遍，才看规则缓存
-/// With a decision kept in the rule cache the fast path evaluates no rules: while the GeoSite
-/// lists are being written and reading them would wait, the jump kept there is still followed
-/// at once and answered in the target. The fast path used to evaluate the compiled rules before
-/// looking in the rule cache
+/// 规则缓存存着决定时，快速路径不再求值规则，照存着的决定走：规则会转发的名字，规则缓存里存着跳转时照样当场跟过去，
+/// 在目标里答上。以前快速路径先把编译规则求值一遍，才看规则缓存
+/// With a decision kept in the rule cache the fast path evaluates no rules and goes by the
+/// decision kept: for a name the rules would forward, a jump kept in the rule cache is still
+/// followed at once and answered in the target. The fast path used to evaluate the compiled
+/// rules before looking in the rule cache
 #[tokio::test]
 async fn a_decision_in_the_rule_cache_is_taken_without_evaluating_the_rules() {
     let engine = engine_with(
@@ -88,21 +90,19 @@ async fn a_decision_in_the_rule_cache_is_taken_without_evaluating_the_rules() {
             { "name": "deny", "matchers": [{ "type": "any" }], "actions": [{ "type": "deny" }] }
         ]}]),
     );
-    ask(&engine, &query("track.ads.example."), peer()).await;
-
-    let geosite = engine.geosite_manager.clone();
-    let writing = geosite.write();
-    let (answered, answer) = mpsc::channel();
-    let asking = engine.clone();
-    let asker = std::thread::spawn(move || {
-        let _ = answered.send(fast_rcode(&asking, "track.ads.example."));
-    });
-    let rcode = answer.recv_timeout(Duration::from_secs(2));
-    drop(writing);
-    asker.join().unwrap();
+    let state = engine.state.load_full();
+    let facts = RequestFacts {
+        client_ip: peer().ip(),
+        ..RequestFacts::a_query("www.example.com")
+    };
+    let question = Engine::rule_question(&state, &state.pipeline.pipelines[0], &facts);
+    let jump = Decision::Jump {
+        pipeline: Arc::from("blocked"),
+    };
+    engine.insert_rule_cache(&question, jump, None, true);
     assert_eq!(
-        rcode,
-        Ok(Some(ResponseCode::Refused)),
-        "answered without reading GeoSite"
+        fast_rcode(&engine, "www.example.com."),
+        Some(ResponseCode::Refused),
+        "the jump kept in the rule cache was followed"
     );
 }
