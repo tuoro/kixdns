@@ -158,7 +158,7 @@ impl Engine {
 /// `proto_utils::servfail_reply`). Only a failure parses the query to tell the two apart;
 /// refusals under overload and timeouts need not
 fn failure_reply(packet: &[u8]) -> Bytes {
-    if proto_utils::question_name_readable(packet) && Message::from_bytes(packet).is_ok() {
+    if proto_utils::question_name_end(packet).is_some() && Message::from_bytes(packet).is_ok() {
         proto_utils::servfail_reply(packet)
     } else {
         proto_utils::formerr_reply(packet)
