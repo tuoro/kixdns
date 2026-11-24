@@ -204,16 +204,6 @@ pub const UDP_PAYLOAD: u16 = 1232;
 /// set aside 64 KiB per connection or request on the strength of a length prefix or a header
 pub const MAX_QUERY_LEN: usize = 4096;
 
-/// 查询的第一个问题名读得了：标签、长度合规，压缩指针只往前指、不指进报文头（见 [`strict_name_end`]）。
-/// hickory 不管指针指不指进报文头，所以快速解析读不了、要交给 hickory 的查询先过这一关。
-/// Whether the query's first question name can be read: proper labels and length, and
-/// compression pointers that only point back and not into the header (see
-/// [`strict_name_end`]). hickory does not mind a pointer into the header, so a query the
-/// quick parse cannot read passes this before it goes to hickory.
-pub(crate) fn question_name_readable(packet: &[u8]) -> bool {
-    strict_name_end(packet, HEADER_LEN).is_some()
-}
-
 /// 仅解析 DNS 头部和第一个 Query，用于快速缓存查找 / Parse only DNS header and first query for quick cache lookup
 /// 避免 hickory-proto Message::from_bytes 的全量解析和分配开销 / Avoid full parsing and allocation overhead of hickory-proto Message::from_bytes
 /// buf: 用于存储归一化（小写）域名的缓冲区，建议至少 256 字节 / buf: buffer for storing normalized (lowercase) domain name, recommend at least 256 bytes
@@ -228,130 +218,10 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
     // 2. Counts / 计数
     let ar_count = u16::from_be_bytes([packet[10], packet[11]]);
 
-    // 3. Parse QName (start at offset 12) / 解析查询名称（从偏移量 12 开始）
-    let mut pos = 12;
-    let mut buf_pos = 0;
-
-    let mut jumped = false;
-    let mut max_jumps = 5;
-    let mut current_pos = pos;
-    let packet_len = packet.len();
-    // 名字在线上的长度，结尾的根标签占 1 字节，最多 MAX_NAME_LEN，和 `strict_name_end`、完整解析一样。以前只受 256
-    // 字节的文本缓冲限制，线上 256 到 258 字节的名字在这里过得去，完整解析却回 FORMERR
-    // The name's length on the wire, the root label at the end taking 1 byte, at most
-    // MAX_NAME_LEN, as in `strict_name_end` and the full parse. Only the 256-byte text buffer
-    // used to bound it, so names of 256 to 258 bytes on the wire passed here and got FORMERR from
-    // the full parse
-    let mut wire_len = 1usize;
-
-    loop {
-        if current_pos >= packet_len {
-            return None;
-        }
-        let len = packet[current_pos];
-
-        if len == 0 {
-            // End of name / 名称结束
-            if !jumped {
-                pos = current_pos + 1;
-            }
-            break;
-        }
-
-        if (len & 0xC0) == 0xC0 {
-            // Compression pointer / 压缩指针
-            if packet_len < current_pos + 2 {
-                return None;
-            }
-            if !jumped {
-                pos = current_pos + 2;
-                jumped = true;
-            }
-            let offset = (((len as u16) & 0x3F) << 8) | (packet[current_pos + 1] as u16);
-            // RFC 1035 section 4.1.4: a pointer refers to a prior occurrence, so it must
-            // point before itself (hickory refuses others too). One pointing forward could
-            // land on bytes that move when the packet is rewritten, and the name sent
-            // upstream would no longer be the one routed on.
-            // RFC 1035 第 4.1.4 节：指针指向前面出现过的名字，必须指在自己前面（hickory 也拒绝
-            // 别的）。指向后面的指针可能落在改写报文时会挪动的字节上，发给上游的名字就不再是
-            // 路由时看到的那个。
-            // 指进报文头（偏移 12 以前）的也不行：那里不会有名字，转发时事务 ID 一换，名字就变了
-            // Nor one pointing into the header (before offset 12): no name starts there, and
-            // once the transaction ID is replaced on the way out the name changes
-            if (offset as usize) < HEADER_LEN || offset as usize >= current_pos {
-                return None;
-            }
-            current_pos = offset as usize;
-            max_jumps -= 1;
-            if max_jumps == 0 {
-                return None; // Loop detection / 循环检测
-            }
-            continue;
-        }
-        if len & 0xC0 != 0 {
-            return None;
-        }
-
-        // Label / 标签
-        let label_len = len as usize;
-        wire_len += 1 + label_len;
-        if wire_len > MAX_NAME_LEN {
-            return None;
-        }
-        current_pos += 1;
-        if packet_len < current_pos + label_len {
-            return None;
-        }
-
-        if buf_pos > 0 {
-            if buf_pos >= buf.len() {
-                return None;
-            }
-            buf[buf_pos] = b'.';
-            buf_pos += 1;
-        }
-
-        let label_bytes = &packet[current_pos..current_pos + label_len];
-
-        // A byte the name's text writes escaped (see `name_text`) leaves the query to the full
-        // parser, so both parsers give every name the same text. The bytes taken here are
-        // printable ASCII, safe in structured logs too.
-        // 名字文本里要转义的字节（见 `name_text`）留给完整解析，两个解析器给每个名字的文本才一样。
-        // 这里收下的都是可打印 ASCII，写进结构化日志也安全。
-        if !label_bytes.iter().all(|&b| is_plain_name_byte(b)) {
-            return None;
-        }
-
-        // Performance optimization: Check if label needs lowercasing
-        // Most DNS labels are already lowercase, so we can avoid the copy in common case
-        // Use simple loop for better cache locality and early break
-        let mut needs_lowercase = false;
-        for &b in label_bytes {
-            if b.is_ascii_uppercase() {
-                needs_lowercase = true;
-                break;
-            }
-        }
-
-        // Copy label bytes to buffer
-        if buf_pos + label_len > buf.len() {
-            return None;
-        }
-
-        if needs_lowercase {
-            // Only lowercase if necessary
-            for &b in label_bytes {
-                buf[buf_pos] = b.to_ascii_lowercase();
-                buf_pos += 1;
-            }
-        } else {
-            // Zero-copy: just copy the bytes as-is
-            buf[buf_pos..buf_pos + label_len].copy_from_slice(label_bytes);
-            buf_pos += label_len;
-        }
-
-        current_pos += label_len;
-    }
+    // 3. 问题名照 `question_name_end` 读，文本照 `plain_name_text` 拼 / The question name, read as
+    // `question_name_end` reads it, its text built as `plain_name_text` builds it
+    let mut pos = question_name_end(packet)?;
+    let qname = plain_name_text(&packet[HEADER_LEN..pos - 1], buf)?;
 
     // 4. QType / 查询类型
     if packet.len() < pos + 4 {
@@ -413,15 +283,9 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
         return None;
     }
 
-    // 上面的循环已经把名字小写写进 buf，只放过了 ASCII，所以转成 &str 一定成功；这里照常检查，不用 unsafe：
-    // 以前另由 `qname_str_unchecked` 不检查地转，而字段是公开的，安全代码就能凑出不是 UTF-8 的名字让它转
-    // The loop above has written the name lowercased into buf, letting only ASCII through, so it
-    // always converts to &str; it is checked as usual here rather than with unsafe: it used to be
-    // converted unchecked by `qname_str_unchecked`, while the field is public, so safe code could
-    // make up a name that is no UTF-8 and have it converted
     Some(QuickQuery {
         tx_id,
-        qname: std::str::from_utf8(&buf[..buf_pos]).ok()?,
+        qname,
         qtype,
         qclass,
         edns_present,
@@ -429,6 +293,37 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
         client_subnet,
         flags: QueryFlags::new(packet[2] & 0x01 != 0, packet[3] & 0x10 != 0, dnssec_ok),
     })
+}
+
+/// 问题名在 [`parse_quick`] 里的文本（同 [`name_text`]）：各标签小写、用 '.' 连起来，写进 `buf`。`labels` 是问题名
+/// 不带结尾根标签的编码，由 [`question_name_end`] 读过、不压缩。有要转义的字节（见 [`is_plain_name_byte`]）或 `buf` 放
+/// 不下时为 None：这样的名字留给完整解析，两个解析器给每个名字的文本才一样。只放过可打印 ASCII，所以转成 &str 一定成功，
+/// 照常检查、不用 unsafe
+/// The question name's text in [`parse_quick`] (as [`name_text`] writes it): its labels
+/// lowercased and joined with '.', written into `buf`. `labels` is the name's encoding without
+/// the root label at its end, read by [`question_name_end`] and uncompressed. None for a byte
+/// that needs an escape (see [`is_plain_name_byte`]) or when `buf` is too short: such a name is
+/// left to the full parse, so both parsers give every name the same text. Only printable ASCII
+/// gets through, so the conversion to &str always succeeds; it is checked as usual, without unsafe
+fn plain_name_text<'a>(mut labels: &[u8], buf: &'a mut [u8]) -> Option<&'a str> {
+    let mut len = 0;
+    while let Some((&label_len, rest)) = labels.split_first() {
+        let (label, rest) = rest.split_at(usize::from(label_len));
+        if len > 0 {
+            *buf.get_mut(len)? = b'.';
+            len += 1;
+        }
+        if !label.iter().all(|&byte| is_plain_name_byte(byte)) {
+            return None;
+        }
+        let text = buf.get_mut(len..len + label.len())?;
+        for (text, byte) in text.iter_mut().zip(label) {
+            *text = byte.to_ascii_lowercase();
+        }
+        len += label.len();
+        labels = rest;
+    }
+    std::str::from_utf8(&buf[..len]).ok()
 }
 
 /// The text a query name is matched, cached and logged under: its labels lowercased and
@@ -835,27 +730,23 @@ fn question_as_asked(reply: Bytes, query: &[u8]) -> Bytes {
     copy.freeze()
 }
 
-/// 第一个问题名结束的位置，名字不压缩、从偏移 12 开始写，不超过 [`MAX_NAME_LEN`]：这样的名字才能照字节抄进应答、和应答
-/// 里的比较。没有问题段、名字用了压缩指针或者超长时为 None；名字之后的类型和类别在不在报文里，由调用方查
-/// Where the first question name ends, written uncompressed from offset 12 and no longer than
-/// [`MAX_NAME_LEN`]: only such a name can be copied byte for byte into a reply, or compared with
-/// the reply's. None without a question, or with a compression pointer or too long a name;
-/// whether the type and class after the name are in the message is the caller's to check
+/// 第一个问题名结束的位置，照 [`strict_name_end`] 读；没有问题段或者名字读不了时为 None，名字之后的类型和类别在不在报文
+/// 里由调用方查。问题名从偏移 12 开始，压缩指针只能指在它那段的开头之前、又不能指进报文头，所以读得了的问题名都不压缩：
+/// 照字节抄进应答、和应答里的比较、逐个标签拼出文本（见 [`plain_name_text`]）都行。hickory 许指针指进报文头，快速解析
+/// 读不了、要交给 hickory 的查询先过这一关
+/// Where the first question name ends, read as [`strict_name_end`] reads names; None without a
+/// question or with a name that cannot be read, whether the type and class after the name are in
+/// the message being the caller's to check. The question name starts at offset 12, and a
+/// compression pointer can point only before the start of its part and not into the header, so
+/// a question name that can be read is uncompressed: it can be copied byte for byte into a
+/// reply, compared with the reply's, and have its text built label by label (see
+/// [`plain_name_text`]). hickory lets a pointer point into the header, so a query the quick
+/// parse cannot read passes this before it goes to hickory
 pub(crate) fn question_name_end(packet: &[u8]) -> Option<usize> {
-    if packet.len() < HEADER_LEN || packet[4..6] == [0, 0] {
+    if packet.get(4..6)? == [0, 0] {
         return None;
     }
-    let mut pos = HEADER_LEN;
-    loop {
-        let len = *packet.get(pos)? as usize;
-        if len > 63 || pos - HEADER_LEN + 1 + len > MAX_NAME_LEN {
-            return None;
-        }
-        if len == 0 {
-            return Some(pos + 1);
-        }
-        pos += 1 + len;
-    }
+    strict_name_end(packet, HEADER_LEN)
 }
 
 /// 报文里 OPT 记录的位置 / Where a message's OPT record sits
@@ -1730,24 +1621,21 @@ fn well_formed_rdata(packet: &[u8], rr_type: u16, rdata: std::ops::Range<usize>)
     }
 }
 
-/// 读一个名字，返回它在 `start` 处的编码结束的位置；读名字、跳过名字的地方都用它（快速解析的问题名另有一份，要连着写出文本，
-/// 规则相同）。标签不超过 63 字节，整个名字连同压缩指针跳过去读到的部分不超过 [`MAX_NAME_LEN`]；压缩指针跳过去以后读到的
-/// 每个字节都在指针所在那段的开头之前，所以指针只能往前指，不会绕圈，也不会读进跳出来的那段（和 hickory 的规则一样）；指针
-/// 也不能指进报文头（偏移 12 以前），那里不会有名字，报文头一改（换事务 ID）名字就跟着变；最多跳 16 次。长度和跳数不数的话，
-/// 许多条记录的属主名指着一长串标签或者一长串指针时，每个名字都要把它走一遍，走一遍报文的步数是报文长度的平方。以前另有两份：
-/// 一份不跳指针、什么都不查，一份许指针指进报文头
+/// 读一个名字，返回它在 `start` 处的编码结束的位置；读名字、跳过名字的地方都用它（问题名见 [`question_name_end`]）。标签
+/// 不超过 63 字节，整个名字连同压缩指针跳过去读到的部分不超过 [`MAX_NAME_LEN`]；压缩指针跳过去以后读到的每个字节都在指针
+/// 所在那段的开头之前，所以指针只能往前指，不会绕圈，也不会读进跳出来的那段（和 hickory 的规则一样）；指针也不能指进报文头
+/// （偏移 12 以前），那里不会有名字，报文头一改（换事务 ID）名字就跟着变；最多跳 16 次。长度和跳数不数的话，许多条记录的
+/// 属主名指着一长串标签或者一长串指针时，每个名字都要把它走一遍，走一遍报文的步数是报文长度的平方
 /// Reads a name and returns where its encoding at `start` ends; wherever names are read or
-/// skipped this is used (the quick parse has its own for the question name, writing out the
-/// text as it goes, by the same rules). Labels of at most 63 bytes, and at most
-/// [`MAX_NAME_LEN`] in all, what compression pointers lead to included; everything read after a
-/// pointer lies before the start of the part the pointer is in, so a pointer can only point
-/// back, cannot loop, and cannot read into the part it jumped from (hickory's rule too); nor can
-/// a pointer point into the header (before offset 12), where no name starts and where the name
-/// would change with the header (a new transaction ID); at most 16 jumps. Without counting the
-/// length and the jumps, a long run of labels or of pointers that the owners of many records
-/// point into is walked for each of them, and one walk of the message takes the square of its
-/// length in steps. There used to be two more: one that followed no pointer and checked nothing,
-/// one that let a pointer point into the header
+/// skipped this is used (for the question name see [`question_name_end`]). Labels of at most 63
+/// bytes, and at most [`MAX_NAME_LEN`] in all, what compression pointers lead to included;
+/// everything read after a pointer lies before the start of the part the pointer is in, so a
+/// pointer can only point back, cannot loop, and cannot read into the part it jumped from
+/// (hickory's rule too); nor can a pointer point into the header (before offset 12), where no
+/// name starts and where the name would change with the header (a new transaction ID); at most
+/// 16 jumps. Without counting the length and the jumps, a long run of labels or of pointers that
+/// the owners of many records point into is walked for each of them, and one walk of the
+/// message takes the square of its length in steps
 fn strict_name_end(packet: &[u8], start: usize) -> Option<usize> {
     let (mut pos, mut part_start, mut limit) = (start, start, usize::MAX);
     let (mut end, mut length, mut jumps) = (None, 1usize, 0);
@@ -2826,6 +2714,37 @@ mod tests {
         let mut qname = [0u8; 256];
 
         assert!(parse_quick(&packet, &mut qname).is_some());
+    }
+
+    /// 问题名的文本是各标签的小写、用点连起来，根名是空串；问题名里的压缩指针无处可指（指不到它那段前面，又不能指进报文头），
+    /// 带指针的问题名读不了
+    /// The question name's text is its labels lowercased and joined with dots, the root's being
+    /// empty; a compression pointer in the question name has nowhere to point (not before its
+    /// part, nor into the header), so a question name with one cannot be read
+    #[test]
+    fn parse_quick_reads_the_question_name_uncompressed() {
+        let mut text = [0u8; 256];
+        for (wire, expected) in [
+            (&b"\x03WwW\x07ExAmple\x03CoM\x00"[..], "www.example.com"),
+            (b"\x00", ""),
+        ] {
+            let packet = [&query_header(1), wire, &[0, 1, 0, 1]].concat();
+            assert_eq!(question_name_end(&packet), Some(12 + wire.len()));
+            assert_eq!(parse_quick(&packet, &mut text).unwrap().qname, expected);
+        }
+        for target in 12..=18 {
+            let packet = [
+                &query_header(1)[..],
+                b"\x02ab\x02cd\xC0",
+                &[target, 0, 1, 0, 1],
+            ]
+            .concat();
+            assert_eq!(question_name_end(&packet), None, "pointer to {target}");
+            assert!(
+                parse_quick(&packet, &mut text).is_none(),
+                "pointer to {target}"
+            );
+        }
     }
 
     #[test]
