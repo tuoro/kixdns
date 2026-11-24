@@ -353,18 +353,20 @@ impl UdpClient {
         upstream: &str,
         timeout_dur: Duration,
     ) -> anyhow::Result<Bytes> {
-        let mut sent = self.begin(packet, upstream).await?;
-        match timeout(timeout_dur, sent.reply()).await {
-            Ok(reply) => reply,
+        let mut exchange = UdpExchange::new(self, packet, upstream);
+        exchange.send(()).await?;
+        match timeout(timeout_dur, exchange.reply()).await {
+            Ok(Some((reply, ()))) => reply,
+            Ok(None) => unreachable!("one copy sent and waited for"),
             Err(_) => Err(anyhow::anyhow!("upstream timeout")),
         }
     }
 
-    /// 把查询发给 `upstream`，返回等它回答的那一头（见 [`UdpSent`]）：等多久、同时还等着什么，由调用方定
-    /// Sends the query to `upstream` and gives the end that waits for its reply (see
-    /// [`UdpSent`]): how long to wait, and what else is waited for meanwhile, is the caller's
+    /// 把查询发给 `upstream` 一次，返回等它回答的那一头（见 [`UdpSent`]）
+    /// Sends the query to `upstream` once and gives the end that waits for its reply (see
+    /// [`UdpSent`])
     #[inline]
-    pub async fn begin(&self, packet: &[u8], upstream: &str) -> anyhow::Result<UdpSent> {
+    async fn begin(&self, packet: &[u8], upstream: &str) -> anyhow::Result<UdpSent> {
         let addr: SocketAddr = upstream.parse().context("invalid upstream address")?;
         // 按目标地址族选池：IPv4 路径只多一次判别
         // Pick the pool by address family; the IPv4 path only gains one check.
@@ -482,30 +484,83 @@ impl UdpClient {
     }
 }
 
-/// 发出去、在等回答的一个 UDP 查询（见 [`UdpClient::begin`]）。只要它还在，回答什么时候到都收得到；放手时不再等，
+/// 发出去、在等回答的一份 UDP 查询（见 [`UdpClient::begin`]）。只要它还在，回答什么时候到都收得到；放手时不再等，
 /// 它登记的条目跟着删掉（见 [`Waiting`]）
-/// One UDP query sent and waiting for its reply (see [`UdpClient::begin`]). For as long as it
-/// is kept the reply is taken whenever it arrives; let go of, it waits no more and the entry it
-/// registered goes with it (see [`Waiting`])
-pub struct UdpSent {
+/// One copy of a UDP query sent and waiting for its reply (see [`UdpClient::begin`]). For as
+/// long as it is kept the reply is taken whenever it arrives; let go of, it waits no more and the
+/// entry it registered goes with it (see [`Waiting`])
+struct UdpSent {
     waiting: Waiting<UdpInflight>,
     /// 发它的 socket：等着回答时不能关，换下来了也一样 / The socket that sent it, which may not close
     /// while the reply is waited for, replaced or not
     _socket: Arc<UdpSocketState>,
 }
 
-impl UdpSent {
-    /// 等它的回答。没等到就被放下的这次等待不影响下一次：回答到了，下一次照样拿得到。拿到过结果以后不要再等
-    /// Waits for its reply. A wait dropped before the reply came leaves the next one unaffected:
-    /// the reply is still there for it once it arrives. Not to be waited on again once it has
-    /// given its outcome
-    pub async fn reply(&mut self) -> anyhow::Result<Bytes> {
-        match (&mut self.waiting.rx).await {
-            Ok(reply) => reply,
-            // 发送的那一头没给结果就没了（正常不会，除非逻辑出错或者 panic）/ The sending end went
-            // without an outcome (not normally, short of a logic error or a panic)
-            Err(_) => Err(anyhow::anyhow!("channel closed")),
+/// 一个查询和一个上游经 UDP 的一次收发：没等到回答就再发一份，发出去的每一份都一直登记着，谁的回答先到用谁的。后发的
+/// 那份不顶替前面的：前一份的回答在重发以后才到也照样收下，回答比重发慢的上游不用多等一个重发的间隔。什么时候重发由调用方
+/// 定（见 `upstream::forward_udp_smart` 和 `bootstrap`）；`T` 是调用方给每一份记的东西，比如它是什么时候发的。第一份放在
+/// 自己里面，再发的才另外分配
+/// One query's exchange with one upstream over UDP: with no reply yet another copy is sent, and
+/// every copy sent stays registered, the first reply to come being used. A later copy does not
+/// replace the earlier: a reply to an earlier one arriving after the resend is taken all the
+/// same, so an upstream slower than the resend costs no resend's interval more. When to send
+/// again is the caller's (see `upstream::forward_udp_smart` and `bootstrap`); `T` is what the
+/// caller notes with each copy, when it was sent, say. The first copy is held inline, only further
+/// ones are allocated
+pub(crate) struct UdpExchange<'a, T> {
+    udp: &'a UdpClient,
+    packet: &'a [u8],
+    upstream: &'a str,
+    sent: smallvec::SmallVec<[(UdpSent, T); 1]>,
+}
+
+impl<'a, T> UdpExchange<'a, T> {
+    /// 经 `udp` 把 `packet` 发给 `upstream` 的收发，还一份也没发 / The exchange sending `packet` to
+    /// `upstream` through `udp`, no copy sent yet
+    pub(crate) fn new(udp: &'a UdpClient, packet: &'a [u8], upstream: &'a str) -> Self {
+        Self {
+            udp,
+            packet,
+            upstream,
+            sent: smallvec::SmallVec::new(),
         }
+    }
+
+    /// 再发一份，记上 `note`；发不出去的什么也不登记 / Sends one more copy noted `note`; one that cannot be
+    /// sent registers nothing
+    pub(crate) async fn send(&mut self, note: T) -> anyhow::Result<()> {
+        let sent = self.udp.begin(self.packet, self.upstream).await?;
+        self.sent.push((sent, note));
+        Ok(())
+    }
+
+    /// 发出去的几份里先到的结果，和那一份记的东西；一份也不在等时是 None。给了结果的那一份不再等，别的接着等。没等到就被
+    /// 放下的这次等待不影响下一次：回答到了，下一次照样拿得到
+    /// The first outcome among the copies sent, with what that copy was noted with; None with no
+    /// copy waited for. The copy that gave it waits no more, the others still do. A wait dropped
+    /// before any outcome leaves the next one unaffected: a reply arriving is still there for it
+    pub(crate) async fn reply(&mut self) -> Option<(anyhow::Result<Bytes>, T)> {
+        if self.sent.is_empty() {
+            return None;
+        }
+        let (at, outcome) = std::future::poll_fn(|cx| {
+            self.sent
+                .iter_mut()
+                .enumerate()
+                .find_map(|(at, (sent, _))| {
+                    match std::pin::Pin::new(&mut sent.waiting.rx).poll(cx) {
+                        std::task::Poll::Ready(outcome) => Some((at, outcome)),
+                        std::task::Poll::Pending => None,
+                    }
+                })
+                .map_or(std::task::Poll::Pending, std::task::Poll::Ready)
+        })
+        .await;
+        let (_, note) = self.sent.swap_remove(at);
+        // 发送的那一头没给结果就没了（正常不会，除非逻辑出错或者 panic）/ The sending end went without an
+        // outcome (not normally, short of a logic error or a panic)
+        let reply = outcome.unwrap_or_else(|_| Err(anyhow::anyhow!("channel closed")));
+        Some((reply, note))
     }
 }
 
@@ -4642,7 +4697,8 @@ mod tests {
         });
         let client = UdpClient::new(1).expect("create UDP client");
         let query = udp_test_query("held.example.");
-        let mut first = client.begin(&query, &upstream).await.expect("sent");
+        let mut first = UdpExchange::new(&client, &query, &upstream);
+        first.send(()).await.expect("sent");
         for _ in 0..per_socket {
             client
                 .send(&query, &upstream, Duration::from_secs(2))
@@ -4650,17 +4706,23 @@ mod tests {
                 .expect("query answered");
         }
         let replaced = client.pool[0].load().socket.local_addr().unwrap();
-        assert_ne!(first._socket.socket.local_addr().unwrap(), replaced);
-        let reply = timeout(Duration::from_secs(2), first.reply())
+        let old_socket = Arc::downgrade(&first.sent[0].0._socket.socket);
+        assert_ne!(
+            old_socket.upgrade().unwrap().local_addr().unwrap(),
+            replaced
+        );
+        let (reply, ()) = timeout(Duration::from_secs(2), first.reply())
             .await
             .expect("answered in time")
-            .expect("answered");
-        assert_eq!(&reply[..2], &query[..2], "original ID restored");
+            .expect("waited for");
+        assert_eq!(
+            &reply.expect("answered")[..2],
+            &query[..2],
+            "original ID restored"
+        );
 
-        // 最后一个查询放手以后，接收任务停下，socket 关掉 / Once its last query lets go, the receiving
-        // task stops and the socket closes
-        let old_socket = Arc::downgrade(&first._socket.socket);
-        drop(first);
+        // 最后一个查询拿到了结果、放了手，接收任务停下，socket 关掉 / Once its last query has its
+        // outcome and lets go, the receiving task stops and the socket closes
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
             old_socket.upgrade().is_none(),
