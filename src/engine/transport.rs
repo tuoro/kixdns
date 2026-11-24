@@ -911,15 +911,18 @@ impl Aging {
         }
     }
 
-    /// 等到 `wear` 那条连接该摘下的时候，给出原因：活满了 `max_age`，或者空闲满了 `idle`；都不限时一直等
+    /// 等到 `wear` 那条连接该摘下的时候，给出原因：活满了 `max_age`，或者空闲满了 `idle`；都不限时一直等。时限远到时钟
+    /// 表示不了的（配置写了极大的值）和不限一样
     /// Waits until the connection of `wear` is to be taken out, giving why: it has lived `max_age`,
-    /// or sat idle for `idle`; with neither limited it waits for ever
+    /// or sat idle for `idle`; with neither limited it waits for ever. A limit too far off for the
+    /// clock to hold (a huge value configured) is no limit
     pub(super) async fn worn(self, wear: &Wear) -> &'static str {
+        let after = |since: tokio::time::Instant, limit: Option<Duration>, why| {
+            Some((since.checked_add(limit?)?, why))
+        };
         loop {
-            let old = self.max_age.map(|age| (wear.made + age, "too old"));
-            let idle = self
-                .idle
-                .map(|idle| (wear.latest_deadline() + idle, "idle"));
+            let old = after(wear.made, self.max_age, "too old");
+            let idle = after(wear.latest_deadline(), self.idle, "idle");
             let Some((at, why)) = old.into_iter().chain(idle).min_by_key(|(at, _)| *at) else {
                 return std::future::pending().await;
             };
@@ -6334,6 +6337,26 @@ mod tests {
         assert_eq!((why, started.elapsed()), ("too old", 10 * second));
 
         let never = Aging::new(Duration::ZERO, Duration::ZERO);
+        assert!(timeout(3600 * second, never.worn(&wear)).await.is_err());
+    }
+
+    /// 配置写了极大的时限（比如 u64::MAX 秒，想表示永不）：那个时限不限，另一个照样起作用。时钟表示不了那么远，
+    /// 照直加上去会 panic，每条 TCP、DoT 连接的写入任务一起来就死掉
+    /// A huge limit configured (u64::MAX seconds, say, meant as never) is no limit, while the
+    /// other still applies. The clock cannot hold a moment that far off, and adding it as it is
+    /// would panic, killing every TCP and DoT connection's writer as it starts
+    #[tokio::test(start_paused = true)]
+    async fn a_limit_too_far_off_for_the_clock_is_no_limit() {
+        let (second, huge) = (Duration::from_secs(1), Duration::from_secs(u64::MAX));
+        let (started, wear) = (tokio::time::Instant::now(), Wear::new());
+        let why = Aging::new(huge, 60 * second).worn(&wear).await;
+        assert_eq!((why, started.elapsed()), ("idle", 60 * second));
+
+        let (started, wear) = (tokio::time::Instant::now(), Wear::new());
+        let why = Aging::new(10 * second, huge).worn(&wear).await;
+        assert_eq!((why, started.elapsed()), ("too old", 10 * second));
+
+        let never = Aging::new(huge, huge);
         assert!(timeout(3600 * second, never.worn(&wear)).await.is_err());
     }
 
