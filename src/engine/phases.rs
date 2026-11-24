@@ -598,7 +598,7 @@ impl<'a> Forwarding<'a> {
                 );
                 tracing::debug!(
                     ecs_mode = ?mode,
-                    modified = modified.len() != request.packet.len(),
+                    modified = matches!(modified, Cow::Owned(_)),
                     "ECS request rewriting applied / 已应用 ECS 请求改写"
                 );
                 (

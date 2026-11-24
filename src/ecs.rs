@@ -1,13 +1,13 @@
-//! EDNS Client Subnet (ECS) wire manipulation — RFC 7871
-//! EDNS 客户端子网 (ECS) wire 操作 — RFC 7871
-//!
-//! Provides request-side ECS injection/stripping for the `Forward` action.
-//! Only runs on cache-miss path (inside `handle_forward_decision`), so the
-//! hot path (cache hit / static response) is never affected.
-//!
-//! 为 `Forward` 动作提供请求侧 ECS 注入/剥离。
-//! 仅在缓存未命中路径（`handle_forward_decision` 内部）执行，
-//! 热路径（缓存命中 / 静态响应）完全不受影响。
+//! EDNS 客户端子网（ECS，RFC 7871）：转发对请求的 ECS 做什么（[`plan`] 定下，[`apply_ecs_for`] 照线上格式改写），
+//! 子网的键 [`EcsKey`]（缓存和合并的请求按它分开），以及哪些客户端地址不带给上游（[`withheld_from_ecs`]）。快速路径
+//! 也用 [`plan`]：规则按 `from_client_ip` 发出的子网区分请求方时，缓存键里要有这个子网（见 `matcher::requester`）。
+//! 报文里 ECS 选项的读写在 `proto_utils`
+//! EDNS Client Subnet (ECS, RFC 7871): what a forward does with a request's ECS ([`plan`]
+//! decides, [`apply_ecs_for`] rewrites it on the wire), the subnet's key [`EcsKey`] that the
+//! cache and merged requests are kept apart by, and which client addresses no ECS carries
+//! upstream ([`withheld_from_ecs`]). The fast path uses [`plan`] too: with rules telling requesters
+//! apart by the subnet `from_client_ip` sends, that subnet is part of the cache key (see
+//! `matcher::requester`). Reading and writing the ECS option of a message is in `proto_utils`
 
 use std::borrow::Cow;
 use std::hash::{Hash, Hasher};
@@ -33,10 +33,12 @@ pub const DEFAULT_PREFIX_V4: u8 = 24;
 pub const DEFAULT_PREFIX_V6: u8 = 56;
 
 /// `static` 模式写的 ECS 地址（见 `EcsMode::Static`），读配置时就解析好，转发时不再解析。写的不是 IP 地址时留着原文：
-/// 配置检查报出它（见 `config::problems`），这样的转发不发 ECS（见 [`plan`]）。按原文读写，写出来的再读回去还是它
+/// 配置检查报出它（见 `config::problems`），这样的转发不换上固定的子网，包原样发出，客户端自己带的 ECS 照样转给上游（见
+/// [`plan`]）。按原文读写，写出来的再读回去还是它
 /// The ECS address the `static` mode writes (see `EcsMode::Static`), parsed as the configuration
 /// is read and not again on a forward. One that is no IP address keeps its text: the
-/// configuration check raises it (see `config::problems`), and such a forward sends no ECS (see
+/// configuration check raises it (see `config::problems`), and such a forward sets no fixed
+/// subnet, sending the packet as it is, so the client's own ECS, if any, goes upstream (see
 /// [`plan`]). It is read and written as text, and what it writes reads back as itself
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[serde(from = "String", into = "String")]
@@ -61,28 +63,17 @@ impl From<StaticEcsIp> for String {
     }
 }
 
-/// 对查询报文执行 `mode` 的 ECS 改写（见 [`plan`]），客户端自己带的 ECS 从报文里读。
-/// Rewrites a query's ECS as `mode` has it (see [`plan`]), the client's own ECS read off the
-/// packet.
-pub fn apply_ecs<'a>(packet: &'a [u8], mode: &EcsMode, peer_ip: IpAddr) -> Cow<'a, [u8]> {
-    let client = match mode {
-        EcsMode::FromClientIp { .. } => crate::proto_utils::client_subnet(packet),
-        _ => None,
-    };
-    apply_ecs_for(packet, mode, peer_ip, client.as_ref())
-}
-
-/// [`apply_ecs`]，请求自己的 ECS 选项调用方已经拿着，引擎就是这样：后台刷新重放的包带不了读不懂的选项（见
-/// `RefreshTarget::client_ecs`）。改写照线上格式做，和交给客户端的应答换上、去掉 ECS 是同一套（见
-/// `proto_utils::echo_ecs`、`proto_utils::ecs_removed`）；不用改、改不了（读不出的报文、TSIG 签过的查询：改了签名就
-/// 不对了）时借着原包，不复制
-/// [`apply_ecs`] for a request whose own ECS option the caller already holds, as the engine
-/// does: a background refresh replays a packet that cannot carry an option nobody can read (see
-/// `RefreshTarget::client_ecs`). The rewrite is done on the wire, by the same code that sets or
-/// takes out the ECS of a reply for a client (see `proto_utils::echo_ecs`,
-/// `proto_utils::ecs_removed`); with nothing to change, or no way to change it (a message that
-/// cannot be read, a query signed with TSIG, whose signature a change would break), the packet
-/// is borrowed as it is, uncopied
+/// 对查询报文执行 `mode` 的 ECS 改写（见 [`plan`]），请求自己的 ECS 选项 `client` 由调用方给：后台刷新重放的包带不了
+/// 读不懂的选项（见 `RefreshTarget::client_ecs`），所以不从报文里读。改写照线上格式做，和交给客户端的应答换上、去掉 ECS
+/// 是同一套（见 `proto_utils::echo_ecs`、`proto_utils::ecs_removed`）；不用改、改不了（读不出的报文、TSIG 签过的查询：
+/// 改了签名就不对了）时借着原包，不复制
+/// Rewrites a query's ECS as `mode` has it (see [`plan`]), the request's own ECS option
+/// `client` given by the caller: a background refresh replays a packet that cannot carry an
+/// option nobody can read (see `RefreshTarget::client_ecs`), so it is not read off the packet.
+/// The rewrite is done on the wire, by the same code that sets or takes out the ECS of a reply
+/// for a client (see `proto_utils::echo_ecs`, `proto_utils::ecs_removed`); with nothing to
+/// change, or no way to change it (a message that cannot be read, a query signed with TSIG,
+/// whose signature a change would break), the packet is borrowed as it is, uncopied
 pub(crate) fn apply_ecs_for<'a>(
     packet: &'a [u8],
     mode: &EcsMode,
@@ -113,10 +104,10 @@ pub(crate) enum EcsPlan {
 
 /// The plan of a forward with `ecs` (None: the forward has no `ecs` setting) for a
 /// request from `peer_ip` carrying the ECS option `client` (see
-/// `proto_utils::client_subnet`). `apply_ecs` carries it out; the response cache
+/// `proto_utils::client_subnet`). `apply_ecs_for` carries it out; the response cache
 /// reads it to know what the upstream was asked with.
 /// 带 `ecs`（None 表示转发没写 `ecs`）的转发对来自 `peer_ip`、带着 ECS 选项 `client`（见
-/// `proto_utils::client_subnet`）的请求怎么处理 ECS。`apply_ecs` 照此执行；响应缓存据此知道
+/// `proto_utils::client_subnet`）的请求怎么处理 ECS。`apply_ecs_for` 照此执行；响应缓存据此知道
 /// 上游被问的是什么。
 pub(crate) fn plan(mode: Option<&EcsMode>, peer_ip: IpAddr, client: Option<&EcsKey>) -> EcsPlan {
     match mode {
@@ -150,8 +141,8 @@ pub(crate) fn plan(mode: Option<&EcsMode>, peer_ip: IpAddr, client: Option<&EcsK
             OwnEcs::Unreadable => EcsPlan::Strip,
             // A private client's packet goes as it came, less a private network
             // 私有地址客户端的包原样发出，只去掉私有网段
-            OwnEcs::Private if is_private_ip(&peer_ip) => EcsPlan::Strip,
-            OwnEcs::Private | OwnEcs::Absent if !is_private_ip(&peer_ip) => {
+            OwnEcs::Private if withheld_from_ecs(peer_ip) => EcsPlan::Strip,
+            OwnEcs::Private | OwnEcs::Absent if !withheld_from_ecs(peer_ip) => {
                 EcsPlan::Set(EcsKey::from_ip(peer_ip, *prefix_v4, *prefix_v6))
             }
             OwnEcs::Private | OwnEcs::Absent => EcsPlan::Keep,
@@ -197,7 +188,7 @@ fn own_ecs(client: Option<&EcsKey>) -> OwnEcs<'_> {
 /// A network address an ECS option should not carry upstream: a private one, or
 /// an IPv4-mapped one / ECS 选项不该带给上游的网段地址：私有地址，或 IPv4 映射形式的地址
 fn is_unroutable(ip: IpAddr) -> bool {
-    is_private_ip(&ip) || matches!(ip, IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some())
+    withheld_from_ecs(ip) || matches!(ip, IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some())
 }
 
 /// Whether `from_client_ip` sends a request's own ECS (`client`, from `peer_ip`):
@@ -208,7 +199,7 @@ pub(crate) fn forwards_own_ecs(peer_ip: IpAddr, client: Option<&EcsKey>) -> bool
     match own_ecs(client) {
         OwnEcs::Forwarded(_) => true,
         OwnEcs::Private | OwnEcs::Unreadable => false,
-        OwnEcs::Absent => is_private_ip(&peer_ip),
+        OwnEcs::Absent => withheld_from_ecs(peer_ip),
     }
 }
 
@@ -239,8 +230,8 @@ pub(crate) fn set_ecs_option(msg: &mut Message, subnet: ClientSubnet) {
 /// neither, for reasons that lie in answers: one of 64:ff9b:1::/48 embedding a public address
 /// is an ordinary DNS64 answer, and one of 198.18.0.0/15 an ordinary answer of a fake-ip
 /// upstream
-pub(crate) fn is_private_ip(ip: &IpAddr) -> bool {
-    crate::matcher::geoip::is_private_ip(*ip)
+pub(crate) fn withheld_from_ecs(ip: IpAddr) -> bool {
+    crate::matcher::geoip::is_private_ip(ip)
         || match ip {
             IpAddr::V4(v4) => matches!(v4.octets(), [198, b, ..] if b & 0xfe == 18),
             IpAddr::V6(v6) => v6.segments()[..3] == [0x64, 0xff9b, 1],
@@ -305,18 +296,20 @@ impl EcsKey {
 
     /// 说不出是哪个子网的 ECS 选项：查询里 SCOPE 不为 0 的（它必须为 0，RFC 7871 第 6 节却没要求为此回
     /// FORMERR，见 `proto_utils::query_subnet`），以及 `proto_utils::client_subnet` 读不出的报文和选项。
-    /// 从监听器进来的查询只会是前一种：地址不合规、不止一个 ECS 选项的当场回 FORMERR（见
-    /// `Engine::on_the_spot`），读不出的报文也到不了这里。透传客户端 ECS 的转发把这样的选项原样发给上游，
-    /// 应答适用于谁说不准（`from_client_ip` 会去掉它）；键由原始字节决定，不会和任何真实子网相等。
+    /// 从监听器进来的查询里读不出的选项到不了这里：照线上格式读得出的报文里 OPT 的选项不合规的当场回 FORMERR（见
+    /// `Engine::on_the_spot`）。读不出的报文还会到这里：hickory 读得了、照线上格式却读不了的（比如压缩指针跳了超过
+    /// 16 次）走完整路径。透传客户端 ECS 的转发把这样的选项原样发给上游，应答适用于谁说不准（`from_client_ip`
+    /// 会去掉它）；键由原始字节决定，不会和任何真实子网相等。
     /// An ECS option that names no subnet one can tell: a nonzero SCOPE in a query (it
     /// must be 0, but RFC 7871 section 6 asks no FORMERR for it, see
     /// `proto_utils::query_subnet`), and a message or option `proto_utils::client_subnet`
-    /// cannot read. A query from a listener can only be the first: one with an improper
-    /// address or more than one ECS option is answered FORMERR on the spot (see
-    /// `Engine::on_the_spot`), and a message that cannot be read does not get here either.
-    /// A forward that passes the client's ECS on sends such an option as it is, and whom
-    /// the answer applies to is unclear (`from_client_ip` removes it); its key comes from
-    /// the raw bytes and never equals a real subnet.
+    /// cannot read. From a listener, an option that cannot be read does not get here: in a
+    /// message that can be read on the wire, improper OPT options are answered FORMERR on the
+    /// spot (see `Engine::on_the_spot`). A message that cannot be read still does: one hickory
+    /// reads but the wire walk cannot (a compression pointer followed more than 16 times, say)
+    /// takes the full path. A forward that passes the client's ECS on sends such an option as
+    /// it is, and whom the answer applies to is unclear (`from_client_ip` removes it); its key
+    /// comes from the raw bytes and never equals a real subnet.
     pub(crate) fn opaque(raw: &[u8]) -> Self {
         let mut addr = [0u8; 16];
         for (half, seed) in addr.chunks_mut(8).zip([1u8, 2u8]) {
@@ -393,6 +386,15 @@ fn mask_address(addr: &mut [u8; 16], prefix: u8) {
     for b in &mut addr[bytes_used..] {
         *b = 0;
     }
+}
+
+/// 测试辅助：对查询执行 `mode` 的 ECS 改写（见 [`apply_ecs_for`]），客户端自己带的 ECS 从报文里读
+/// Test helper: rewrites a query's ECS as `mode` has it (see [`apply_ecs_for`]), the client's own
+/// ECS read off the packet
+#[cfg(test)]
+pub(crate) fn apply_ecs<'a>(packet: &'a [u8], mode: &EcsMode, peer_ip: IpAddr) -> Cow<'a, [u8]> {
+    let client = crate::proto_utils::client_subnet(packet);
+    apply_ecs_for(packet, mode, peer_ip, client.as_ref())
 }
 
 /// 测试辅助：`"地址/前缀"` 写的子网 / Test helper: the subnet written `"address/prefix"`
@@ -896,25 +898,25 @@ mod tests {
         );
     }
 
-    // ---- is_private_ip ----
+    // ---- withheld_from_ecs ----
 
     #[test]
-    fn test_is_private_ip() {
+    fn test_withheld_from_ecs() {
         // Private v4
-        assert!(is_private_ip(&"10.0.0.1".parse::<IpAddr>().unwrap()));
-        assert!(is_private_ip(&"172.16.0.1".parse::<IpAddr>().unwrap()));
-        assert!(is_private_ip(&"192.168.1.1".parse::<IpAddr>().unwrap()));
-        assert!(is_private_ip(&"127.0.0.1".parse::<IpAddr>().unwrap()));
-        assert!(is_private_ip(&"169.254.1.1".parse::<IpAddr>().unwrap()));
+        assert!(withheld_from_ecs("10.0.0.1".parse::<IpAddr>().unwrap()));
+        assert!(withheld_from_ecs("172.16.0.1".parse::<IpAddr>().unwrap()));
+        assert!(withheld_from_ecs("192.168.1.1".parse::<IpAddr>().unwrap()));
+        assert!(withheld_from_ecs("127.0.0.1".parse::<IpAddr>().unwrap()));
+        assert!(withheld_from_ecs("169.254.1.1".parse::<IpAddr>().unwrap()));
 
         // Public v4
-        assert!(!is_private_ip(&"8.8.8.8".parse::<IpAddr>().unwrap()));
-        assert!(!is_private_ip(&"203.0.113.1".parse::<IpAddr>().unwrap()));
+        assert!(!withheld_from_ecs("8.8.8.8".parse::<IpAddr>().unwrap()));
+        assert!(!withheld_from_ecs("203.0.113.1".parse::<IpAddr>().unwrap()));
 
         // Private v6
-        assert!(is_private_ip(&"::1".parse::<IpAddr>().unwrap()));
-        assert!(is_private_ip(&"fd00::1".parse::<IpAddr>().unwrap()));
-        assert!(is_private_ip(&"fe80::1".parse::<IpAddr>().unwrap()));
+        assert!(withheld_from_ecs("::1".parse::<IpAddr>().unwrap()));
+        assert!(withheld_from_ecs("fd00::1".parse::<IpAddr>().unwrap()));
+        assert!(withheld_from_ecs("fe80::1".parse::<IpAddr>().unwrap()));
 
         // 运营商级 NAT、站点本地、本地用的转换前缀里嵌着公网地址的，和基准测试网段的两头 / Carrier-grade
         // NAT, site-local, the local-use translation prefix embedding a public address, and either
@@ -926,19 +928,19 @@ mod tests {
             "198.18.0.0",
             "198.19.255.255",
         ] {
-            assert!(is_private_ip(&address.parse().unwrap()), "{address}");
+            assert!(withheld_from_ecs(address.parse().unwrap()), "{address}");
         }
 
         // Public v6
-        assert!(!is_private_ip(
-            &"2001:4860:4860::8888".parse::<IpAddr>().unwrap()
+        assert!(!withheld_from_ecs(
+            "2001:4860:4860::8888".parse::<IpAddr>().unwrap()
         ));
-        assert!(!is_private_ip(&"64:ff9b::808:808".parse().unwrap()));
+        assert!(!withheld_from_ecs("64:ff9b::808:808".parse().unwrap()));
         // 基准测试网段两边紧挨着的 / Those right outside the benchmarking range
-        assert!(!is_private_ip(&"198.17.255.255".parse().unwrap()));
-        assert!(!is_private_ip(&"198.20.0.0".parse().unwrap()));
-        assert!(!is_private_ip(
-            &"2606:4700::1111".parse::<IpAddr>().unwrap()
+        assert!(!withheld_from_ecs("198.17.255.255".parse().unwrap()));
+        assert!(!withheld_from_ecs("198.20.0.0".parse().unwrap()));
+        assert!(!withheld_from_ecs(
+            "2606:4700::1111".parse::<IpAddr>().unwrap()
         ));
     }
 

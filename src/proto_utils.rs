@@ -1077,9 +1077,9 @@ fn edns_options(
     })
 }
 
-/// OPT 的 RDATA 里的 ECS 选项（RFC 7871 第 6 节）。选项结构不对、或者不止一个 ECS 选项时为 Err。
+/// OPT 的 RDATA 里的 ECS 选项（RFC 7871 第 6 节）。选项结构不对、ECS 选项不足 4 个字节，或者不止一个 ECS 选项时为 Err。
 /// The ECS option in an OPT record's RDATA (RFC 7871 section 6). Err when the
-/// options are malformed or there is more than one ECS option.
+/// options are malformed, an ECS option is under 4 octets, or there is more than one ECS option.
 fn ecs_option(packet: &[u8], rdata: std::ops::Range<usize>) -> Result<Option<EcsOption>, ()> {
     let mut found = None;
     for option in edns_options(packet, rdata) {
@@ -1101,14 +1101,16 @@ fn ecs_option(packet: &[u8], rdata: std::ops::Range<usize>) -> Result<Option<Ecs
     Ok(found)
 }
 
-/// 查询（OPT 的 RDATA 在 `rdata`）里客户端自己带的 ECS。地址不合规（见 `EcsOption::address_bits`）或者不止一个 ECS
-/// 选项时为 Err，这样的查询回 FORMERR（见 [`malformed_ecs`]）；SCOPE 不为 0 的得到 `EcsKey::opaque`（查询里它必须为 0，
-/// RFC 7871 第 6 节却没要求为此回 FORMERR）：它照样会被原样转给上游，应答却说不准适用于谁。
-/// The ECS a query carries itself, its OPT RDATA at `rdata`. Err for an improper address (see
-/// `EcsOption::address_bits`) or more than one ECS option, and such a query is answered FORMERR
-/// (see [`malformed_ecs`]); a nonzero SCOPE gets an `EcsKey::opaque` (it must be 0 in a query,
-/// but RFC 7871 section 6 asks no FORMERR for it): it still goes upstream as it is, but whom
-/// the answer applies to is unclear.
+/// 查询（OPT 的 RDATA 在 `rdata`）里客户端自己带的 ECS。OPT 的选项不合规时为 Err：任何一个选项结构不对（见
+/// [`edns_options`]），ECS 选项不足 4 个字节、地址不合规（见 `EcsOption::address_bits`），或者不止一个 ECS 选项；这样的
+/// 查询回 FORMERR（见 [`malformed_options`]）。SCOPE 不为 0 的得到 `EcsKey::opaque`（查询里它必须为 0，RFC 7871 第 6 节
+/// 却没要求为此回 FORMERR）：它照样会被原样转给上游，应答却说不准适用于谁。
+/// The ECS a query carries itself, its OPT RDATA at `rdata`. Err when the OPT's options are
+/// improper: any option malformed (see [`edns_options`]), an ECS option under 4 octets or with
+/// an improper address (see `EcsOption::address_bits`), or more than one ECS option; such a
+/// query is answered FORMERR (see [`malformed_options`]). A nonzero SCOPE gets an
+/// `EcsKey::opaque` (it must be 0 in a query, but RFC 7871 section 6 asks no FORMERR for it): it
+/// still goes upstream as it is, but whom the answer applies to is unclear.
 fn query_subnet(
     packet: &[u8],
     rdata: std::ops::Range<usize>,
@@ -1124,12 +1126,12 @@ fn query_subnet(
     }))
 }
 
-/// 查询里的 ECS 选项不合规，要回 FORMERR（RFC 7871 第 6 节、第 7.2.1 节，见 `query_subnet`）。快速解析不收这样的查询，
-/// 所以只为快速解析读不了的查询看一遍
-/// Whether the query's ECS option is improper and to be answered FORMERR (RFC 7871 sections 6
-/// and 7.2.1, see `query_subnet`). The quick parse takes no such query, so only a query it
-/// cannot read is looked at for this
-pub(crate) fn malformed_ecs(query: &[u8]) -> bool {
+/// 查询里 OPT 的选项不合规，要回 FORMERR：选项结构不对，或者 ECS 选项不合规（RFC 7871 第 6 节、第 7.2.1 节），见
+/// `query_subnet`。快速解析不收这样的查询，所以只为快速解析读不了的查询看一遍
+/// Whether the query's OPT options are improper and to be answered FORMERR: an option
+/// malformed, or an improper ECS option (RFC 7871 sections 6 and 7.2.1), see `query_subnet`.
+/// The quick parse takes no such query, so only a query it cannot read is looked at for this
+pub(crate) fn malformed_options(query: &[u8]) -> bool {
     matches!(find_opt(query), Ok(Some(opt)) if query_subnet(query, opt.rdata.clone()).is_err())
 }
 
