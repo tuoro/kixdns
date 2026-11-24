@@ -31,6 +31,10 @@ COMMANDS:
   run              运行 DNS 服务器
   convert-geo-ip   将 GeoIP .dat 转换为 MMDB
   help             显示帮助
+
+OPTIONS:
+  -h, --help       显示帮助
+  -V, --version    显示版本
 ~~~
 
 run 选项：
@@ -40,9 +44,8 @@ run 选项：
     --listener-label <LABEL>    Pipeline 选择使用的监听器标签（默认：default）
     --debug                     启用 debug 级别日志
     --udp-workers <NUM>         UDP worker 数量（0 表示使用可用 CPU 并行度）
-    --admin-socket <PATH>       面板用的本机控制通道（Unix socket）；不设时不开，Windows 上不支持
+    --admin-socket <PATH>       面板用的本机控制通道（Unix socket）；不设时不开，Windows 上没有这个选项
 -h, --help                      显示帮助
--V, --version                   显示版本
 ~~~
 
 GeoIP 转换选项：
