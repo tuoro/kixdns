@@ -366,3 +366,71 @@ async fn a_response_forward_without_an_upstream_goes_to_the_default_upstream() {
     assert_eq!(support::first_a(&reply), Some(default_address));
     assert_eq!((first.queries(), default.queries()), (1, 1));
 }
+
+/// 请求在路上时换了 min_ttl：应答的 TTL 照请求开始时那份配置收，写进的也是那份配置的缓存命名空间，换回那份配置以后命中
+/// 缓存的照样是它。这里 min_ttl 0 上的请求在路上时换成 300，上游这才回答 TTL 60：客户端拿到 60，换回 0 以后命中缓存的
+/// 也是 60；反过来 300 上的请求拿到抬过的 300。请求阶段的转发和回答检查以后的转发都一样
+/// A reply across a change of min_ttl takes its TTLs by the configuration the request started
+/// with, the one whose cache namespace it is written into, and that is what a cache hit gets
+/// once that configuration is back. Here a request under min_ttl 0 is on its way when 300 goes
+/// in, and only then does the upstream answer with TTL 60: the client gets 60, and so does a
+/// cache hit once 0 is back; the other way round the request under 300 gets the 300 raised to.
+/// A forward of the request phase and one after an answer check alike
+#[tokio::test]
+async fn a_reply_across_a_reload_takes_the_ttls_of_its_own_configuration() {
+    use crate::engine::geo_reload_tests::wait_for;
+    use serde_json::json;
+    const AGAIN: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 2);
+    for asked_again in [false, true] {
+        for (from, to) in [(0, 300), (300, 0)] {
+            let case = format!("asked again {asked_again}, min_ttl {from} then {to}");
+            let (held, answers) = support::answering_upstream_held(ANSWER, 60).await;
+            let again = support::answering_upstream(AGAIN, 60).await;
+            let config = |min_ttl: u32| {
+                let mut rule = json!({
+                    "name": "all",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "forward", "upstream": held.address }]
+                });
+                if asked_again {
+                    rule["response_matchers"] =
+                        json!([{ "type": "response_answer_ip", "cidr": "192.0.2.1/32" }]);
+                    rule["response_actions_on_match"] =
+                        json!([{ "type": "forward", "upstream": again.address }]);
+                }
+                let config = json!({
+                    "settings": counting_settings(json!({ "min_ttl": min_ttl })),
+                    "pipelines": [{ "id": "main", "rules": [rule] }]
+                });
+                crate::matcher::RuntimePipelineConfig::from_config(
+                    serde_json::from_value(config).expect("parse config"),
+                )
+                .expect("build runtime config")
+            };
+            let engine = Engine::new(config(from), "test".to_string()).expect("engine");
+            let (address, ttl) = (if asked_again { AGAIN } else { ANSWER }, from.max(60));
+
+            let (reply, ()) = tokio::join!(ask(&engine, "example.com.", RecordType::A), async {
+                wait_for("the query must reach the upstream", || held.queries() == 1).await;
+                engine.reload(config(to));
+                answers.release();
+            });
+            let expected = (ResponseCode::NoError, Some((address, ttl)));
+            assert_eq!(read(&reply), expected, "{case}");
+
+            engine.reload(config(from));
+            let (rcode, hit) = read(&ask(&engine, "example.com.", RecordType::A).await);
+            let (hit_address, hit_ttl) = hit.expect("an A record");
+            assert_eq!(
+                (rcode, hit_address),
+                (ResponseCode::NoError, address),
+                "{case}"
+            );
+            assert!(
+                (ttl - 2..=ttl).contains(&hit_ttl),
+                "{case}: {hit_ttl} from the cache"
+            );
+            assert_eq!(held.queries(), 1, "{case}: answered from the cache");
+        }
+    }
+}
