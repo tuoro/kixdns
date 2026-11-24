@@ -5264,9 +5264,9 @@ mod diagnostic_tests {
             "settings.prefetch is no longer read and has no effect; the entry can be removed",
             "settings.cache_capacity: 2000000 is very large and may take a lot of memory",
             "settings.request_timeout_ms: 3000 is under 2.5 times upstream_timeout_ms (2000), which may cut the resend and the TCP fallback short",
-            "pipeline_select 1: a geoip matcher written with no country code never matches",
-            "pipeline \"main\" rule \"request\": a geoip matcher written with no country code never matches",
-            "pipeline \"main\" rule \"answer\": a geoip matcher written with no country code never matches",
+            "pipeline_select[0].matchers[0]: a geoip matcher written with no country code never matches",
+            "pipelines[0].rules[0].matchers[0]: a geoip matcher written with no country code never matches",
+            "pipelines[0].rules[1].response_matchers[0]: a geoip matcher written with no country code never matches",
         ]);
 
         let response = super::validate_body(bytes::Bytes::from(raw.to_string())).await;
