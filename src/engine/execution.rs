@@ -5996,59 +5996,38 @@ mod tests {
         }
     }
 
-    /// 失败应答（SERVFAIL、REFUSED、扩展 RCODE，见 `upstream::is_failure_reply`）过期以后不当作
-    /// stale 提供：查缓存、上游失败时的兜底都不用它；NOERROR 的照常当作 stale 提供、照常兜底
-    /// An expired failure reply (SERVFAIL, REFUSED, an extended RCODE, see
-    /// `upstream::is_failure_reply`) is never served stale: a lookup and the fallback after an
-    /// upstream failure both pass it by, while a NOERROR one is served stale and serves the
-    /// fallback as usual
+    /// 规则据上游应答给出的 deny（REFUSED，不带上游）过期以后和上游的应答一样当作 stale 提供：查缓存、上游失败时的兜底
+    /// 都用它。上游的失败应答进不了缓存（见 `Engine::insert_dns_cache_entry`），缓存里的 REFUSED 只会是它
+    /// A deny the rules gave by an upstream's answer (REFUSED, with no upstream) is served stale
+    /// once expired as an upstream's answer is: a lookup and the fallback after an upstream
+    /// failure both use it. An upstream's failure reply never goes into the cache (see
+    /// `Engine::insert_dns_cache_entry`), so a REFUSED there is only ever this
     #[tokio::test]
-    async fn an_expired_failure_reply_is_never_served_stale() {
-        let (engine, dedupe_hash) = engine_without_an_answering_upstream(true);
+    async fn an_expired_deny_is_served_stale_as_any_answer() {
+        let (engine, slot) = engine_without_an_answering_upstream(true);
         let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
-        for (rcode, served) in [
-            (ResponseCode::NoError, true),
-            (ResponseCode::ServFail, false),
-            (ResponseCode::Refused, false),
-            (ResponseCode::BADVERS, false),
-            (ResponseCode::BADCOOKIE, false),
+        for (rcode, upstream) in [
+            (ResponseCode::NoError, Some(Arc::from(DEAD_UPSTREAM))),
+            (ResponseCode::Refused, None),
         ] {
             let entry = Arc::new(CacheEntry {
                 rcode,
+                upstream,
                 ..(*stale_entry("default")).clone()
             });
             let state = engine.state.load_full();
-            let context = phases::CacheLookupContext {
-                flags: crate::proto_utils::QueryFlags::RECURSIVE,
-                state: &state,
-                qname: "stale.com",
-                qtype: RecordType::A,
-                qclass: DNSClass::IN,
-                pipeline_id: "default",
-                slot: dedupe_hash,
-                tx_id: 0xAABB,
-                start: Instant::now(),
-                peer: &peer,
-                requester: Requester {
-                    address: peer.ip(),
-                    edns: false,
-                    ecs: None,
-                },
-                observed: None,
-            };
-            engine.cache_insert(dedupe_hash, entry.clone());
-            assert_eq!(
+            let context = stale_com_lookup(&state, &peer, slot);
+            engine.cache_insert(slot, entry);
+            assert!(
                 phases::check_cache_after_failure(&engine, &context, &mut Default::default())
                     .is_some(),
-                served,
                 "{rcode}: the fallback"
             );
-            assert_eq!(
+            assert!(
                 matches!(
                     phases::check_cache(&engine, &context, &mut Default::default()),
                     phases::Looked::Answered(_)
                 ),
-                served,
                 "{rcode}: the lookup"
             );
         }
