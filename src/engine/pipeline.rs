@@ -12,8 +12,7 @@ use crate::matcher::advanced_rule::CompiledPipeline;
 use crate::matcher::geoip::GeoIpManager;
 use crate::matcher::geosite::GeoSiteManager;
 use crate::matcher::{
-    PipelineSelectorQuery, Requester, RequesterKey, RuntimePipeline, RuntimePipelineConfig,
-    eval_match_chain,
+    PipelineSelectorQuery, Requester, RuntimePipeline, RuntimePipelineConfig, eval_match_chain,
 };
 use parking_lot::RwLock;
 
@@ -24,7 +23,7 @@ use super::observation::{
 };
 use super::response::least_ttl;
 use super::rules::Decision;
-use super::rules::{RULE_CACHE_MAX_AGE, RuleCacheEntry, RuleCacheRecord, calculate_rule_hash};
+use super::rules::{RULE_CACHE_MAX_AGE, RuleCacheEntry, RuleCacheRecord, RuleQuestion};
 use super::types::EngineInner;
 use super::{make_static_cname_answer, make_static_ip_answer, make_static_txt_answer};
 use crate::observe::{RuleCacheLookup, RuleEvaluated, RulePhase};
@@ -168,23 +167,57 @@ impl Engine {
         Some(&state.compiled_pipelines[idx])
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn insert_rule_cache(
+    /// `pipeline` 对这个问题、按规则对 `requester` 的判定在规则缓存里的问题（见 [`RuleQuestion`]）。规则的决定从不取决于
+    /// ECS：规则缓存的判定只有请求匹配器的那些（见 `RuntimePipeline::rule_requester`）
+    /// The rule cache question of `pipeline` for this question, by how the rules judge
+    /// `requester` (see [`RuleQuestion`]). Rule decisions never depend on ECS: the rule cache
+    /// judges by the request matchers alone (see `RuntimePipeline::rule_requester`)
+    pub(crate) fn rule_question<'a>(
         &self,
-        hash: u64,
-        pipeline_id: Arc<str>,
-        request: &RuleEvaluationContext<'_>,
-        decision: Decision,
-        requester: RequesterKey,
-        matched_rules: &[Arc<str>],
-        decided_by_rule: bool,
-    ) {
-        let RuleEvaluationContext {
+        cache_namespace: u64,
+        pipeline: &'a RuntimePipeline,
+        qname: &'a str,
+        qtype: RecordType,
+        qclass: DNSClass,
+        requester: Requester,
+    ) -> RuleQuestion<'a> {
+        RuleQuestion::new(
+            cache_namespace,
+            &pipeline.id,
             qname,
             qtype,
             qclass,
-            ..
-        } = *request;
+            pipeline
+                .rule_requester
+                .key(requester, Some(&self.geoip_manager)),
+        )
+    }
+
+    /// 规则缓存里给 `question`、在 `now` 这一刻还有效的决定。过期的这里不去掉：求值以后原地写回，它在淘汰队列里的位置
+    /// 还在，写不回的由清扫去掉。快速路径和完整路径都从这里查
+    /// The rule cache's decision for `question`, still valid at `now`. An expired one is not
+    /// removed here: written back after evaluating, it keeps its place in the eviction queues,
+    /// and one that is not goes with the sweep. The fast path and the full path both look here
+    pub(crate) fn cached_decision(
+        &self,
+        question: &RuleQuestion<'_>,
+        now: Instant,
+    ) -> Option<Arc<RuleCacheRecord>> {
+        self.rule_cache
+            .get(question.key)
+            .filter(|record| record.entry.answers(question, now))
+    }
+
+    /// 把求值给 `question` 作出的决定存进规则缓存；`matched_rules` 是求值时命中的规则，只在有观察者时记下
+    /// Store the decision evaluating made for `question` in the rule cache; `matched_rules` are
+    /// the rules that matched on the way, kept only with an observer
+    pub(crate) fn insert_rule_cache(
+        &self,
+        question: &RuleQuestion<'_>,
+        decision: Decision,
+        matched_rules: Option<&[Arc<str>]>,
+        decided_by_rule: bool,
+    ) {
         let ttl = match &decision {
             Decision::Static { answers, .. } => {
                 least_ttl(answers).map(|ttl| Duration::from_secs(u64::from(ttl)))
@@ -211,18 +244,10 @@ impl Engine {
         let expires_at = Some(ttl.map_or(longest, |ttl| (now + ttl).min(longest)));
 
         self.rule_cache.insert(
-            hash,
+            question.key,
             Arc::new(RuleCacheRecord {
-                entry: RuleCacheEntry {
-                    pipeline_id,
-                    qname: SmallVec::from_slice(qname.as_bytes()),
-                    qtype: u16::from(qtype),
-                    qclass: u16::from(qclass),
-                    requester,
-                    decision,
-                    expires_at,
-                },
-                matched_rules: request.observed.map(|_| Arc::from(matched_rules)),
+                entry: RuleCacheEntry::new(question, decision, expires_at),
+                matched_rules: matched_rules.map(Arc::from),
                 decided_by_rule,
             }),
         );
@@ -245,23 +270,17 @@ impl Engine {
             ..
         } = *request;
         // 1. Check Rule Cache
-        // Use hash for lookup to avoid cloning String for key on every lookup
-        let requester_key = pipeline.rule_requester.key(
-            Requester {
-                address: client_ip,
-                edns: edns_present,
-                // Rule decisions never depend on ECS / 规则决策从不取决于 ECS
-                ecs: None,
-            },
-            Some(&self.geoip_manager),
-        );
-        let rule_hash = calculate_rule_hash(
+        let question = self.rule_question(
             state.cache_namespace(&pipeline.id),
-            &pipeline.id,
+            pipeline,
             qname,
             qtype,
             qclass,
-            &requester_key,
+            Requester {
+                address: client_ip,
+                edns: edns_present,
+                ecs: None,
+            },
         );
         // With rules skipped (the ones a continue passed), this evaluation does not
         // give the pipeline's decision for the name, so it neither reads nor writes
@@ -273,17 +292,13 @@ impl Engine {
         let whole_pipeline = skip_rules.is_none_or(|set| set.is_empty());
         let allow_rule_cache_lookup = !background_refresh && whole_pipeline;
 
-        if allow_rule_cache_lookup && let Some(record) = self.rule_cache.get(rule_hash) {
-            let entry = &record.entry;
-            // 过期的这里不去掉：求值之后原地写回，它在淘汰队列里的位置还在，写不回的由清扫去掉
-            // An expired entry is not removed here: written back after evaluating, it keeps its
-            // place in the eviction queues; one that is not goes with the sweep
-            if entry.matches(&pipeline.id, qname, qtype, qclass, &requester_key) {
-                if let Some((observer, ctx)) = request.observed {
-                    report_rule_cache_hit(observer, ctx, &pipeline.id, &record, false);
-                }
-                return entry.decision.clone();
+        if allow_rule_cache_lookup
+            && let Some(record) = self.cached_decision(&question, Instant::now())
+        {
+            if let Some((observer, ctx)) = request.observed {
+                report_rule_cache_hit(observer, ctx, &pipeline.id, &record, false);
             }
+            return record.entry.decision.clone();
         }
         if allow_rule_cache_lookup && let Some((observer, ctx)) = request.observed {
             observer.rule_cache_lookup(
@@ -342,12 +357,9 @@ impl Engine {
             !logged && (pipeline.matches_regex || !matches!(decision, Decision::Forward { .. }));
         if whole_pipeline && worth_keeping {
             self.insert_rule_cache(
-                rule_hash,
-                pipeline.id.clone(),
-                request,
+                &question,
                 decision.clone(),
-                requester_key,
-                &matched_rules,
+                request.observed.map(|_| &matched_rules[..]),
                 decided_by_rule,
             );
         }
@@ -477,7 +489,7 @@ impl Engine {
                                 response_phase: None,
                                 rule_name: rule.name.clone(),
                                 rule_index: Some(idx),
-                                transport: Some(Transport::Udp),
+                                transport: Transport::Udp,
                                 ecs: None,
                                 allow_reuse: true,
                             };
@@ -498,19 +510,20 @@ impl Engine {
                             upstream_shared,
                         } => {
                             // 规则写了几个 forward 时，轮到头一个就照配置加载时合并好的一起问（见
-                            // `Rule::compute_merged_forward`），每个上游自己定传输；写在前面的 log 和只有一个 forward
-                            // 时一样已经执行过。以前合并的转发在执行动作之前就给出，这样的规则 log 从不执行
+                            // `Rule::compute_merged_forward`），每个上游的传输写在它自己的地址里，没写前缀的用 UDP；
+                            // 写在前面的 log 和只有一个 forward 时一样已经执行过。以前合并的转发在执行动作之前就给出，
+                            // 这样的规则 log 从不执行
                             // With several forwards written, the first one's turn asks them all as merged
-                            // at config load (see `Rule::compute_merged_forward`), each upstream deciding
-                            // its own transport; a log written before has run, as with a single forward.
-                            // The merged forward used to be given before any action ran, and the log of
-                            // such a rule never did
+                            // at config load (see `Rule::compute_merged_forward`), each upstream's
+                            // transport written in its own address, UDP for one without a scheme; a log
+                            // written before has run, as with a single forward. The merged forward used to
+                            // be given before any action ran, and the log of such a rule never did
                             let (upstream, pre_split_upstreams, transport, ecs) =
                                 match &rule.merged_forward {
                                     Some(merged) => (
                                         merged.upstream_str.clone(),
                                         Some(merged.upstream_list.clone()),
-                                        None,
+                                        Transport::Udp,
                                         merged.ecs.clone(),
                                     ),
                                     None => (
@@ -522,7 +535,7 @@ impl Engine {
                                             }
                                         },
                                         pre_split_upstreams.clone(),
-                                        Some(transport.unwrap_or(Transport::Udp)),
+                                        transport.unwrap_or(Transport::Udp),
                                         ecs.clone(),
                                     ),
                                 };

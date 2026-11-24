@@ -373,12 +373,12 @@ fn requester_scopes(
                 scope.extend(&reads[reached].matchers);
             }
             // After an answer check continues, the request keeps its entry for the
-            // rest of the decision loop (see `ForwardDecisionContext::held_inflight`)
+            // rest of the decision loop (see `Route::held_inflight`)
             // and its waiters take the final answer. The rest of the pipeline and
             // the pipelines it jumps to may decide that answer, and forwards there
             // send their own ECS, which this pipeline's key does not carry.
             // 回答检查 continue 之后，请求在决策循环余下的部分一直持有条目（见
-            // `ForwardDecisionContext::held_inflight`），等待者拿到最终应答。这个应答可能由
+            // `Route::held_inflight`），等待者拿到最终应答。这个应答可能由
             // pipeline 余下的规则和它跳到的 pipeline 决定，而那里的转发发送自己的 ECS，
             // 本 pipeline 的键并不带着。
             if reads[idx].continues {
