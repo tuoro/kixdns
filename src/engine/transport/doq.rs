@@ -898,11 +898,13 @@ impl DoqMuxClient {
         // The address sending 0-RTT first, then IPv4 before IPv6: on some networks IPv6 is
         // unstable, or an MTU limit keeps QUIC's Initial packets from getting through
         addresses.sort_by_key(|address| (Some(*address) != zero_rtt_at, address.is_ipv6()));
-        staggered(addresses, deadline, |address| {
+        let reach = |address| {
             let zero_rtt = Some(address) == zero_rtt_at;
             Self::connect_to(&runtime, &upstream, &target, address, zero_rtt)
-        })
-        .await
+        };
+        // QUIC 的握手整个在 `reach` 里，后面不再握手 / QUIC's handshake is all in `reach`, none
+        // following it
+        staggered(addresses, deadline, reach, futures::future::ok).await
     }
 
     /// 在 `address` 上建一条到 `target` 的连接（见 [`Self::connect_new`]）/ Connects to `target` at

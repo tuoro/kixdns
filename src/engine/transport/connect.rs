@@ -27,60 +27,85 @@ use webpki_roots::TLS_SERVER_ROOTS;
 /// started
 pub(super) const ATTEMPT_DELAY: Duration = Duration::from_millis(250);
 
-/// 用 `attempt` 连上 `addresses` 里的一个（RFC 8305 第 4、5 节）：地址按族交替排开，第一个地址那一族在前；起一个尝试，
-/// 它过了 [`ATTEMPT_DELAY`] 还没连上、或者失败了，就接着起下一个，先连上的那个用，别的放弃；都失败时按失败的先后列出每个
-/// 地址和它的失败，日志里看得出连过哪些。到了建连的期限 `deadline`（见 [`Connect::attempt`]）还没连上时，已经失败的照列，
-/// 还在连的记成「多久没回应」：黑洞地址、丢掉的 SYN、不回的 TLS 或 DoQ 握手都是这样，原因里看得出是哪些地址。TCP、DoT、
-/// 直连的 DoH 和 DoQ 都这样连，一个尝试连同握手（见 [`connect_tcp`]）：前面的地址不回应时，后面的不用等到建连的时限才轮到
-/// Connects through `attempt` to one of `addresses` (RFC 8305 sections 4 and 5): the addresses
-/// alternate by family, the first address's family first; one attempt is started, and once it is
-/// not through after [`ATTEMPT_DELAY`], or has failed, the next one is, the first to connect
-/// being used and the rest given up; with all failed every address is reported with its failure,
-/// in the order they failed, so a log shows what was dialled. Not through by the connect's
-/// `deadline` (see [`Connect::attempt`]), those failed are reported as ever and those still
-/// connecting as unanswered for so long: so for an address that is a black hole, a SYN dropped, a
-/// TLS or DoQ handshake never answered, the cause shows which addresses they were. TCP, DoT,
-/// direct DoH and DoQ all connect so, an attempt taking in the handshake (see [`connect_tcp`]):
-/// with an early address not answering, the later ones have their turn well within the
-/// connect's time limit
-pub(super) async fn staggered<T, F>(
+/// 用 `reach` 连上 `addresses` 里的一个，再在上面做 `handshake`（RFC 8305 第 4、5 节）：地址按族交替排开，第一个地址那一族
+/// 在前；起一个尝试，它过了 [`ATTEMPT_DELAY`] 还没连上地址、或者失败了，就接着起下一个；连上了地址的，从那一刻起再给握手一个
+/// [`ATTEMPT_DELAY`]，下一个才起：高往返的链路上 TCP 连上以后 TLS 还要一两个往返，和 TCP 算在同一个间隔里的话，每次建连都会
+/// 多起几路握手。先握手完的那个用，别的放弃；都失败时按失败的先后列出每个地址和它的失败，日志里看得出连过哪些。到了建连的期限
+/// `deadline`（见 [`Connect::attempt`]）还没连上时，已经失败的照列，还在连的记成「多久没回应」：黑洞地址、丢掉的 SYN、不回的
+/// TLS 或 DoQ 握手都是这样，原因里看得出是哪些地址。TCP、DoT、直连的 DoH 和 DoQ 都这样连（见 [`connect_tcp`]，DoQ 的握手
+/// 整个算在 `reach` 里）：前面的地址不回应时，后面的不用等到建连的时限才轮到
+/// Connects through `reach` to one of `addresses` and then does `handshake` on it (RFC 8305
+/// sections 4 and 5): the addresses alternate by family, the first address's family first; one
+/// attempt is started, and once it has not reached its address after [`ATTEMPT_DELAY`], or has
+/// failed, the next one is; one that has reached its address is given another
+/// [`ATTEMPT_DELAY`] from then for its handshake before the next starts: on a path with a long
+/// round trip TLS takes a round trip or two more once TCP is through, and counted in the one
+/// interval with TCP it would have every connect start a few handshakes more. The first through
+/// its handshake is used and the rest given up; with all failed every address is reported with
+/// its failure, in the order they failed, so a log shows what was dialled. Not through by the
+/// connect's `deadline` (see [`Connect::attempt`]), those failed are reported as ever and those
+/// still connecting as unanswered for so long: so for an address that is a black hole, a SYN
+/// dropped, a TLS or DoQ handshake never answered, the cause shows which addresses they were.
+/// TCP, DoT, direct DoH and DoQ all connect so (see [`connect_tcp`]; DoQ's handshake is all in
+/// `reach`): with an early address not answering, the later ones have their turn well within
+/// the connect's time limit
+pub(super) async fn staggered<C, T, R, H>(
     addresses: Vec<SocketAddr>,
     deadline: tokio::time::Instant,
-    attempt: impl Fn(SocketAddr) -> F,
+    reach: impl Fn(SocketAddr) -> R,
+    handshake: impl Fn(C) -> H,
 ) -> anyhow::Result<T>
 where
-    F: Future<Output = anyhow::Result<T>>,
+    R: Future<Output = anyhow::Result<C>>,
+    H: Future<Output = anyhow::Result<T>>,
 {
     use futures::StreamExt;
 
+    // 有个尝试连上了地址、开始握手 / An attempt has reached its address and begun its handshake
+    let reached = tokio::sync::Notify::new();
     let mut waiting = interleaved(addresses).into_iter();
     let mut attempts = futures::stream::FuturesUnordered::new();
     // 起过的尝试：地址和起的时候，有了结果的是 None / The attempts started: the address and when,
     // None once it has an outcome
     let mut started = Vec::new();
     let mut failed = Vec::new();
+    // 下一个地址最早什么时候连 / When the next address is dialled at the earliest
+    let mut next_at = tokio::time::Instant::now();
+    let (reach, handshake, reached) = (&reach, &handshake, &reached);
     loop {
-        match waiting.next() {
-            Some(address) => {
-                let at = started.len();
-                started.push(Some((address, tokio::time::Instant::now())));
-                attempts.push(attempt(address).map(move |outcome| (at, outcome)));
-            }
-            None if attempts.is_empty() => {
-                anyhow::ensure!(!failed.is_empty(), "no address to connect to");
-                anyhow::bail!("{}", failed.join("; "));
-            }
-            None => {}
+        let now = tokio::time::Instant::now();
+        if now >= next_at
+            && let Some(address) = waiting.next()
+        {
+            let at = started.len();
+            started.push(Some((address, now)));
+            attempts.push(async move {
+                let outcome = async {
+                    let connection = reach(address).await?;
+                    reached.notify_one();
+                    handshake(connection).await
+                };
+                (at, outcome.await)
+            });
+            next_at = now + ATTEMPT_DELAY;
+        }
+        if attempts.is_empty() && waiting.as_slice().is_empty() {
+            anyhow::ensure!(!failed.is_empty(), "no address to connect to");
+            anyhow::bail!("{}", failed.join("; "));
         }
         tokio::select! {
             Some((at, outcome)) = attempts.next() => {
                 let (address, _) = started[at].take().expect("one outcome per attempt");
                 match outcome {
                     Ok(connected) => return Ok(connected),
-                    Err(error) => failed.push(format!("connect {address}: {error:#}")),
+                    Err(error) => {
+                        failed.push(format!("connect {address}: {error:#}"));
+                        next_at = tokio::time::Instant::now();
+                    }
                 }
             }
-            () = tokio::time::sleep(ATTEMPT_DELAY), if !waiting.as_slice().is_empty() => {}
+            () = reached.notified() => next_at = tokio::time::Instant::now() + ATTEMPT_DELAY,
+            () = tokio::time::sleep_until(next_at), if !waiting.as_slice().is_empty() => {}
             () = tokio::time::sleep_until(deadline) => {
                 failed.extend(started.iter().flatten().map(|(address, since)| {
                     let waited = since.elapsed().as_millis();
@@ -113,14 +138,14 @@ fn interleaved(addresses: Vec<SocketAddr>) -> Vec<SocketAddr> {
 /// 连上写成 `主机:端口` 的地址（TCP、DoT 上游，直连的 DoH 上游）：主机名交给 `bootstrap` 解析，几个地址错开着连
 /// （见 [`staggered`]），最晚连到建连的期限 `deadline`。连一个地址是一整个尝试：TCP 连上、调好（见
 /// [`tune_stream_socket`]），再在上面做 `handshake`（DoT、DoH 的 TLS 握手，TCP 原样交出），所以握手不回应的地址和 SYN
-/// 不回应的一样，过了 [`ATTEMPT_DELAY`] 就连下一个，到期时原因里写着它
+/// 不回应的一样，TCP 连上以后再过 [`ATTEMPT_DELAY`] 就连下一个，到期时原因里写着它
 /// Connects to an address written as `host:port` (TCP and DoT upstreams, a direct DoH one): the
 /// host name goes to `bootstrap`, several addresses are connected to staggered (see
 /// [`staggered`]) up to the connect's `deadline`. Connecting to one address is one whole
 /// attempt: TCP connected and tuned (see [`tune_stream_socket`]), then `handshake` on it (the
 /// TLS handshake of DoT and DoH, TCP handing the stream on as it is), so an address not answering
-/// the handshake is as one not answering the SYN, the next dialled after [`ATTEMPT_DELAY`] and
-/// the cause at the deadline naming it
+/// the handshake is as one not answering the SYN, the next dialled [`ATTEMPT_DELAY`] after TCP
+/// is through and the cause at the deadline naming it
 pub(in crate::engine) async fn connect_tcp<T, F>(
     bootstrap: &Bootstrap,
     address: &str,
@@ -141,13 +166,12 @@ where
                 .await?
         }
     };
-    let handshake = &handshake;
-    staggered(addresses, deadline, |socket| async move {
+    let reach = |socket| async move {
         let stream = TcpStream::connect(socket).await?;
         tune_stream_socket(&stream, address);
-        handshake(stream).await
-    })
-    .await
+        Ok(stream)
+    };
+    staggered(addresses, deadline, reach, handshake).await
 }
 
 /// TCP 连接的保活，TCP、DoT 和 DoH（直连的和经 reqwest 的）都一样：这么久没有收发就探一次，没回应隔这么久再探，探到系统定的

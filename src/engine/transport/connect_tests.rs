@@ -1,6 +1,7 @@
 //! 建连、老化和连接池的测试 / Tests of connecting, aging and pools
 
 use super::*;
+use futures::future;
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -121,35 +122,92 @@ async fn attempts_are_staggered_and_a_failure_moves_on_at_once() {
     );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     let started = tokio::time::Instant::now();
-    let connected = staggered(vec![a, b], deadline, |address| async move {
+    let pending_at_a = |address| async move {
         if address == a {
             std::future::pending::<anyhow::Result<SocketAddr>>().await
         } else {
             Ok(address)
         }
-    })
-    .await
-    .expect("the second connects");
+    };
+    let connected = staggered(vec![a, b], deadline, pending_at_a, future::ok)
+        .await
+        .expect("the second connects");
     assert_eq!((connected, started.elapsed()), (b, ATTEMPT_DELAY));
 
     let started = tokio::time::Instant::now();
-    let connected = staggered(vec![a, b], deadline, |address| async move {
+    let refused_at_a = |address| async move {
         anyhow::ensure!(address != a, "{address} refused");
         Ok(address)
-    })
-    .await
-    .expect("the second connects");
+    };
+    let connected = staggered(vec![a, b], deadline, refused_at_a, future::ok)
+        .await
+        .expect("the second connects");
     assert_eq!((connected, started.elapsed()), (b, Duration::ZERO));
 
-    let failed = staggered(vec![a, b], deadline, |_| async move {
-        Err::<SocketAddr, _>(anyhow::anyhow!("refused"))
-    })
-    .await
-    .expect_err("none connects");
+    let refused = |_| async move { Err::<SocketAddr, _>(anyhow::anyhow!("refused")) };
+    let failed = staggered(vec![a, b], deadline, refused, future::ok)
+        .await
+        .expect_err("none connects");
     assert_eq!(
         failed.to_string(),
         format!("connect {a}: refused; connect {b}: refused")
     );
+}
+
+/// 连上了地址、握手还没完：从连上的那一刻起再给握手一个 [`ATTEMPT_DELAY`]，下一个地址才起。往返 200 ms 的链路上 TCP 200 ms
+/// 连上、TLS 再要 200 ms：只连一个地址，400 ms 握手完；握手不回的，TCP 连上 250 ms 以后连下一个。以前 TCP 和 TLS 算在同一个
+/// 250 ms 里，往返超过 125 ms 的链路上每次建连都多起一路握手
+/// An address reached and its handshake not through yet: the handshake is given another
+/// [`ATTEMPT_DELAY`] from the moment it was reached before the next address starts. On a path of
+/// a 200 ms round trip TCP takes 200 ms and TLS 200 ms more: one address alone is dialled, through
+/// its handshake at 400 ms; with the handshake never answered, the next is dialled 250 ms after
+/// TCP was through. TCP and TLS used to count in the one 250 ms, so on a path with a round trip
+/// over 125 ms every connect started a handshake more
+#[tokio::test(start_paused = true)]
+async fn a_handshake_has_its_own_attempt_delay() {
+    let (a, b): (SocketAddr, SocketAddr) = (
+        "192.0.2.1:853".parse().unwrap(),
+        "[2001:db8::1]:853".parse().unwrap(),
+    );
+    let round_trip = Duration::from_millis(200);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let dialled = std::sync::Mutex::new(Vec::new());
+    let reach = |address| {
+        dialled.lock().unwrap().push(address);
+        async move {
+            tokio::time::sleep(round_trip).await;
+            Ok(address)
+        }
+    };
+
+    let started = tokio::time::Instant::now();
+    let shake = |address| async move {
+        tokio::time::sleep(round_trip).await;
+        Ok(address)
+    };
+    let connected = staggered(vec![a, b], deadline, reach, shake)
+        .await
+        .expect("the first connects");
+    assert_eq!((connected, started.elapsed()), (a, 2 * round_trip));
+    assert_eq!(*dialled.lock().unwrap(), [a], "the second never dialled");
+
+    dialled.lock().unwrap().clear();
+    let started = tokio::time::Instant::now();
+    let silent_at_a = |address| async move {
+        if address == a {
+            std::future::pending::<anyhow::Result<SocketAddr>>().await
+        } else {
+            Ok(address)
+        }
+    };
+    let connected = staggered(vec![a, b], deadline, reach, silent_at_a)
+        .await
+        .expect("the second connects");
+    assert_eq!(
+        (connected, started.elapsed()),
+        (b, round_trip + ATTEMPT_DELAY + round_trip)
+    );
+    assert_eq!(*dialled.lock().unwrap(), [a, b]);
 }
 
 /// 到了建连的期限还没连上：已经失败的照列，还在连的记成多久没回应，看得出是哪些地址。以前外层的时限先到，连过的地址和
@@ -165,12 +223,13 @@ async fn attempts_still_connecting_at_the_deadline_are_named() {
     let [a, b, c]: [SocketAddr; 3] =
         ["192.0.2.1:53", "192.0.2.2:53", "192.0.2.3:53"].map(|address| address.parse().unwrap());
     let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-    let failed = staggered(vec![a, b, c], deadline, |address| async move {
+    let refused_at_b = |address| async move {
         anyhow::ensure!(address != b, "refused");
         std::future::pending::<anyhow::Result<()>>().await
-    })
-    .await
-    .expect_err("none connects");
+    };
+    let failed = staggered(vec![a, b, c], deadline, refused_at_b, future::ok)
+        .await
+        .expect_err("none connects");
     // a 一开始就连，b 过了 ATTEMPT_DELAY 才连、马上失败，c 紧跟着连 / a is dialled at once, b after
     // ATTEMPT_DELAY failing at once, and c straight after
     assert_eq!(
