@@ -533,7 +533,12 @@ pub struct UpstreamResult<'a> {
     pub via: Transport,
     /// Result classification.
     pub outcome: UpstreamOutcome,
-    /// Time spent on this attempt.
+    /// Time spent on this attempt: from sending the query to having the answer (or
+    /// the failure), every send for the address included, the hedged retry and the
+    /// TCP fallback too. With `via` TCP after a UDP attempt it is therefore the
+    /// whole attempt, not the TCP exchange alone.
+    /// 这次尝试用了多久：从发出查询到拿到应答（或失败）的总时长，这个地址上的每一次发送都算在里面，重发和 TCP 回退也是。
+    /// UDP 改用 TCP 以后 `via` 是 TCP，这时它也是整次尝试的时长，不只是 TCP 那一段。
     pub latency: Duration,
     /// Response code of the received answer; `None` when no answer was
     /// received or it could not be parsed.
