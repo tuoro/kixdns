@@ -6,10 +6,11 @@ use std::time::{Duration, Instant};
 
 use notify::event::{AccessKind, AccessMode, EventKind, ModifyKind, RenameMode};
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher, WatcherKind};
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use crate::config;
 use crate::engine::Engine;
+use crate::matcher::geoip::FileStamp;
 
 /// 文件写完以后（写的一方关上了它，或者改名到了位）再等这么久，把同一次保存的其它事件收齐：改名盖过目标文件时
 /// notify 报一个「改名到这里」，再报一个同时列出两端的「改名」；证书和私钥前后脚换。
@@ -35,41 +36,77 @@ const AT_MOST: Duration = Duration::from_secs(2);
 /// [`ConfigWatch::start`]. The watch used to go in only once the configuration was read and the
 /// engine built, and a change in between was lost, the kernel keeping the old configuration
 /// until the next change
-pub struct ConfigWatch(PendingWatch);
+pub struct ConfigWatch {
+    watch: PendingWatch,
+    /// 读之前配置文件什么样（见 [`ConfigWatch::start_reporting`]）/ What the configuration file
+    /// looked like before it was read (see [`ConfigWatch::start_reporting`])
+    before_read: Option<FileStamp>,
+}
 
 impl ConfigWatch {
     /// 开始监视配置文件 `path`，在读它之前调用 / Starts watching the configuration file `path`;
     /// call it before reading the file
     pub fn new(path: &Path) -> notify::Result<Self> {
-        PendingWatch::new(&[path.to_path_buf()]).map(Self)
+        let watch = PendingWatch::new(&[path.to_path_buf()])?;
+        let before_read = FileStamp::of(path).ok();
+        Ok(Self { watch, before_read })
     }
 
-    /// 配置文件每改一次（开始之前排着的也算）就照着它重载 `engine`，直到返回的 [`FileWatch`] 被丢掉
+    /// 配置文件每改一次（开始之前排着的也算）就照着它重载 `engine`，直到返回的 [`FileWatch`] 被丢掉。`read` 是启动时
+    /// 读到的配置文本（见 [`ConfigWatch::start_reporting`]）
     /// Reloads `engine` from the configuration file on every change to it (those queued before
-    /// the start included), until the returned [`FileWatch`] is dropped
-    pub fn start(self, engine: Engine) -> notify::Result<FileWatch> {
-        self.start_reporting(engine, |_| {})
+    /// the start included), until the returned [`FileWatch`] is dropped. `read` is the
+    /// configuration text startup read (see [`ConfigWatch::start_reporting`])
+    pub fn start(self, engine: Engine, read: String) -> notify::Result<FileWatch> {
+        self.start_reporting(engine, read, |_| {})
     }
 
     /// 同 [`ConfigWatch::start`]，监视得怎样交给 `on_watch`：为什么有位置监视不上，都监视上了是 None。开始时报一次装的
     /// 时候的（见 [`PendingWatch::uncovered`]），之后每次重载之前文件重新解析、监视跟着换，再报一次（见
     /// [`PendingWatch::start_reporting`]）
+    ///
+    /// 头一次重载之前，文件还是启动时读它之前的样子（见 [`FileStamp`]）、内容也和启动时读到的 `read` 一字不差时不重载：
+    /// 内核用的就是它。macOS 的 FSEvents 会把装监视之前不久的写入报给刚装上的监视，同一份配置就会在启动以后又重载一次，
+    /// 配置里有问题时还多记一条重载失败。一字不差地再存一次照样重载（让重载重读 MMDB、监视不了的 Geo 文件），存过以后
+    /// 修改时间就变了；修改时间只精确到秒的文件系统上，同一秒里改成一样长的别的内容，靠内容看得出来
     /// As [`ConfigWatch::start`], with how the file is watched going to `on_watch`: why some of
     /// its places cannot be watched, None when every one is. It is reported once at the start, as
     /// installed (see [`PendingWatch::uncovered`]), and again before each reload, as the file is
     /// resolved again with the watches following (see [`PendingWatch::start_reporting`])
+    ///
+    /// Until the first reload, the file still looking as it did before startup read it (see
+    /// [`FileStamp`]) and holding word for word the `read` startup got is not reloaded: it is
+    /// what the kernel runs. macOS's FSEvents reports a write made shortly before the watch was
+    /// installed to the watch just installed, and the same configuration would be reloaded once
+    /// more after startup, a failed reload logged besides for a configuration with a problem.
+    /// Saved again word for word it is reloaded all the same (making the reload read the MMDB or
+    /// Geo files that cannot be watched again), the save changing its modification time; on a
+    /// file system keeping that time to the second, other content of the same length written
+    /// within that second is told by the content
     pub fn start_reporting(
         self,
         engine: Engine,
+        read: String,
         mut on_watch: impl FnMut(Option<&notify::Error>) + Send + 'static,
     ) -> notify::Result<FileWatch> {
-        on_watch(self.0.uncovered().next().map(|(_, err)| err));
-        self.0
+        let Self { watch, before_read } = self;
+        let mut as_read = before_read.map(|stamp| (stamp, read));
+        on_watch(watch.uncovered().next().map(|(_, err)| err));
+        watch
             .start_reporting("config-watcher", move |path| {
+                let loaded = config::load_config_with_source(path);
+                if as_read.as_ref().is_some_and(|(stamp, read)| {
+                    FileStamp::of(path).is_ok_and(|now| now == *stamp)
+                        && loaded.as_ref().is_ok_and(|(_, raw)| raw == read)
+                }) {
+                    debug!(path = %path.display(), "config file as read at startup, not reloaded");
+                    return;
+                }
+                as_read = None;
                 // 启动时只记错误、照样加载的那些写法，重载时拒绝（见 config::compile）
                 // What startup only logs as errors and loads all the same, a reload refuses (see
                 // config::compile)
-                let loaded = config::load_config_with_source(path).and_then(|(cfg, raw)| {
+                let loaded = loaded.and_then(|(cfg, raw)| {
                     let version = cfg.version.clone();
                     config::compile(cfg).map(|cfg| (cfg, raw, version))
                 });
@@ -117,7 +154,7 @@ impl PendingWatch {
             let _ = events.send(Message::Event(event));
         })?;
         for (path, err) in &uncovered {
-            error!(path = %path.display(), error = %err, "cannot watch every place the file leads, changes there go unseen");
+            error!(path = %path.display(), error = %err, "cannot watch every place the file leads");
         }
         Ok(Self {
             watcher,
@@ -128,14 +165,15 @@ impl PendingWatch {
         })
     }
 
-    /// 装的时候有位置监视不上的文件：配置里写的路径，和为什么（那里的变化看不到）。比如符号链接指向的目录还不存在：链接
-    /// 所在的目录监视着，链接换了指向看得到，目录建好以后里面的文件出现了却看不到。开始以后文件重新解析时监视得怎样经
-    /// [`PendingWatch::start_reporting`] 的 `on_watch` 报
-    /// The files with places that could not be watched when installed: the path as configured,
-    /// and why (changes there go unseen). A symlink into a directory not there yet, say: the
-    /// link's directory is watched, so the link pointing elsewhere is seen, yet once the
-    /// directory is made the file showing up in it is not. How a file is watched as it is
-    /// resolved again after the start goes to `on_watch` of [`PendingWatch::start_reporting`]
+    /// 装的时候有位置监视不上的文件（一处都没监视上的也算）：配置里写的路径，和为什么（这个监视看不到那里的变化）。比如
+    /// 符号链接指向的目录还不存在：链接所在的目录监视着，链接换了指向看得到，目录建好以后里面的文件出现了却看不到。开始
+    /// 以后文件重新解析时监视得怎样经 [`PendingWatch::start_reporting`] 的 `on_watch` 报
+    /// The files with places that could not be watched when installed (those watched nowhere
+    /// included): the path as configured, and why (the watch does not see changes there). A
+    /// symlink into a directory not there yet, say: the link's directory is watched, so the
+    /// link pointing elsewhere is seen, yet once the directory is made the file showing up in
+    /// it is not. How a file is watched as it is resolved again after the start goes to
+    /// `on_watch` of [`PendingWatch::start_reporting`]
     pub(crate) fn uncovered(&self) -> impl Iterator<Item = (&Path, &notify::Error)> {
         self.uncovered
             .iter()
@@ -155,12 +193,12 @@ impl PendingWatch {
     }
 
     /// 同 [`PendingWatch::start`]，每次回调之前文件重新解析、监视跟着换以后，把它监视得怎样交给 `on_watch`：参数是
-    /// 配置里写的路径，和它新的位置为什么监视不上（那里的变化看不到；这时也记一条 error），都监视上了是 None。开始之前
-    /// 监视得怎样见 [`PendingWatch::uncovered`]
+    /// 配置里写的路径，和它新的位置为什么监视不上（这个监视看不到那里的变化；这时也记一条 error），都监视上了是 None。
+    /// 开始之前监视得怎样见 [`PendingWatch::uncovered`]
     /// As [`PendingWatch::start`], and each time a file is resolved again before its callback,
     /// with the watches following, how it is watched goes to `on_watch`: the path as configured,
-    /// and why its new places cannot be watched (changes there go unseen; an error is logged
-    /// too), None when every one is. How it is watched before the start, see
+    /// and why its new places cannot be watched (the watch does not see changes there; an error
+    /// is logged too), None when every one is. How it is watched before the start, see
     /// [`PendingWatch::uncovered`]
     pub(crate) fn start_reporting(
         self,
@@ -258,11 +296,12 @@ struct Target {
 type Uncovered = Vec<(PathBuf, notify::Error)>;
 
 impl Targets {
-    /// 监视 `paths`，事件交给 `handler`，并给出有监视点所在的目录监视不了的文件和为什么。一个文件的监视点所在的目录一个
-    /// 都监视不了时报错
+    /// 监视 `paths`，事件交给 `handler`，并给出有监视点所在的目录监视不了的文件和为什么，一个都监视不了的也在里面（它
+    /// 哪儿都没监视上，同一个监视里别的文件照常监视）。只有建不起监视、解析不了路径时报错
     /// Watches `paths`, sending events to `handler`, and gives the files with a watch point
-    /// directory that cannot be watched, and why. An error when none of a file's watch point
-    /// directories can be watched
+    /// directory that cannot be watched, and why, those with none that can included (watched
+    /// nowhere, the other files of the watch being watched as usual). An error only when the
+    /// watcher cannot be made or a path cannot be resolved
     fn watch(
         paths: &[PathBuf],
         handler: impl notify::EventHandler,
@@ -283,10 +322,8 @@ impl Targets {
             }
             let points = watch_points(path).map_err(notify::Error::io)?;
             let (held, first_error) = targets.hold(&mut watcher, &points);
-            match (held.is_empty(), first_error) {
-                (true, Some(err)) => return Err(err),
-                (false, Some(err)) => uncovered.push((path.clone(), err)),
-                _ => {}
+            if let Some(err) = first_error {
+                uncovered.push((path.clone(), err));
             }
             targets.files.push(Target {
                 configured: path.clone(),
@@ -343,10 +380,10 @@ impl Targets {
     }
 
     /// 文件 `index` 重新解析一遍，监视换到新的监视点所在的目录。解析不了（监视留在原处），或者有监视点所在的目录
-    /// 监视不上时报错：那里的变化看不到
+    /// 监视不上时报错：这个监视看不到那里的变化
     /// Resolves file `index` again and moves the watches to the directories of its new watch
     /// points. An error when it cannot be resolved (the watches staying where they were), or a
-    /// watch point's directory cannot be watched: changes there go unseen
+    /// watch point's directory cannot be watched: the watch does not see changes there
     fn refresh(&mut self, watcher: &mut RecommendedWatcher, index: usize) -> notify::Result<()> {
         let points = watch_points(&self.files[index].configured).map_err(notify::Error::io)?;
         // 先装新的再撤旧的，两边都用着的目录不会断开 / The new watches go in before the old come out,
@@ -578,7 +615,7 @@ fn pump(
                     let watched = targets.refresh(watcher, index);
                     let configured = &targets.files[index].configured;
                     if let Err(err) = &watched {
-                        error!(path = %configured.display(), error = %err, "cannot watch the file where it now leads, changes there go unseen");
+                        error!(name, path = %configured.display(), error = %err, "cannot watch the file where it now leads");
                     }
                     on_watch(configured, watched.as_ref().err());
                     on_change(configured);
@@ -777,13 +814,15 @@ mod tests {
     }
 
     /// notify 漏了事件（比如 inotify 的队列满了）时报的 Rescan 不带路径：什么都可能改过，每个文件都回调一次，记一条
-    /// error；notify 报的错也记 error。两条都带着监视的名字和它的文件：配置、GeoSite、GeoIP、DoH 证书各有一个监视，
-    /// 看得出是哪个
+    /// error；notify 报的错也记 error，这两条带着监视的文件。重新解析以后有位置监视不上的文件（这里是所在的目录不在）
+    /// 也记一条 error，带着它的路径。每条都带着监视的名字：配置、GeoSite、GeoIP、DoH 证书各有一个监视，看得出是哪个
     /// The Rescan notify reports when events were missed (inotify's queue overflowing, say)
     /// names no path: anything may have changed, so every file is called back once and an
-    /// error is logged; an error notify reports is logged as an error too. Both carry the watch's
-    /// name and its files: the configuration, GeoSite, GeoIP and the DoH certificate each have a
-    /// watch, and which one it is shows
+    /// error is logged; an error notify reports is logged as an error too, both carrying the
+    /// watch's files. A file with places that cannot be watched once resolved again (here its
+    /// directory is not there) logs an error too, carrying its path. Each carries the watch's
+    /// name: the configuration, GeoSite, GeoIP and the DoH certificate each have a watch, and
+    /// which one it is shows
     #[test]
     fn a_rescan_calls_every_file_back_and_errors_are_logged() {
         use tracing_subscriber::layer::SubscriberExt as _;
@@ -807,9 +846,13 @@ mod tests {
             }
         }
         let dir = tempfile::tempdir().expect("tempdir");
-        // 不建这两个文件，免得真的事件也回调它们 / The files are not created, so that no real
-        // event calls them back too
-        let files = [dir.path().join("a.json"), dir.path().join("b.json")];
+        // 不建这些文件，免得真的事件也回调它们；最后一个所在的目录也不在 / The files are not created,
+        // so that no real event calls them back too; the last one's directory is not there either
+        let files = [
+            dir.path().join("a.json"),
+            dir.path().join("b.json"),
+            dir.path().join("missing").join("c.json"),
+        ];
         let PendingWatch {
             mut watcher,
             mut targets,
@@ -828,6 +871,9 @@ mod tests {
             let _ = stop.send(Message::Stop);
         });
 
+        // 重新解析时记的那条，别的测试的监视线程也会碰到 / The one logged when resolving again is hit
+        // by other tests' watch threads too
+        crate::engine::test_support::callsites_ask_every_time();
         let errors = std::sync::Arc::default();
         let subscriber =
             tracing_subscriber::registry().with(Errors(std::sync::Arc::clone(&errors)));
@@ -850,13 +896,17 @@ mod tests {
         called.sort();
         assert_eq!(called, files);
         let errors = errors.lock().unwrap();
-        assert_eq!(errors.len(), 2, "{errors:#?}");
+        assert_eq!(errors.len(), 3, "{errors:#?}");
         for error in errors.iter() {
             assert!(error.contains("name=\"test-watch\""), "{error}");
+        }
+        for error in &errors[..2] {
             for file in &files {
                 assert!(error.contains(&format!("{file:?}")), "{error}");
             }
         }
+        let unwatched = format!("path={} ", files[2].display());
+        assert!(errors[2].contains(&unwatched), "{}", errors[2]);
     }
 
     /// 一阵改动等到每个文件都安静下来：写着的文件晚，其它文件早安静了也得等它；它写完了就按它的时刻；
@@ -1201,6 +1251,38 @@ mod tests {
         );
     }
 
+    /// 一个文件的监视点所在的目录一个都监视不上（所在的目录不在）：它哪儿都没监视上，带着为什么列在 `uncovered` 里，监视
+    /// 照样装好，同一个监视里别的文件照常监视、回调
+    /// A file none of whose watch point directories can be watched (its directory not there) is
+    /// watched nowhere and listed in `uncovered` with why; the watch is installed all the same,
+    /// the other files of it watched and called back as usual
+    #[test]
+    fn a_file_watched_nowhere_leaves_the_others_watched() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // 真路径：macOS 的临时目录在符号链接 /var 下面，链接所在的根目录监视得上 / The real path:
+        // macOS's temporary directory is under the symlink /var, and the root it sits in can be
+        // watched
+        let real = std::fs::canonicalize(dir.path()).expect("real path");
+        let (watched, nowhere) = (real.join("watched.file"), real.join("missing/nowhere.file"));
+        std::fs::write(&watched, "v1").expect("seed file");
+
+        let pending = PendingWatch::new(&[nowhere.clone(), watched.clone()]).expect("watch");
+        let uncovered: Vec<&Path> = pending.uncovered().map(|(path, _)| path).collect();
+        assert_eq!(uncovered, [nowhere.as_path()]);
+        let (tx, rx) = mpsc::channel();
+        let _watch = pending
+            .start("test-watch", move |path| {
+                let _ = tx.send(path.to_path_buf());
+            })
+            .expect("start");
+        std::fs::write(&watched, "v2").expect("change file");
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)).ok(),
+            Some(watched),
+            "the other file is watched"
+        );
+    }
+
     /// 装监视的时候符号链接就指向不存在的目录：链接所在的目录监视得上，监视照样装好，这个文件带着为什么列在
     /// `uncovered` 里，都监视得上的文件不在。以前只要有一个监视点装上就当监视着，监视不上的那些谁也不知道
     /// A symlink leading into a directory not there when the watch is installed: the link's
@@ -1247,9 +1329,10 @@ mod tests {
 
         for (path, uncovered) in [(linked, true), (plain, false)] {
             let (tx, rx) = mpsc::channel();
+            let read = std::fs::read_to_string(&path).unwrap_or_default();
             let _watch = ConfigWatch::new(&path)
                 .expect("watch")
-                .start_reporting(engine.clone(), move |watched| {
+                .start_reporting(engine.clone(), read, move |watched| {
                     let _ = tx.send(watched.map(ToString::to_string));
                 })
                 .expect("start");

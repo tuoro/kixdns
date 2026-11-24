@@ -42,11 +42,11 @@ impl RuntimeRule {
 /// the configuration's text again
 #[derive(Debug, Clone)]
 pub enum StaticAnswer {
-    /// 只有 RCODE、不带记录：static_response、deny（REFUSED），以及写的地址或 CNAME 目标读不出来、TXT 装不下时的 SERVFAIL
-    /// （配置检查报过）
+    /// 只有 RCODE、不带记录：static_response、deny（REFUSED），以及写的地址或 CNAME 目标读不出来、TXT 一个字符串也没有或
+    /// 装不下时的 SERVFAIL（配置检查报过，见 `engine::response::txt_problem`）
     /// An RCODE alone, with no records: static_response, deny (REFUSED), and the SERVFAIL of an
-    /// address or CNAME target that cannot be read, or of a TXT that does not fit (which the
-    /// configuration check reports)
+    /// address or CNAME target that cannot be read, or of a TXT that names no string or does not
+    /// fit (which the configuration check reports, see `engine::response::txt_problem`)
     Rcode(ResponseCode),
     /// 按问题给的记录 / Records given by the question
     Records(StaticRecords),
