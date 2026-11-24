@@ -254,11 +254,11 @@ pub struct RuntimePipeline {
     /// GeoIP) would be work done twice
     pub last_precomputed: Option<usize>,
     /// How the answer can depend on the requester: through this pipeline's rules,
-    /// the rules along the response-jump paths its answer checks start, and, when
-    /// an answer check continues, the pipelines its rules jump to. Response cache,
-    /// inflight and rule cache keys tell requesters apart by it.
+    /// the rules along the response-jump paths its answer checks start, and the
+    /// pipelines its rules jump to after an answer check may have continued.
+    /// Response cache, inflight and rule cache keys tell requesters apart by it.
     /// 应答如何取决于请求方：来自本 pipeline 的规则、它的回答检查开始的响应跳转路径上的
-    /// 规则，以及回答检查会 continue 时它的规则跳到的 pipeline。响应缓存、inflight 和
+    /// 规则，以及回答检查可能 continue 之后它的规则跳到的 pipeline。响应缓存、inflight 和
     /// 规则缓存的键按它区分请求方。
     pub requester: RequesterScope,
     /// What this pipeline's own request matchers tell requesters apart by. A rule
@@ -277,23 +277,26 @@ pub struct RuntimePipeline {
     /// former and follows the latter to look in its target.
     pub matches_regex: bool,
     /// 缓存在这个 pipeline 键下的应答和规则决定取决于哪些 Geo 数据：它自己的规则读的标签，和 [`Self::answered_through`]
-    /// 里的 pipeline 的规则读的。请求阶段跳过去的应答缓存在目标的键下，跟着目标的命名空间走。其中哪个标签的数据换了，按
+    /// 里的 pipeline 的规则读的。别的请求阶段跳转拿到的应答缓存在目标的键下，跟着目标的命名空间走。其中哪个标签的数据换了，按
     /// 旧数据缓存的应答和规则决定就不能再用，这个 pipeline 换缓存命名空间；别的标签换了它不跟着换（见
     /// `EngineInner::at_geo`）
     /// Which Geo data the answers and rule decisions cached under this pipeline's keys depend
     /// on: the tags its own rules read, and those the rules of the pipelines in
-    /// [`Self::answered_through`] read. The answers a request-phase jump gets are cached under
-    /// the target's keys and go with the target's namespace. Once the data of any of those tags
+    /// [`Self::answered_through`] read. The answers any other request-phase jump gets are cached
+    /// under the target's keys and go with the target's namespace. Once the data of any of those tags
     /// changes, answers and rule decisions cached with the old data are no longer valid, and the
     /// pipeline moves to a new cache namespace; other tags changing leave it where it is (see
     /// `EngineInner::at_geo`)
     pub geo_data: GeoData,
-    /// 经回答检查的跳转能到达的 pipeline（在 `RuntimePipelineConfig::pipelines` 里的下标），以及从那里再跳到的：跳过去
-    /// 拿到的应答缓存在这个 pipeline 的键下，所以它们的配置也算进这个 pipeline 的缓存命名空间（见
+    /// 经回答检查的跳转、或者回答检查可能 continue 之后规则的跳转能到达的 pipeline（在 `RuntimePipelineConfig::pipelines`
+    /// 里的下标），以及从那里再跳到的：据过上游的回答以后跳过去拿到的应答缓存在这个 pipeline 的键下（见
+    /// `engine::execution::Route::enter`），所以它们的配置也算进这个 pipeline 的缓存命名空间（见
     /// `engine::types::build_cache_namespaces`），它们一改，按旧配置缓存的应答就不再用
-    /// The pipelines an answer check's jump reaches (by index in `RuntimePipelineConfig::pipelines`),
-    /// and those jumped to from there: the answers got over there are cached under this
-    /// pipeline's key, so their configuration goes into this pipeline's cache namespace too (see
+    /// The pipelines reached by an answer check's jump, or by a jump of the rules after an answer
+    /// check may have continued (by index in `RuntimePipelineConfig::pipelines`), and those
+    /// jumped to from there: what is got over there once an upstream's answer has been gone by is
+    /// cached under this pipeline's key (see `engine::execution::Route::enter`), so their
+    /// configuration goes into this pipeline's cache namespace too (see
     /// `engine::types::build_cache_namespaces`), and once they change, answers cached by the
     /// old configuration are no longer used
     pub answered_through: Vec<usize>,
