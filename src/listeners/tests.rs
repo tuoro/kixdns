@@ -840,7 +840,7 @@ async fn queued_and_refused_replies_leave_from_the_address_the_query_came_to() {
     // 流控拒绝时当场发的，不等待：tokio 要先看到 socket 可写 / What is sent at once when flow
     // control refuses, without waiting: tokio has to have seen the socket writable first
     server.writable().await.unwrap();
-    try_send_udp_response(&server, &query("a.test", 1), b"refused", to);
+    to.try_send(&server, b"refused").unwrap();
     expect(b"refused").await;
 
     // 接收循环在等新报文时直接发的 / What goes directly while the receive loop waits
