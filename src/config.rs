@@ -1138,7 +1138,7 @@ pub enum EcsMode {
     /// Used to spoof a specific geo-location, ignoring the real client IP.
     Static {
         /// 固定 IP 地址（IPv4 或 IPv6）/ Fixed IP address (IPv4 or IPv6)
-        ip: String,
+        ip: crate::ecs::StaticEcsIp,
         /// Source prefix length (default: 24)
         #[serde(default = "default_ecs_prefix_v4")]
         prefix: u8,
@@ -2001,10 +2001,13 @@ fn rule_problems(
         );
     for (action, skipped_when_empty) in actions {
         if let Action::Forward {
-            ecs: Some(EcsMode::Static { ip, .. }),
+            ecs:
+                Some(EcsMode::Static {
+                    ip: crate::ecs::StaticEcsIp::NotAnIp(ip),
+                    ..
+                }),
             ..
         } = action
-            && ip.parse::<std::net::IpAddr>().is_err()
         {
             report(format!(
                 "ecs ip \"{ip}\" is not an IP address, so no ECS is sent"

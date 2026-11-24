@@ -9,11 +9,14 @@
 //! 仅在缓存未命中路径（`handle_forward_decision` 内部）执行，
 //! 热路径（缓存命中 / 静态响应）完全不受影响。
 
+use std::borrow::Cow;
 use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
 
 use hickory_proto::op::Message;
 use hickory_proto::rr::rdata::opt::{ClientSubnet, EdnsCode, EdnsOption};
+
+use serde::{Deserialize, Serialize};
 
 use crate::config::EcsMode;
 
@@ -29,24 +32,39 @@ pub const DEFAULT_PREFIX_V4: u8 = 24;
 /// 默认 IPv6 源前缀长度
 pub const DEFAULT_PREFIX_V6: u8 = 56;
 
-/// Apply ECS transformation to a DNS wire packet, returning modified bytes.
-/// 对 DNS wire 包应用 ECS 变换，返回修改后的字节。
-///
-/// Returns the original packet bytes if:
-/// - Mode is `Clear` but no ECS exists (no-op)
-/// - Mode is `FromClientIp` and the client's own ECS goes on as it is, or the client
-///   sent none and its IP is private (privacy protection, RFC 1918/ULA/loopback);
-///   see `plan`
-/// - Static IP is invalid
-/// - Message parsing fails (malformed query)
-///
-/// 以下情况返回原始包字节：
-/// - 模式为 `Clear` 但不存在 ECS（无需操作）
-/// - 模式为 `FromClientIp`，客户端自己的 ECS 原样转发，或者客户端没带 ECS 而 IP 为私有地址
-///   （隐私保护，RFC 1918/ULA/loopback）；见 `plan`
-/// - 静态 IP 无效
-/// - 消息解析失败（畸形查询）
-pub fn apply_ecs(packet: &[u8], mode: &EcsMode, peer_ip: IpAddr) -> Vec<u8> {
+/// `static` 模式写的 ECS 地址（见 `EcsMode::Static`），读配置时就解析好，转发时不再解析。写的不是 IP 地址时留着原文：
+/// 配置检查报出它（见 `config::problems`），这样的转发不发 ECS（见 [`plan`]）。按原文读写，写出来的再读回去还是它
+/// The ECS address the `static` mode writes (see `EcsMode::Static`), parsed as the configuration
+/// is read and not again on a forward. One that is no IP address keeps its text: the
+/// configuration check raises it (see `config::problems`), and such a forward sends no ECS (see
+/// [`plan`]). It is read and written as text, and what it writes reads back as itself
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(from = "String", into = "String")]
+pub enum StaticEcsIp {
+    Ip(IpAddr),
+    /// 写的不是 IP 地址：原文 / Not an IP address: the text as written
+    NotAnIp(String),
+}
+
+impl From<String> for StaticEcsIp {
+    fn from(text: String) -> Self {
+        text.parse().map_or(Self::NotAnIp(text), Self::Ip)
+    }
+}
+
+impl From<StaticEcsIp> for String {
+    fn from(ip: StaticEcsIp) -> Self {
+        match ip {
+            StaticEcsIp::Ip(ip) => ip.to_string(),
+            StaticEcsIp::NotAnIp(text) => text,
+        }
+    }
+}
+
+/// 对查询报文执行 `mode` 的 ECS 改写（见 [`plan`]），客户端自己带的 ECS 从报文里读。
+/// Rewrites a query's ECS as `mode` has it (see [`plan`]), the client's own ECS read off the
+/// packet.
+pub fn apply_ecs<'a>(packet: &'a [u8], mode: &EcsMode, peer_ip: IpAddr) -> Cow<'a, [u8]> {
     let client = match mode {
         EcsMode::FromClientIp { .. } => crate::proto_utils::client_subnet(packet),
         _ => None,
@@ -54,22 +72,30 @@ pub fn apply_ecs(packet: &[u8], mode: &EcsMode, peer_ip: IpAddr) -> Vec<u8> {
     apply_ecs_for(packet, mode, peer_ip, client.as_ref())
 }
 
-/// [`apply_ecs`] for a request whose own ECS option the caller already holds, as
-/// the engine does: a background refresh replays a packet that cannot carry an
-/// option nobody can read (see `RefreshTarget::client_ecs`).
-/// 调用方已经拿着请求自己 ECS 选项时的 [`apply_ecs`]，引擎就是这样：后台刷新重放的包带不了
-/// 读不懂的选项（见 `RefreshTarget::client_ecs`）。
-pub(crate) fn apply_ecs_for(
-    packet: &[u8],
+/// [`apply_ecs`]，请求自己的 ECS 选项调用方已经拿着，引擎就是这样：后台刷新重放的包带不了读不懂的选项（见
+/// `RefreshTarget::client_ecs`）。改写照线上格式做，和交给客户端的应答换上、去掉 ECS 是同一套（见
+/// `proto_utils::echo_ecs`、`proto_utils::ecs_removed`）；不用改、改不了（读不出的报文、TSIG 签过的查询：改了签名就
+/// 不对了）时借着原包，不复制
+/// [`apply_ecs`] for a request whose own ECS option the caller already holds, as the engine
+/// does: a background refresh replays a packet that cannot carry an option nobody can read (see
+/// `RefreshTarget::client_ecs`). The rewrite is done on the wire, by the same code that sets or
+/// takes out the ECS of a reply for a client (see `proto_utils::echo_ecs`,
+/// `proto_utils::ecs_removed`); with nothing to change, or no way to change it (a message that
+/// cannot be read, a query signed with TSIG, whose signature a change would break), the packet
+/// is borrowed as it is, uncopied
+pub(crate) fn apply_ecs_for<'a>(
+    packet: &'a [u8],
     mode: &EcsMode,
     peer_ip: IpAddr,
     client: Option<&EcsKey>,
-) -> Vec<u8> {
-    match plan(Some(mode), peer_ip, client) {
-        EcsPlan::Strip => strip_ecs(packet),
-        EcsPlan::Keep => packet.to_vec(),
-        EcsPlan::Set(subnet) => inject_ecs(packet, subnet),
-    }
+) -> Cow<'a, [u8]> {
+    let rewritten = match plan(Some(mode), peer_ip, client) {
+        EcsPlan::Strip => crate::proto_utils::ecs_removed(packet),
+        EcsPlan::Keep => None,
+        // 查询里的 SCOPE 必须为 0（RFC 7871 第 6 节）/ A query's SCOPE must be 0 (RFC 7871 section 6)
+        EcsPlan::Set(subnet) => crate::proto_utils::echo_ecs(packet, &subnet, 0),
+    };
+    rewritten.map_or(Cow::Borrowed(packet), Cow::Owned)
 }
 
 /// What a forward does with the ECS option of the packet it sends.
@@ -130,12 +156,11 @@ pub(crate) fn plan(mode: Option<&EcsMode>, peer_ip: IpAddr, client: Option<&EcsK
             }
             OwnEcs::Private | OwnEcs::Absent => EcsPlan::Keep,
         },
-        Some(EcsMode::Static { ip, prefix }) => match ip.parse::<IpAddr>() {
-            Ok(parsed) => EcsPlan::Set(EcsKey::from_ip(parsed, *prefix, *prefix)),
-            Err(_) => {
-                tracing::warn!(ip = %ip, "invalid static ECS IP, skipping injection / 静态 ECS IP 无效，跳过注入");
-                EcsPlan::Keep
-            }
+        Some(EcsMode::Static { ip, prefix }) => match ip {
+            StaticEcsIp::Ip(ip) => EcsPlan::Set(EcsKey::from_ip(*ip, *prefix, *prefix)),
+            // 配置检查报过它（见 `config::problems`），这里不再报 / The configuration check reported
+            // it (see `config::problems`), so it is not reported again here
+            StaticEcsIp::NotAnIp(_) => EcsPlan::Keep,
         },
     }
 }
@@ -187,50 +212,6 @@ pub(crate) fn forwards_own_ecs(peer_ip: IpAddr, client: Option<&EcsKey>) -> bool
     }
 }
 
-/// Inject (or replace) ECS OPT option into a DNS wire packet.
-/// 向 DNS wire 包注入（或替换）ECS OPT 选项。
-///
-/// Uses hickory-proto `Message` round-trip for correctness — OPT pseudo-record
-/// manipulation involves variable-length TLV encoding and ARCOUNT updates that
-/// are error-prone at wire level. This only runs on cache-miss path.
-///
-/// 使用 hickory-proto `Message` 往返保证正确性 — OPT 伪记录操作涉及变长 TLV
-/// 编码和 ARCOUNT 更新，在 wire 层操作容易出错。此函数仅在缓存未命中路径执行。
-fn inject_ecs(packet: &[u8], subnet: EcsKey) -> Vec<u8> {
-    let mut msg = match Message::from_vec(packet) {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::debug!(error = %e, "ECS inject: failed to parse message, forwarding as-is / ECS 注入：解析消息失败，原样转发");
-            return packet.to_vec();
-        }
-    };
-
-    // RFC 7871 §6: ADDRESS carries only SOURCE PREFIX-LENGTH bits, zero-padded
-    // to the last octet. hickory emits ceil(prefix / 8) octets of the address
-    // as given, so a prefix that is not a multiple of 8 would leak the client's
-    // extra bits and produce an option strict upstreams reject as FORMERR.
-    // RFC 7871 §6：ADDRESS 只能带 SOURCE PREFIX-LENGTH 位，其余零填充。hickory 按
-    // 原样输出 ceil(prefix/8) 字节，非 8 的倍数前缀会泄露客户端多余位，且严格的
-    // 上游会回 FORMERR。
-    // `EcsKey` holds the address already masked to its prefix, which is capped at the
-    // family's length.
-    // `EcsKey` 里的地址已经按前缀掩码，前缀也已按地址族的长度封顶。
-    let Some(addr) = subnet.ip() else {
-        return packet.to_vec();
-    };
-    let subnet = ClientSubnet::new(addr, subnet.source_prefix, 0);
-
-    set_ecs_option(&mut msg, subnet);
-
-    match msg.to_vec() {
-        Ok(buf) => buf,
-        Err(e) => {
-            tracing::debug!(error = %e, "ECS inject: failed to re-encode message, forwarding as-is / ECS 注入：重新编码消息失败，原样转发");
-            packet.to_vec()
-        }
-    }
-}
-
 /// 把报文 OPT 里的 ECS 换成 `subnet`；没有 OPT 时新建一个，负载上限 1232 字节。hickory-proto
 /// 0.26 的 OPT 用 Vec 存选项，insert() 总是追加，所以先去掉已有的 ECS，免得重复。
 /// Make `subnet` the ECS of the message's OPT, creating one with a 1232-byte payload
@@ -244,46 +225,6 @@ pub(crate) fn set_ecs_option(msg: &mut Message, subnet: ClientSubnet) {
     });
     edns.options_mut().remove(EdnsCode::Subnet);
     edns.options_mut().insert(EdnsOption::Subnet(subnet));
-}
-
-/// Strip ECS OPT option from a DNS wire packet.
-/// 从 DNS wire 包中剥离 ECS OPT 选项。
-///
-/// If no ECS option exists, returns the original packet unchanged.
-/// 如果不存在 ECS 选项，原样返回原始包。
-///
-/// The options are cut out of the OPT record as they stand, so one hickory cannot
-/// decode (an unknown family, a prefix too long) goes too; hickory only steps in
-/// when records follow the OPT record (see `proto_utils::without_ecs`).
-/// 选项按报文原样从 OPT 记录里删掉，所以 hickory 解不开的选项（地址族未知、前缀过长）也能删；
-/// 只有 OPT 后面还有记录时才交给 hickory（见 `proto_utils::without_ecs`）。
-fn strip_ecs(packet: &[u8]) -> Vec<u8> {
-    if let Ok(stripped) = crate::proto_utils::without_ecs(bytes::Bytes::copy_from_slice(packet)) {
-        return stripped.to_vec();
-    }
-    let mut msg = match Message::from_vec(packet) {
-        Ok(m) => m,
-        Err(_) => return packet.to_vec(),
-    };
-
-    let has_ecs = msg
-        .edns
-        .as_ref()
-        .and_then(|e| e.options().get(EdnsCode::Subnet))
-        .is_some();
-
-    if !has_ecs {
-        return packet.to_vec();
-    }
-
-    if let Some(edns) = &mut msg.edns {
-        edns.options_mut().remove(EdnsCode::Subnet);
-    }
-
-    match msg.to_vec() {
-        Ok(buf) => buf,
-        Err(_) => packet.to_vec(),
-    }
 }
 
 /// ECS 不带给上游的客户端地址：`geoip_private` 算作内网的那些（见 `geoip::is_private_ip`，两边只用这一份），再加上两段
@@ -521,10 +462,7 @@ mod tests {
     fn an_opt_made_for_the_ecs_advertises_1232_bytes() {
         let query = make_query("example.com", 0x1234);
         assert!(Message::from_vec(&query).unwrap().edns.is_none());
-        let modified = inject_ecs(
-            &query,
-            EcsKey::from_ip("203.0.113.5".parse().unwrap(), 24, 24),
-        );
+        let modified = with_static_ecs(&query, "203.0.113.5", 24);
         let edns = Message::from_vec(&modified).unwrap().edns.expect("an OPT");
         assert_eq!(edns.max_payload(), 1232);
     }
@@ -551,15 +489,21 @@ mod tests {
         msg.to_vec().unwrap()
     }
 
-    // ---- inject_ecs ----
+    /// `static` 模式发 `ip`/`prefix` 的查询 / The query a `static` mode sends for `ip`/`prefix`
+    fn with_static_ecs(packet: &[u8], ip: &str, prefix: u8) -> Vec<u8> {
+        let mode = EcsMode::Static {
+            ip: ip.to_string().into(),
+            prefix,
+        };
+        apply_ecs(packet, &mode, "192.0.2.1".parse().unwrap()).into_owned()
+    }
+
+    // ---- set / 加上 ----
 
     #[test]
     fn test_inject_ecs_into_plain_query() {
         let query = make_query("example.com", 0x1234);
-        let modified = inject_ecs(
-            &query,
-            EcsKey::from_ip(IpAddr::V4("203.0.113.5".parse().unwrap()), 24, 24),
-        );
+        let modified = with_static_ecs(&query, "203.0.113.5", 24);
 
         assert!(has_ecs(&modified), "ECS should be present after injection");
         let (addr, src_prefix, scope) = extract_ecs_info(&modified).unwrap();
@@ -571,10 +515,7 @@ mod tests {
     #[test]
     fn test_inject_ecs_into_query_with_existing_opt() {
         let query = make_query_with_opt("example.com", 0x1234);
-        let modified = inject_ecs(
-            &query,
-            EcsKey::from_ip(IpAddr::V4("203.0.113.5".parse().unwrap()), 24, 24),
-        );
+        let modified = with_static_ecs(&query, "203.0.113.5", 24);
 
         assert!(has_ecs(&modified));
         let (addr, _, _) = extract_ecs_info(&modified).unwrap();
@@ -584,8 +525,7 @@ mod tests {
     #[test]
     fn test_inject_ecs_v6() {
         let query = make_query("example.com", 0x1234);
-        let v6: std::net::Ipv6Addr = "2001:db8:abcd:1234::5".parse().unwrap();
-        let modified = inject_ecs(&query, EcsKey::from_ip(IpAddr::V6(v6), 56, 56));
+        let modified = with_static_ecs(&query, "2001:db8:abcd:1234::5", 56);
 
         assert!(has_ecs(&modified));
         let (addr, src_prefix, _) = extract_ecs_info(&modified).unwrap();
@@ -606,55 +546,205 @@ mod tests {
         // First inject
         // 第一次注入
         let query = make_query("example.com", 0x1234);
-        let modified = inject_ecs(
-            &query,
-            EcsKey::from_ip(IpAddr::V4("203.0.113.5".parse().unwrap()), 24, 24),
-        );
+        let modified = with_static_ecs(&query, "203.0.113.5", 24);
         assert!(has_ecs(&modified));
 
         // Inject again with different subnet — should replace, not duplicate
         // 用不同子网再次注入 — 应替换而非重复
-        let re_modified = inject_ecs(
-            &modified,
-            EcsKey::from_ip(IpAddr::V4("198.51.100.5".parse().unwrap()), 24, 24),
-        );
+        let re_modified = with_static_ecs(&modified, "198.51.100.5", 24);
         let (addr, _, _) = extract_ecs_info(&re_modified).unwrap();
         assert_eq!(addr, IpAddr::V4("198.51.100.0".parse().unwrap()));
+        let edns = Message::from_vec(&re_modified).unwrap().edns.unwrap();
+        assert_eq!(edns.options().get_all(EdnsCode::Subnet).len(), 1);
     }
 
-    // ---- strip_ecs ----
+    // ---- clear / 去掉 ----
 
     #[test]
     fn test_strip_ecs_removes_ecs() {
-        let query = make_query("example.com", 0x1234);
-        let injected = inject_ecs(
-            &query,
-            EcsKey::from_ip(IpAddr::V4("203.0.113.5".parse().unwrap()), 24, 24),
-        );
+        let injected = with_static_ecs(&make_query("example.com", 0x1234), "203.0.113.5", 24);
         assert!(has_ecs(&injected));
 
-        let stripped = strip_ecs(&injected);
+        let stripped = apply_ecs(&injected, &EcsMode::Clear, "127.0.0.1".parse().unwrap());
         assert!(!has_ecs(&stripped), "ECS should be removed / ECS 应被移除");
     }
 
+    /// `static` 的地址读配置时就解析好，转发时不再解析；不是 IP 地址的留着原文，写出来再读回去还是它
+    /// A `static` address is parsed as the configuration is read, not on a forward; one that is
+    /// no IP address keeps its text, and what is written reads back as itself
     #[test]
-    fn test_strip_ecs_no_ecs_is_noop() {
-        let query = make_query("example.com", 0x1234);
-        assert!(!has_ecs(&query));
+    fn a_static_address_is_parsed_as_the_configuration_is_read() {
+        let read = |ip: &str| {
+            serde_json::from_value::<EcsMode>(serde_json::json!({"mode": "static", "ip": ip}))
+                .unwrap()
+        };
+        assert_eq!(
+            read("2001:db8::1"),
+            EcsMode::Static {
+                ip: StaticEcsIp::Ip("2001:db8::1".parse().unwrap()),
+                prefix: 24,
+            }
+        );
+        assert_eq!(
+            read("not.an.ip"),
+            EcsMode::Static {
+                ip: StaticEcsIp::NotAnIp("not.an.ip".to_string()),
+                prefix: 24,
+            }
+        );
+        for mode in [read("203.0.113.0"), read("not.an.ip")] {
+            let written = serde_json::to_value(&mode).unwrap();
+            assert_eq!(serde_json::from_value::<EcsMode>(written).unwrap(), mode);
+        }
+    }
 
-        let result = strip_ecs(&query);
-        assert!(!has_ecs(&result));
+    /// 没有 ECS 可去、客户端自己的 ECS 原样转发、静态地址不是 IP 地址时，都借着原包，不复制
+    /// With no ECS to take out, the client's own ECS going on as it is, or a static address that
+    /// is no IP address, the packet is borrowed as it is, uncopied
+    #[test]
+    fn an_unchanged_query_is_borrowed() {
+        let query = make_query_with_opt("example.com", 0x1234);
+        let peer: IpAddr = "203.0.113.42".parse().unwrap();
+        assert!(matches!(
+            apply_ecs(&query, &EcsMode::Clear, peer),
+            Cow::Borrowed(_)
+        ));
+        let from_client = EcsMode::FromClientIp {
+            prefix_v4: 24,
+            prefix_v6: 56,
+        };
+        let own = subnet("198.51.100.0/24");
+        assert!(matches!(
+            apply_ecs_for(&query, &from_client, peer, Some(&own)),
+            Cow::Borrowed(_)
+        ));
+        let not_an_ip = EcsMode::Static {
+            ip: "not.an.ip".to_string().into(),
+            prefix: 24,
+        };
+        assert!(matches!(
+            apply_ecs(&query, &not_an_ip, peer),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    /// 线上格式改写的结果和交给 hickory 重新编码的逐字节相同：没有 OPT、OPT 里没有选项、已经带着别的子网、还带着
+    /// cookie 和 DO 位的查询，问题名大小写混写、带 RD 和 CD，各种子网都一样；OPT 后面还有记录时本来就交给 hickory
+    /// The rewrite on the wire comes out byte for byte as hickory encodes it again: for a query
+    /// without an OPT, with an empty one, already carrying another subnet, and with a cookie and
+    /// the DO bit too, its name in mixed case with RD and CD set, for every subnet; with records
+    /// after the OPT it goes to hickory anyway
+    #[test]
+    fn the_rewrite_on_the_wire_matches_hickory_byte_for_byte() {
+        let with_options = |options: Vec<EdnsOption>, dnssec_ok: bool| {
+            let mut msg = Message::from_vec(&make_query("WwW.ExAmple.CoM", 0x4321)).unwrap();
+            msg.metadata.recursion_desired = true;
+            msg.metadata.checking_disabled = true;
+            let mut edns = hickory_proto::op::Edns::new();
+            edns.set_max_payload(4096);
+            edns.set_dnssec_ok(dnssec_ok);
+            for option in options {
+                edns.options_mut().insert(option);
+            }
+            msg.edns = Some(edns);
+            msg
+        };
+        let other = EdnsOption::Subnet(ClientSubnet::new("198.51.100.0".parse().unwrap(), 24, 0));
+        let cookie = EdnsOption::Unknown(10, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        // OPT 后面再跟一条 A 记录：hickory 编码时总把 OPT 放在最后，所以照线上格式接上 / An A record after
+        // the OPT: hickory always puts the OPT last as it encodes, so it is appended on the wire
+        let mut records_after_opt = with_options(vec![other.clone()], false).to_vec().unwrap();
+        records_after_opt[11] += 1;
+        records_after_opt
+            .extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0, 2, 9]);
+        let queries = [
+            make_query("example.com", 0x1234),
+            with_options(Vec::new(), false).to_vec().unwrap(),
+            with_options(vec![other.clone()], false).to_vec().unwrap(),
+            with_options(vec![cookie.clone(), other, cookie], true)
+                .to_vec()
+                .unwrap(),
+            records_after_opt,
+        ];
+        // 原先的做法：hickory 读出整个报文、换上或去掉 ECS 再编码 / How it used to be done: hickory
+        // reads the whole message, sets or takes out the ECS and encodes it again
+        let by_hickory = |query: &[u8], subnet: Option<EcsKey>| {
+            let mut msg = Message::from_vec(query).unwrap();
+            match subnet {
+                Some(subnet) => set_ecs_option(
+                    &mut msg,
+                    ClientSubnet::new(subnet.ip().unwrap(), subnet.source_prefix, 0),
+                ),
+                None => msg
+                    .edns
+                    .as_mut()
+                    .unwrap()
+                    .options_mut()
+                    .remove(EdnsCode::Subnet),
+            }
+            msg.to_vec().unwrap()
+        };
+        let peer: IpAddr = "192.0.2.1".parse().unwrap();
+        for query in &queries {
+            let cleared = apply_ecs(query, &EcsMode::Clear, peer);
+            if has_ecs(query) {
+                assert_eq!(*cleared, by_hickory(query, None));
+            } else {
+                assert!(matches!(cleared, Cow::Borrowed(_)));
+            }
+            for (ip, prefix) in [
+                ("203.0.113.77", 24),
+                ("203.0.113.255", 20),
+                ("2001:db8:abcd:ef01::1", 56),
+                ("192.0.2.1", 0),
+            ] {
+                let sent = with_static_ecs(query, ip, prefix);
+                let subnet = EcsKey::from_ip(ip.parse().unwrap(), prefix, prefix);
+                assert_eq!(sent, by_hickory(query, Some(subnet)), "{ip}/{prefix}");
+                let cleared = apply_ecs(&sent, &EcsMode::Clear, peer);
+                assert_eq!(*cleared, by_hickory(&sent, None), "{ip}/{prefix}");
+            }
+        }
+    }
+
+    /// TSIG 签过的查询（RFC 8945）改了哪一位签名都失效：ECS 加不上也去不掉，原样发出，不交给 hickory 重新编码
+    /// A query signed with TSIG (RFC 8945) has its signature broken by any change: its ECS is
+    /// neither set nor taken out, and it goes as it came, not encoded again by hickory
+    #[test]
+    fn a_signed_query_goes_as_it_came() {
+        let signed = |options: &[u8]| {
+            let mut packet = make_query("example.com", 0x1234);
+            packet[11] = 2;
+            packet.extend_from_slice(&[0, 0, 41, 0x04, 0xd0, 0, 0, 0, 0]);
+            packet.extend_from_slice(&(options.len() as u16).to_be_bytes());
+            packet.extend_from_slice(options);
+            // 一条 TSIG：属主 key.、类型 250、类别 ANY / A TSIG: owner key., type 250, class ANY
+            packet.extend_from_slice(b"\x03key\x00");
+            packet.extend_from_slice(&[0, 250, 0, 255, 0, 0, 0, 0, 0, 4, 1, 2, 3, 4]);
+            assert!(crate::proto_utils::last_record_is_tsig(&packet));
+            packet
+        };
+        let ecs = [0, 8, 0, 7, 0, 1, 24, 0, 198, 51, 100];
+        let peer: IpAddr = "203.0.113.42".parse().unwrap();
+        let fixed = EcsMode::Static {
+            ip: "203.0.113.0".to_string().into(),
+            prefix: 24,
+        };
+        for packet in [signed(&[]), signed(&ecs)] {
+            for mode in [&EcsMode::Clear, &fixed] {
+                assert!(matches!(
+                    apply_ecs(&packet, mode, peer),
+                    Cow::Borrowed(sent) if sent == packet.as_slice()
+                ));
+            }
+        }
     }
 
     // ---- apply_ecs (integration) ----
 
     #[test]
     fn test_apply_ecs_clear_mode() {
-        let query = make_query("example.com", 0x1234);
-        let injected = inject_ecs(
-            &query,
-            EcsKey::from_ip(IpAddr::V4("203.0.113.5".parse().unwrap()), 24, 24),
-        );
+        let injected = with_static_ecs(&make_query("example.com", 0x1234), "203.0.113.5", 24);
 
         let mode = EcsMode::Clear;
         let result = apply_ecs(&injected, &mode, "127.0.0.1".parse().unwrap());
@@ -708,7 +798,7 @@ mod tests {
         // IPv6 走 Static 路径同样处理：/52 之后的位必须清零。
         let query = make_query("example.com", 0x2002);
         let mode = EcsMode::Static {
-            ip: "2001:db8:abcd:ef01::1".to_string(),
+            ip: "2001:db8:abcd:ef01::1".to_string().into(),
             prefix: 52,
         };
         let modified = apply_ecs(&query, &mode, IpAddr::V4("192.0.2.1".parse().unwrap()));
@@ -766,7 +856,7 @@ mod tests {
     fn test_apply_ecs_static_mode() {
         let query = make_query("example.com", 0x1234);
         let mode = EcsMode::Static {
-            ip: "203.0.113.0".to_string(),
+            ip: "203.0.113.0".to_string().into(),
             prefix: 24,
         };
         let result = apply_ecs(&query, &mode, "127.0.0.1".parse().unwrap());
@@ -781,7 +871,7 @@ mod tests {
     fn test_apply_ecs_static_invalid_ip_skipped() {
         let query = make_query("example.com", 0x1234);
         let mode = EcsMode::Static {
-            ip: "not.an.ip.addr".to_string(),
+            ip: "not.an.ip.addr".to_string().into(),
             prefix: 24,
         };
         let result = apply_ecs(&query, &mode, "8.8.8.8".parse().unwrap());
@@ -1003,7 +1093,7 @@ mod tests {
     #[test]
     fn test_ecs_key_static_mode() {
         let mode = EcsMode::Static {
-            ip: "203.0.113.0".to_string(),
+            ip: "203.0.113.0".to_string().into(),
             prefix: 24,
         };
         let key = planned(&mode, "127.0.0.1".parse().unwrap()).unwrap();
@@ -1016,7 +1106,7 @@ mod tests {
     #[test]
     fn test_ecs_key_static_invalid_ip_returns_none() {
         let mode = EcsMode::Static {
-            ip: "not.an.ip".to_string(),
+            ip: "not.an.ip".to_string().into(),
             prefix: 24,
         };
         let key = planned(&mode, "8.8.8.8".parse().unwrap());

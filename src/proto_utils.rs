@@ -1403,17 +1403,17 @@ fn padding_added(message: &[u8], block: usize) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// 给缓存里的应答换上回显客户端自己 ECS 的选项，作用范围为 `scope`（RFC 7871 第 7.2.2 节：
-/// 查询带 ECS，应答就要带），取代它原有的 ECS 选项；应答没有 OPT 时补一条。报文读不出来、
-/// OPT 后面还有记录（见 `OptRecord::last`），或者最后一条记录是 TSIG（OPT 不能排在它后面）
-/// 时为 None。
-/// Give a cached reply an option echoing the client's own ECS with `scope`
-/// (RFC 7871 section 7.2.2: a query with ECS gets a reply with it), in place of
-/// any ECS option it has, adding an OPT record when the reply has none. None
-/// when the message cannot be read, records follow its OPT (see
-/// `OptRecord::last`), or its last record is a TSIG, which OPT may not follow.
+/// 报文换上 `subnet` 的 ECS 选项，作用范围为 `scope`，取代它原有的 ECS 选项；没有 OPT 时补一条。交给带 ECS 的客户端的
+/// 应答回显它自己的子网（RFC 7871 第 7.2.2 节：查询带 ECS，应答就要带），转发出去的查询带上要发的子网（`scope` 为 0）。
+/// 报文读不出来、OPT 后面还有记录（见 `OptRecord::last`），或者最后一条记录是 TSIG（OPT 不能排在它后面）时为 None。
+/// The message with an ECS option for `subnet` with `scope`, in place of any ECS option it has,
+/// an OPT added when it has none. A reply for a client that sent ECS echoes the client's own
+/// subnet (RFC 7871 section 7.2.2: a query with ECS gets a reply with it), and a query going
+/// upstream carries the subnet to send (`scope` 0). None when the message cannot be read,
+/// records follow its OPT (see `OptRecord::last`), or its last record is a TSIG, which OPT may
+/// not follow.
 pub(crate) fn with_ecs_echo(
-    stored: &[u8],
+    message: &[u8],
     subnet: &crate::ecs::EcsKey,
     scope: u8,
 ) -> Option<Vec<u8>> {
@@ -1426,49 +1426,59 @@ pub(crate) fn with_ecs_echo(
     option.push(scope);
     option.extend_from_slice(address);
 
-    match find_opt(stored).ok()? {
+    match find_opt(message).ok()? {
         // See `OptRecord::last` / 见 `OptRecord::last`
         Some(opt) if !opt.last => None,
         Some(opt) => {
             // 已有的 ECS 选项换成这一个 / An ECS option already there is replaced by this one
-            let kept = match ecs_option(stored, opt.rdata.clone()).ok()? {
+            let kept = match ecs_option(message, opt.rdata.clone()).ok()? {
                 Some(existing) => existing.bytes,
                 None => opt.rdata.end..opt.rdata.end,
             };
             let rd_len = u16::try_from(opt.rdata.len() - kept.len() + option.len()).ok()?;
-            let mut out = Vec::with_capacity(stored.len() + option.len());
-            out.extend_from_slice(&stored[..kept.start]);
-            out.extend_from_slice(&stored[kept.end..opt.rdata.end]);
+            let mut out = Vec::with_capacity(message.len() + option.len());
+            out.extend_from_slice(&message[..kept.start]);
+            out.extend_from_slice(&message[kept.end..opt.rdata.end]);
             out.extend_from_slice(&option);
-            out.extend_from_slice(&stored[opt.rdata.end..]);
+            out.extend_from_slice(&message[opt.rdata.end..]);
             out[opt.rdlen_at..opt.rdlen_at + 2].copy_from_slice(&rd_len.to_be_bytes());
             Some(out)
         }
-        None => with_opt(stored, false, &option),
+        None => with_opt(message, false, &option),
     }
 }
 
-/// 同 `with_ecs_echo`，它不肯改写时（OPT 后面还有记录）改由 hickory 读出整个报文、换上回显
-/// 再重新编码（OPT 放到最后）。读不了、写不出，或者最后一条记录是 TSIG 时为 None。
-/// As `with_ecs_echo`, falling back, where that declines (records after the OPT),
-/// to reading the whole message with hickory, setting the echo and encoding it
-/// again (OPT last). None when it cannot be read or written, or its last record
-/// is a TSIG.
-pub(crate) fn echo_ecs(stored: &[u8], subnet: &crate::ecs::EcsKey, scope: u8) -> Option<Vec<u8>> {
-    with_ecs_echo(stored, subnet, scope).or_else(|| rewrite_ecs(stored, Some((subnet, scope))))
+/// 同 `with_ecs_echo`，它不肯改写时（OPT 后面还有记录）改由 hickory 读出整个报文、换上 ECS 再重新编码（OPT 放到最后）。
+/// 读不了、写不出，或者最后一条记录是 TSIG（改了签名就不对了）时为 None。
+/// As `with_ecs_echo`, falling back, where that declines (records after the OPT), to reading the
+/// whole message with hickory, setting the ECS and encoding it again (OPT last). None when it
+/// cannot be read or written, or its last record is a TSIG, whose signature a change would break.
+pub(crate) fn echo_ecs(message: &[u8], subnet: &crate::ecs::EcsKey, scope: u8) -> Option<Vec<u8>> {
+    with_ecs_echo(message, subnet, scope).or_else(|| rewrite_ecs(message, Some((subnet, scope))))
 }
 
-/// 应答去掉 ECS 选项后交给客户端：`without_ecs` 去不掉时（OPT 后面还有记录）改由 hickory
-/// 重新编码。都不行时原样交回。
-/// The reply without its ECS option, for a client: where `without_ecs` cannot take
-/// it out (records after the OPT), hickory encodes it again. Handed back as it is
-/// when neither can.
-pub(crate) fn ecs_removed(reply: Bytes) -> Bytes {
-    without_ecs(reply).unwrap_or_else(|kept| rewrite_ecs(&kept, None).map_or(kept, Bytes::from))
+/// 去掉 ECS 选项的报文：交给没带 ECS 的客户端的应答（RFC 7871 第 7.2.2 节），以及 `clear` 转发出去的查询。OPT 是最后
+/// 一条记录时从它里面剪掉（见 `without_options`），后面还有记录、或者照线上格式读不了时由 hickory 重新编码（见
+/// `rewrite_ecs`）。没有 ECS 选项、或者去不掉（hickory 也读不了、最后一条是 TSIG）时为 None
+/// The message without its ECS option: a reply for a client that sent no ECS (RFC 7871 section
+/// 7.2.2), and a query a `clear` forward sends. Cut out of the OPT when that is the last record
+/// (see `without_options`); encoded again by hickory when records follow it, or when it cannot
+/// be read on the wire (see `rewrite_ecs`). None when there is no ECS option, or it cannot be
+/// taken out (hickory cannot read the message either, or its last record is a TSIG)
+pub(crate) fn ecs_removed(message: &[u8]) -> Option<Vec<u8>> {
+    match find_opt(message) {
+        Ok(None) => None,
+        Ok(Some(opt)) if opt.last => {
+            without_options(message, &opt, &[8]).unwrap_or_else(|()| rewrite_ecs(message, None))
+        }
+        Ok(Some(opt)) if matches!(ecs_option(message, opt.rdata.clone()), Ok(None)) => None,
+        _ => rewrite_ecs(message, None),
+    }
 }
 
-/// 用 hickory 改写报文里的 ECS 选项：`echo` 为 Some 时换成这个回显，None 时去掉
-/// Rewrite a message's ECS option through hickory: the echo `echo` names, or none
+/// 用 hickory 改写报文里的 ECS 选项：`echo` 为 Some 时换成它，None 时去掉；去掉时没有 ECS 选项为 None
+/// Rewrite a message's ECS option through hickory: to the one `echo` names, or none; None when
+/// it is to be taken out and there is none
 fn rewrite_ecs(message: &[u8], echo: Option<(&crate::ecs::EcsKey, u8)>) -> Option<Vec<u8>> {
     use hickory_proto::rr::rdata::opt::{ClientSubnet, EdnsCode};
     if last_record_is_tsig(message) {
@@ -1484,7 +1494,9 @@ fn rewrite_ecs(message: &[u8], echo: Option<(&crate::ecs::EcsKey, u8)>) -> Optio
             );
         }
         None => {
-            msg.edns.as_mut()?.options_mut().remove(EdnsCode::Subnet);
+            let options = msg.edns.as_mut()?.options_mut();
+            options.get(EdnsCode::Subnet)?;
+            options.remove(EdnsCode::Subnet);
         }
     }
     msg.to_vec().ok()
@@ -4301,10 +4313,7 @@ mod tests {
         #[test]
         fn short_messages_are_left_alone() {
             for short in [Vec::new(), vec![0u8; 5], vec![0u8; 11]] {
-                assert_eq!(
-                    ecs_removed(Bytes::from(short.clone())),
-                    Bytes::from(short.clone())
-                );
+                assert_eq!(ecs_removed(&short), None);
                 assert_eq!(echo_ecs(&short, &subnet("203.0.113.0", 24), 0), None);
                 assert!(!last_record_is_tsig(&short));
             }

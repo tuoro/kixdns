@@ -602,7 +602,7 @@ impl<'a> Forwarding<'a> {
                     "ECS request rewriting applied / 已应用 ECS 请求改写"
                 );
                 (
-                    Cow::Owned(modified),
+                    modified,
                     ForwardEcs::of(Some(mode), &request.requester.ecs_view()),
                 )
             }
@@ -1242,7 +1242,7 @@ pub(crate) fn client_reply(
 ) -> Bytes {
     use crate::ecs_scope::ReplyEcs;
     let Some(client) = client else {
-        return proto_utils::ecs_removed(reply);
+        return proto_utils::ecs_removed(&reply).map_or(reply, Bytes::from);
     };
     if client.is_opaque() {
         return reply;
