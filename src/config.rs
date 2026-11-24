@@ -586,10 +586,11 @@ impl Action {
     }
 
     /// 回答阶段执行到它，这串动作就到此为止（见 `engine::rules`）：除了 log 和 forward（问到的应答换掉手上的，接着执行
-    /// 后面的动作）都是
+    /// 后面的动作）都是。一串里写多少个 forward 都照写的执行
     /// Whether this action, run in the answer phase, is the last of its list to run (see
     /// `engine::rules`): every action but log and forward (the reply it gets replaces the
-    /// answer in hand, and the actions after it run on)
+    /// answer in hand, and the actions after it run on). However many forwards a list writes,
+    /// each runs as written
     pub(crate) fn ends_response(&self) -> bool {
         !matches!(self, Action::Log { .. } | Action::Forward { .. })
     }
