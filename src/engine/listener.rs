@@ -11,7 +11,6 @@ use bytes::{Bytes, BytesMut};
 use hickory_proto::rr::RecordType;
 use tracing::debug;
 
-use super::execution::request_timeout_ms;
 use super::{Engine, FastPathResponse, PreParsedData, utils};
 use crate::observe::ClientTransport;
 use crate::proto_utils;
@@ -116,9 +115,9 @@ impl Engine {
         // within the request, for an upstream or a stale answer's refresh, are bounded by it, and
         // an outer limit of another configuration would cut what they wait for into SERVFAIL.
         // Queries after a reload follow the new configuration
-        let settings = &pre_parsed.state.pipeline.settings;
+        let settings = pre_parsed.settings();
         let (timeout_ms, upstream_timeout_ms) =
-            (request_timeout_ms(settings), settings.upstream_timeout_ms);
+            (settings.request_budget_ms(), settings.upstream_timeout_ms);
         tokio::time::timeout(
             Duration::from_millis(timeout_ms),
             self.handle_packet_full(packet, peer, pre_parsed),
