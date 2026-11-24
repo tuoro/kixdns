@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use super::observation::report_response_decision;
 use crate::cache_store::Cached;
-use crate::config::{Action, Transport};
+use crate::config::{Action, ForwardTarget, Transport};
 use crate::engine::core::Engine;
 use crate::engine::execution::Request;
 use crate::engine::response::{least_ttl, static_reply};
@@ -27,9 +27,9 @@ pub enum Decision {
         answers: Vec<Record>,
     },
     Forward {
-        upstream: Arc<str>,
-        /// Pre-split upstream list (performance optimization) / 预分割的 upstream 列表（性能优化）
-        pre_split_upstreams: Option<std::sync::Arc<Vec<std::sync::Arc<str>>>>,
+        /// 问的上游（见 `GlobalSettings::forward_target`）/ The upstreams asked (see
+        /// `GlobalSettings::forward_target`)
+        target: ForwardTarget,
         response_phase: Option<Arc<ResponsePhase>>,
         rule_name: Arc<str>,
         /// 作出决策的转发规则在它的规则组里排第几（从 0 起）；没有规则作出决策、或是从不 continue 的 allow 时为 None。它
@@ -82,8 +82,7 @@ impl Decision {
         allow_reuse: bool,
     ) -> Self {
         Decision::Forward {
-            upstream: settings.default_upstream_arc(),
-            pre_split_upstreams: settings.default_upstream_pre_split.clone(),
+            target: settings.forward_target(None),
             response_phase: None,
             rule_name,
             rule_index: None,
@@ -450,18 +449,16 @@ async fn run_response_actions(
                 upstream,
                 transport,
                 ecs,
-                pre_split_upstreams,
-                upstream_shared: _,
             } => {
                 // 手上应答记的来源（`udp:1.1.1.1:53`）不是能发查询的地址，所以没写 upstream 时和请求
                 // 阶段一样用 default_upstream
                 // Where the answer in hand came from (`udp:1.1.1.1:53`) is no address to query,
                 // so without an upstream this uses default_upstream as the request phase does
-                let upstream_addr: Arc<str> = Arc::from(
-                    upstream
-                        .as_deref()
-                        .unwrap_or(&request.state.pipeline.settings.default_upstream),
-                );
+                let target = request
+                    .state
+                    .pipeline
+                    .settings
+                    .forward_target(upstream.as_ref());
                 let use_transport = transport.unwrap_or(Transport::Udp);
                 // 自己写了 `ecs` 的照它从客户端的查询改写，应答适用于谁也按它算；没写的和规则自己的转发发同一个包。以前
                 // 这里的 `ecs` 读进来就丢掉了
@@ -490,9 +487,8 @@ async fn run_response_actions(
                     ctx.engine,
                     &request.state.pipeline.settings,
                     packet,
-                    &upstream_addr,
+                    &target,
                     use_transport,
-                    pre_split_upstreams.as_ref(),
                     request.observed,
                     request.asker(),
                 )
@@ -519,7 +515,7 @@ async fn run_response_actions(
                         if UpstreamFailure::was_withheld(&err) {
                             tracing::debug!(
                                 event = "response_action_withheld",
-                                upstream = %upstream_addr,
+                                upstream = %target.upstream,
                                 qname = %qname,
                                 client_ip = %request.peer.ip(),
                                 error = %format_args!("{err:#}"),
@@ -528,9 +524,9 @@ async fn run_response_actions(
                             return Err(err);
                         }
                         crate::warn_sparse!(
-                            per upstream_addr;
+                            per target.upstream;
                             event = "response_action_failure",
-                            upstream = %upstream_addr,
+                            upstream = %target.upstream,
                             qname = %qname,
                             qtype = ?qtype,
                             client_ip = %request.peer.ip(),
