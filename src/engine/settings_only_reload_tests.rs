@@ -54,12 +54,12 @@ async fn a_reload_of_settings_alone_leaves_the_old_answers_behind() {
     assert_eq!(new.queries(), 1);
 }
 
-/// 重载改了只在启动时读的设置（这里是监听地址和缓存容量）时记一条 warn，列出它们：没开面板时也看得见要重启。改回去以后，
-/// 或者只改了重载即生效的设置时不记
+/// 重载改了只在启动时读的设置（这里是监听地址和缓存容量）时记一条 error，列出它们：没开面板、默认日志级别下也看得见要
+/// 重启。改回去以后，或者只改了重载即生效的设置时不记
 /// A reload changing settings read at startup alone (the listening address and the cache
-/// capacity here) logs a warning naming them, so a restart is seen to be due without the
-/// panel too. Once they are changed back, or with only settings applied on a reload changed,
-/// none is logged
+/// capacity here) logs an error naming them, so a restart is seen to be due without the panel
+/// and at the default log level too. Once they are changed back, or with only settings applied
+/// on a reload changed, none is logged
 #[tokio::test]
 async fn a_reload_names_the_settings_that_take_a_restart() {
     let engine = engine_from(settings_only("127.0.0.1:9"));
@@ -75,13 +75,13 @@ async fn a_reload_names_the_settings_that_take_a_restart() {
         warnings
             .lines()
             .into_iter()
-            .filter(|line| line.contains("take effect after a restart"))
+            .filter(|line| line.contains("taking effect only after a restart"))
             .collect::<Vec<_>>()
     };
     let pending = reload(json!({ "bind_udp": "127.0.0.1:5300", "cache_capacity": 1234 }));
     assert_eq!(pending.len(), 1, "{pending:#?}");
     assert!(
-        pending[0].contains("settings=bind_udp, cache_capacity"),
+        pending[0].starts_with("ERROR") && pending[0].contains("settings=bind_udp, cache_capacity"),
         "{}",
         pending[0]
     );

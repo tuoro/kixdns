@@ -379,7 +379,14 @@ async fn run_response_actions(
     for action in ctx.actions {
         match action {
             Action::Log { level } => {
-                log_match(level.as_deref(), ctx.rule_name, qname, request.peer.ip());
+                log_match(
+                    level.as_deref(),
+                    ctx.pipeline_id,
+                    ctx.rule_name,
+                    qname,
+                    qtype,
+                    request.peer.ip(),
+                );
             }
             Action::StaticResponse { rcode } => {
                 let code = parse_rcode(rcode).unwrap_or(ResponseCode::NXDomain);
@@ -563,30 +570,33 @@ async fn run_response_actions(
 /// A static answer the response actions give for the request, with the least TTL of its records:
 /// written on the wire from the client's query (see `response::static_reply`), with no parse of
 /// the request for it
-/// 执行 log 动作：按 `level`（trace、debug、warn、error，别的和不写都是 info）记下命中的规则、查询名和客户端地址
-/// Runs a log action: records the rule that matched, the query name and the client address at
-/// `level` (trace, debug, warn or error, info for anything else or none)
+/// 执行 log 动作：按 `level`（trace、debug、warn、error，别的和不写都是 info）记下命中的 Pipeline 和规则、查询名、查询类型
+/// 和客户端地址
+/// Runs a log action: records the pipeline and rule that matched, the query name, the query type
+/// and the client address at `level` (trace, debug, warn or error, info for anything else or none)
 pub(crate) fn log_match(
     level: Option<&str>,
+    pipeline: &str,
     rule_name: &str,
     qname: &str,
+    qtype: RecordType,
     client_ip: std::net::IpAddr,
 ) {
     match level.unwrap_or("info") {
         "trace" => {
-            tracing::trace!(event = "matcher_log", rule = %rule_name, qname = %qname, client_ip = %client_ip, level = "trace")
+            tracing::trace!(event = "matcher_log", pipeline = %pipeline, rule = %rule_name, qname = %qname, qtype = ?qtype, client_ip = %client_ip, level = "trace")
         }
         "debug" => {
-            tracing::debug!(event = "matcher_log", rule = %rule_name, qname = %qname, client_ip = %client_ip, level = "debug")
+            tracing::debug!(event = "matcher_log", pipeline = %pipeline, rule = %rule_name, qname = %qname, qtype = ?qtype, client_ip = %client_ip, level = "debug")
         }
         "warn" => {
-            tracing::warn!(event = "matcher_log", rule = %rule_name, qname = %qname, client_ip = %client_ip, level = "warn")
+            tracing::warn!(event = "matcher_log", pipeline = %pipeline, rule = %rule_name, qname = %qname, qtype = ?qtype, client_ip = %client_ip, level = "warn")
         }
         "error" => {
-            tracing::error!(event = "matcher_log", rule = %rule_name, qname = %qname, client_ip = %client_ip, level = "error")
+            tracing::error!(event = "matcher_log", pipeline = %pipeline, rule = %rule_name, qname = %qname, qtype = ?qtype, client_ip = %client_ip, level = "error")
         }
         _ => {
-            tracing::info!(event = "matcher_log", rule = %rule_name, qname = %qname, client_ip = %client_ip, level = "info")
+            tracing::info!(event = "matcher_log", pipeline = %pipeline, rule = %rule_name, qname = %qname, qtype = ?qtype, client_ip = %client_ip, level = "info")
         }
     }
 }

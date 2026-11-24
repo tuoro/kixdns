@@ -159,7 +159,8 @@ pub(crate) fn reject_failure_reply_on_refresh(
     }
     match crate::proto_utils::parse_response_quick(reply).map(|qr| qr.rcode) {
         Some(rcode) if is_failure_reply(rcode) => Err(UpstreamFailure::error(anyhow::anyhow!(
-            "the upstream answered {rcode}"
+            "the upstream answered {}",
+            crate::observe::rcode_name(rcode.into())
         ))),
         _ => Ok(()),
     }
@@ -2533,17 +2534,23 @@ mod refresh_failure_reply_tests {
             }
             reply.to_vec().unwrap()
         };
-        for code in [
-            ResponseCode::ServFail,
-            ResponseCode::Refused,
-            ResponseCode::BADVERS,
-            ResponseCode::BADTIME,
-            ResponseCode::BADALG,
-            ResponseCode::BADCOOKIE,
+        // 错误里的响应码写助记名，和别处的日志一样 / The response code in the error is written as its
+        // mnemonic, as other logs write it
+        for (code, name) in [
+            (ResponseCode::ServFail, "SERVFAIL"),
+            (ResponseCode::Refused, "REFUSED"),
+            (ResponseCode::BADVERS, "BADVERS"),
+            (ResponseCode::BADTIME, "RCODE18"),
+            (ResponseCode::BADALG, "RCODE21"),
+            (ResponseCode::BADCOOKIE, "BADCOOKIE"),
         ] {
             assert!(is_failure_reply(code), "{code}");
             let err = reject_failure_reply_on_refresh(true, &reply(code)).unwrap_err();
             assert!(err.downcast_ref::<UpstreamFailure>().is_some());
+            assert_eq!(
+                err.root_cause().to_string(),
+                format!("the upstream answered {name}")
+            );
             assert!(reject_failure_reply_on_refresh(false, &reply(code)).is_ok());
         }
         for code in [
