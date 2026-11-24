@@ -525,11 +525,15 @@ pub struct GeoSiteManager {
     // 名字存结果的缓存，在全是新名字时会涨到几百兆
     database: FxHashMap<String, Arc<TagMatchers>>,
     // 每个数据文件贡献的 tag，重载时据此只替换该文件的条目。按文件头一次读进来的先后排，也就是配置里写的
-    // 先后；重载不改变位置。几个文件声明同一个 tag 时，排在后面的文件说了算，`database` 里放的是它的数据
+    // 先后；重载不改变位置。几个文件声明同一个 tag 时，排在后面的文件说了算，`database` 里放的是它的数据。
+    // 文件按配置里写的路径认（监视和热重载给的也是这个路径），不解析符号链接：链接改了指向（Kubernetes 卷换
+    // `..data`、`current -> v2`）还是同一个文件
     // Tags contributed by each data file, so a reload replaces only that file's entries. In the
     // order the files were first read, which is the order the configuration writes them in; a
     // reload keeps a file's place. Of several files declaring one tag the later file decides,
-    // and `database` holds its data
+    // and `database` holds its data. A file goes by the path the configuration writes (the one
+    // the watch and hot reloads give too), symlinks unresolved: a link pointed elsewhere (a
+    // Kubernetes volume swapping `..data`, `current -> v2`) is still the same file
     sources: Vec<(PathBuf, Vec<String>)>,
 }
 
@@ -586,8 +590,7 @@ impl GeoSiteManager {
     /// again gives none of the tags rules use, these are the ones keeping its data (see
     /// `reload_geosite_file` in `engine::geo`)
     pub fn provided_only_by(&self, path: &Path) -> Vec<String> {
-        let key = Self::source_key(path);
-        let Some(place) = self.sources.iter().position(|(source, _)| *source == key) else {
+        let Some(place) = self.place(path) else {
             return Vec::new();
         };
         self.sources[place]
@@ -607,8 +610,7 @@ impl GeoSiteManager {
     /// all (shared with this manager). When reading the file again gives nothing, this carries
     /// the data in use into the manager being built (see `load_geosite` in `engine::geo`)
     pub fn decided_by(&self, path: &Path, tags: &[String]) -> ParsedGeoSite {
-        let key = Self::source_key(path);
-        let Some(place) = self.sources.iter().position(|(source, _)| *source == key) else {
+        let Some(place) = self.place(path) else {
             return Vec::new();
         };
         self.sources[place]
@@ -842,9 +844,8 @@ impl GeoSiteManager {
     /// that file takes them over, as a full load would have it, or else the tag survives but
     /// matches data that was deleted
     pub fn handovers(&self, path: &Path, parsed: &ParsedGeoSite) -> Handovers {
-        let key = Self::source_key(path);
         let mut handovers = Handovers::default();
-        let Some(place) = self.sources.iter().position(|(source, _)| *source == key) else {
+        let Some(place) = self.place(path) else {
             return handovers;
         };
         for tag in &self.sources[place].1 {
@@ -909,17 +910,12 @@ impl GeoSiteManager {
         handed_over: ParsedGeoSite,
         keep_unprovided: bool,
     ) -> usize {
-        let key = Self::source_key(path);
         // 这个文件排第几：读过的留在原位，头一次读的排到最后 / The file's place: one read before
         // keeps it, one read for the first time goes last
-        let place = self
-            .sources
-            .iter()
-            .position(|(source, _)| *source == key)
-            .unwrap_or_else(|| {
-                self.sources.push((key.clone(), Vec::new()));
-                self.sources.len() - 1
-            });
+        let place = self.place(path).unwrap_or_else(|| {
+            self.sources.push((path.to_path_buf(), Vec::new()));
+            self.sources.len() - 1
+        });
         let previous = std::mem::take(&mut self.sources[place].1);
 
         let mut tags = Vec::with_capacity(parsed.len());
@@ -986,25 +982,10 @@ impl GeoSiteManager {
             .map(|(path, _)| path.as_path())
     }
 
-    /// 数据文件的身份：尽量用规范化后的绝对路径，这样配置里写的相对路径与监视器事件带来的绝对路径指向同一条记录。文件
-    /// 不存在时规范化它所在的目录：配置里写了、还没有的文件先占着位置（见 `engine::geo` 的 `load_geosite`），出现以后
-    /// 还是同一条。目录也规范化不了时退回原路径
-    /// Identity of a data file: the canonical absolute path where possible, so a relative path
-    /// from the configuration and the absolute path a watcher event carries refer to the same
-    /// entry. For a file that is not there its directory is canonicalised: a configured file
-    /// not there yet holds its place (see `load_geosite` in `engine::geo`), and is the same
-    /// entry once it appears. When the directory cannot be canonicalised either, the path as
-    /// given
-    fn source_key(path: &Path) -> PathBuf {
-        std::fs::canonicalize(path)
-            .or_else(|_| {
-                let name = path.file_name().ok_or(std::io::ErrorKind::NotFound)?;
-                let dir = path.parent().filter(|dir| !dir.as_os_str().is_empty());
-                Ok::<_, std::io::Error>(
-                    std::fs::canonicalize(dir.unwrap_or(Path::new(".")))?.join(name),
-                )
-            })
-            .unwrap_or_else(|_| path.to_path_buf())
+    /// 数据文件 `path` 在 `sources` 里排第几，还没读过时是 None / Where data file `path` ranks in
+    /// `sources`, None when it was never read
+    fn place(&self, path: &Path) -> Option<usize> {
+        self.sources.iter().position(|(source, _)| source == path)
     }
 
     /// 按条目读 .dat 文件，留下 `tags` 点名的标签（见 [`Self::parse_file`]）
@@ -1486,48 +1467,6 @@ mod tests {
             !manager.matches("new", "www.new.example"),
             "nothing from the failed file may leak into the live table"
         );
-    }
-
-    /// 配置里写相对路径、监视器事件给绝对路径，两者必须指向同一条记录，
-    /// 否则删除动作永远打不中启动时那次加载。
-    /// A relative path from the configuration and the absolute path a watcher
-    /// event carries must refer to the same entry, or the removal never matches
-    /// the load that happened at startup.
-    #[test]
-    fn dat_reload_matches_the_same_file_through_a_different_path_spelling() {
-        let dir = tempfile::tempdir().unwrap();
-        let absolute = write_dat(
-            &dir,
-            &[
-                build_geosite("CN", &[build_domain(2, "baidu.com", &[])]),
-                build_geosite("ADS", &[build_domain(2, "doubleclick.net", &[])]),
-            ],
-        );
-        // 同一个文件的另一种写法：绕一层子目录再退回来。Rust 的 Path 比较会规范化
-        // 掉 "."，但不会规范化 ".."，正好模拟配置里的相对路径与监视器给出的绝对
-        // 路径指向同一个文件却不相等的情况。
-        // Another spelling of the same file, via a subdirectory and back. Rust's
-        // Path comparison normalises "." away but not "..", which reproduces a
-        // relative path from the configuration and the absolute path a watcher
-        // reports pointing at one file without comparing equal.
-        std::fs::create_dir(dir.path().join("sub")).unwrap();
-        let indirect = dir.path().join("sub").join("..").join("geosite.dat");
-
-        let mut manager = GeoSiteManager::default();
-        manager.load_file(&indirect, &["cn", "ads"]).unwrap();
-        assert!(manager.matches("ads", "www.doubleclick.net"));
-
-        write_dat(
-            &dir,
-            &[build_geosite("CN", &[build_domain(2, "qq.com", &[])])],
-        );
-        manager.load_file(&absolute, &["cn", "ads"]).unwrap();
-
-        assert!(
-            !manager.matches("ads", "www.doubleclick.net"),
-            "the same file under another spelling must count as the same source"
-        );
-        assert!(manager.matches("cn", "www.qq.com"));
     }
 
     /// 同时配置 .dat 和 .json 时，重载 JSON 不能清掉 .dat 贡献的 tag。此前
