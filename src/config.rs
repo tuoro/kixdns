@@ -193,10 +193,9 @@ impl Default for GlobalSettings {
             default_upstream_pre_split: None,
             default_upstream_shared: None,
             bootstrap: String::new(),
-            // Increased from 2000ms to 9000ms to align with idoq library best practices
-            // DoQ servers (especially Alibaba DNS) may require longer response times
-            // 从 2000ms 增加到 9000ms，以对齐 idoq 库的最佳实践
-            // DoQ 服务器（特别是阿里 DNS）可能需要更长的响应时间
+            // 9 秒：DoQ 服务器（特别是阿里 DNS）可能要等更久才回，和 idoq 库的建议一致
+            // 9 seconds: DoQ servers (Alibaba DNS especially) may take longer to answer, as the
+            // idoq library advises
             upstream_timeout_ms: 9000,
             request_timeout_ms: None, // 默认自动计算 / Auto-calculated by default
             response_jump_limit: 10,
@@ -843,37 +842,48 @@ impl GlobalSettings {
             .unwrap_or_else(|| Arc::from(self.default_upstream.as_str()))
     }
 
-    /// 分片数和连接池超过上限的截到上限（见 [`MAX_DASHMAP_SHARDS`]、[`MAX_POOL_SIZE`]），说出截了哪些。截过的算
-    /// [`problems`]：启动时记一条错误、按上限照常起来，没有上限时能用的配置（`tcp_pool_size: 2048`）升级以后照样起得来；
-    /// 重载和面板保存拒绝。编译配置时先截（见 `RuntimePipelineConfig::from_config`）
+    /// 分片数和连接池超过上限的（见 [`MAX_DASHMAP_SHARDS`]、[`MAX_POOL_SIZE`]），每项一句，值不动。它们算
+    /// [`problems`]：启动时记一条错误、按上限照常起来（见 [`Self::hold_to_limits`]），没有上限时能用的配置
+    /// （`tcp_pool_size: 2048`）升级以后照样起得来；重载和面板保存拒绝
+    /// The shard count and the connection pools over their limits (see [`MAX_DASHMAP_SHARDS`],
+    /// [`MAX_POOL_SIZE`]), a sentence each, the values left as they are. They count among
+    /// [`problems`]: startup logs an error and starts at the limit (see [`Self::hold_to_limits`]),
+    /// so a configuration that worked before there were limits (`tcp_pool_size: 2048`) still
+    /// starts after an upgrade, while a reload and a panel save refuse it
+    fn over_limits(&self) -> impl Iterator<Item = String> {
+        [
+            ("dashmap_shards", self.dashmap_shards, MAX_DASHMAP_SHARDS),
+            ("udp_pool_size", self.udp_pool_size, MAX_POOL_SIZE),
+            ("tcp_pool_size", self.tcp_pool_size, MAX_POOL_SIZE),
+            ("doh_pool_size", self.doh_pool_size, MAX_POOL_SIZE),
+            ("dot_pool_size", self.dot_pool_size, MAX_POOL_SIZE),
+            ("doq_pool_size", self.doq_pool_size, MAX_POOL_SIZE),
+        ]
+        .into_iter()
+        .filter(|&(_, value, most)| value > most)
+        .map(|(setting, value, most)| {
+            format!(
+                "settings.{setting}: {value} is more than {most}, the most it may be; startup uses {most} instead"
+            )
+        })
+    }
+
+    /// 把超过上限的分片数和连接池截到上限（见 [`MAX_DASHMAP_SHARDS`]、[`MAX_POOL_SIZE`]；说它们的是 `over_limits`，算
+    /// [`problems`]）。编译配置时先截（见 `RuntimePipelineConfig::from_config`）
     /// Holds the shard count and the connection pools over their limits to them (see
-    /// [`MAX_DASHMAP_SHARDS`], [`MAX_POOL_SIZE`]), saying which it held. Each counts among
-    /// [`problems`]: startup logs an error and starts at the limit, so a configuration that
-    /// worked before there were limits (`tcp_pool_size: 2048`) still starts after an upgrade,
-    /// while a reload and a panel save refuse it. Compiling a configuration holds them first
-    /// (see `RuntimePipelineConfig::from_config`)
-    pub fn hold_to_limits(&mut self) -> Vec<String> {
-        let mut held = Vec::new();
-        for (setting, value, most) in [
-            (
-                "dashmap_shards",
-                &mut self.dashmap_shards,
-                MAX_DASHMAP_SHARDS,
-            ),
-            ("udp_pool_size", &mut self.udp_pool_size, MAX_POOL_SIZE),
-            ("tcp_pool_size", &mut self.tcp_pool_size, MAX_POOL_SIZE),
-            ("doh_pool_size", &mut self.doh_pool_size, MAX_POOL_SIZE),
-            ("dot_pool_size", &mut self.dot_pool_size, MAX_POOL_SIZE),
-            ("doq_pool_size", &mut self.doq_pool_size, MAX_POOL_SIZE),
+    /// [`MAX_DASHMAP_SHARDS`], [`MAX_POOL_SIZE`]; `over_limits` names them, among [`problems`]).
+    /// Compiling a configuration holds them first (see `RuntimePipelineConfig::from_config`)
+    pub fn hold_to_limits(&mut self) {
+        self.dashmap_shards = self.dashmap_shards.min(MAX_DASHMAP_SHARDS);
+        for pool in [
+            &mut self.udp_pool_size,
+            &mut self.tcp_pool_size,
+            &mut self.doh_pool_size,
+            &mut self.dot_pool_size,
+            &mut self.doq_pool_size,
         ] {
-            if *value > most {
-                held.push(format!(
-                    "settings.{setting}: {value} is more than {most}, the most it may be, so {most} is used"
-                ));
-                *value = most;
-            }
+            *pool = (*pool).min(MAX_POOL_SIZE);
         }
-        held
     }
 
     /// 设置自身是否说得通：取值范围、相互之间的关系，以及只在启动时读、却得和建引擎时的前提一致的那几项。编译配置的第一步，
@@ -1159,16 +1169,16 @@ pub struct ValidationReport {
 }
 
 /// 一份配置编译成运行时配置，热重载、面板的校验和试用都走这里，拒掉的和启动时会让内核起不来的一样：会悄悄做成
-/// 别的事的写法（见 [`problems`]）、编译不了的匹配器和正则，以及监听地址和 DoH 的前提（见
-/// [`GlobalSettings::listeners`]）。以前热重载不查监听地址，`bind_udp` 写错了照样重载成功，等到重启内核才起不来。
+/// 别的事的写法（见 [`problems`]，一条不落地放在错误 [`Problems`] 里）、编译不了的匹配器和正则，以及监听地址和 DoH 的
+/// 前提（见 [`GlobalSettings::listeners`]）。以前热重载不查监听地址，`bind_udp` 写错了照样重载成功，等到重启内核才起不来。
 /// 启动不走这里：那时 [`problems`] 记成错误、照旧加载
 /// A configuration compiled into its runtime form, which hot reload and the panel's validation
 /// and trial all go through, refusing what would stop the kernel at startup: what silently does
-/// something else (see [`problems`]), matchers and regexes that do not compile, and the
-/// listener addresses and DoH prerequisites (see [`GlobalSettings::listeners`]). Hot reload
-/// used not to check the listeners, so a mistyped `bind_udp` reloaded fine and the kernel then
-/// failed to start at the next restart. Startup does not come here: there [`problems`] are
-/// logged as errors and loaded as before
+/// something else (see [`problems`], every one of them in the error, a [`Problems`]), matchers
+/// and regexes that do not compile, and the listener addresses and DoH prerequisites (see
+/// [`GlobalSettings::listeners`]). Hot reload used not to check the listeners, so a mistyped
+/// `bind_udp` reloaded fine and the kernel then failed to start at the next restart. Startup does
+/// not come here: there [`problems`] are logged as errors and loaded as before
 pub fn compile(cfg: PipelineConfig) -> Result<RuntimePipelineConfig> {
     refuse_problems(&cfg)?;
     let runtime = RuntimePipelineConfig::from_config(cfg).context("compile configuration")?;
@@ -1254,7 +1264,7 @@ pub fn problems(cfg: &PipelineConfig) -> Vec<String> {
             cfg.settings.doh_path
         ));
     }
-    found.extend(cfg.settings.clone().hold_to_limits());
+    found.extend(cfg.settings.over_limits());
     // 一个 id 写了几次，在它第一次出现的地方报一次 / An id written several times is raised once,
     // where it first appears
     let mut written: rustc_hash::FxHashMap<&str, usize> = rustc_hash::FxHashMap::default();
@@ -1588,11 +1598,43 @@ impl<'de> Visitor<'de> for Unread<'_> {
     }
 }
 
-/// [`problems`] 有一条就失败，列出全部 / Fail on any of [`problems`], listing them all
+/// 一份配置因为 [`problems`] 被拒（见 [`refuse_problems`]）：那些问题，每条一句。显示成用 `; ` 连起来的一句；要逐条列出的
+/// （控制通道校验的回答和 `config` 结果的 `last_reload`）用 [`Problems::of`] 从错误里取出来
+/// A configuration refused for its [`problems`] (see [`refuse_problems`]): those problems, a
+/// sentence each. It displays as one sentence, the problems joined by `; `; what lists them one
+/// by one (the control channel's validation answer and the `config` result's `last_reload`)
+/// takes them out of the error with [`Problems::of`]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Problems(pub Vec<String>);
+
+impl Problems {
+    /// `error` 是因为这些问题拒掉配置时的那些问题，别的错误时为空 / The problems `error` refused a
+    /// configuration for, empty for any other error
+    pub fn of(error: &anyhow::Error) -> &[String] {
+        error
+            .downcast_ref::<Self>()
+            .map(|problems| problems.0.as_slice())
+            .unwrap_or_default()
+    }
+}
+
+impl std::fmt::Display for Problems {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0.join("; "))
+    }
+}
+
+impl std::error::Error for Problems {}
+
+/// [`problems`] 有一条就失败，列出全部（见 [`Problems`]）/ Fail on any of [`problems`], listing
+/// them all (see [`Problems`])
 pub fn refuse_problems(cfg: &PipelineConfig) -> Result<()> {
     let found = problems(cfg);
-    anyhow::ensure!(found.is_empty(), "{}", found.join("; "));
-    Ok(())
+    if found.is_empty() {
+        Ok(())
+    } else {
+        Err(Problems(found).into())
+    }
 }
 
 /// 一条规则里几个 forward 的 ecs 写得不一样：它们合成一次转发，只能发一个 ECS，所以一个也不发
@@ -2865,7 +2907,7 @@ mod validation_tests {
             assert_eq!(
                 super::problems(&parsed),
                 [format!(
-                    "settings.{setting}: {over} is more than {most}, the most it may be, so {most} is used"
+                    "settings.{setting}: {over} is more than {most}, the most it may be; startup uses {most} instead"
                 )]
             );
             let runtime = crate::matcher::RuntimePipelineConfig::from_config(parsed.clone())
@@ -3560,6 +3602,11 @@ mod validation_tests {
             message.contains("WHATEVER") && message.contains("\"gone\""),
             "{message}"
         );
+        assert_eq!(
+            super::Problems::of(&err),
+            super::problems(&super::parse_config(&config.to_string()).unwrap())
+        );
+        assert_eq!(super::Problems::of(&err).len(), 2);
     }
 
     /// 只列出启动时才读的设置；重载即生效的改了不算，改回去以后也不再列
@@ -3638,5 +3685,31 @@ mod validation_tests {
             super::compile(config).expect("compiles");
         });
         assert_eq!(logged.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    /// 写成空的 geo_site_not 已经算一条问题，没有数据的 GeoSite 标签里不再列一个空名字：以前告警写成
+    /// 「GeoSite tags , cn have no data」
+    /// A geo_site_not written empty counts as a problem already, and the GeoSite tags without data
+    /// no longer list an empty name: the warning used to say "GeoSite tags , cn have no data"
+    #[test]
+    fn a_geosite_tag_written_empty_is_no_tag_without_data() {
+        let config = serde_json::json!({
+            "pipelines": [{ "id": "main", "rules": [
+                rule("empty", serde_json::json!([{ "type": "geo_site_not", "value": "" }]), serde_json::json!([{ "type": "allow" }])),
+                rule("cn", serde_json::json!([{ "type": "geo_site", "value": "cn" }]), serde_json::json!([{ "type": "allow" }]))
+            ]}]
+        });
+        let parsed = super::parse_config(&config.to_string()).expect("parses");
+        assert_eq!(
+            super::problems(&parsed),
+            ["pipelines[0].rules[0].matchers[0]: geo_site_not \"\" matches every name"]
+        );
+        let runtime = crate::matcher::RuntimePipelineConfig::from_config(parsed).expect("compiles");
+        assert_eq!(
+            runtime.warnings,
+            [
+                "GeoSite tags cn have no data to match against: settings.geosite_data_paths is empty, so geo_site never matches them and geo_site_not always does"
+            ]
+        );
     }
 }

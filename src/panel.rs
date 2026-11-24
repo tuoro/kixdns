@@ -179,6 +179,13 @@ struct ActiveConfig {
     loaded_at_unix: u64,
     last_reload_success: bool,
     last_reload_error: Option<String>,
+    /// 上一次重载因为配置有问题被拒时的那些问题（见 `config::Problems`），每条截到 [`MAX_ERROR_LENGTH`]，一条不落；
+    /// `last_reload_error` 是它们连起来的一句，截到同样长，问题多了就列不全。重载成功或者因为别的原因失败时为空
+    /// The problems the last reload was refused for (see `config::Problems`), each cut to
+    /// [`MAX_ERROR_LENGTH`], none left out; `last_reload_error` is them joined into one sentence and
+    /// cut to the same length, which leaves some out when there are many. Empty when the reload
+    /// succeeded or failed for another reason
+    last_reload_problems: Vec<String>,
     /// 当前配置改了、但要重启才生效的设置（见 `ConfigLoaded::restart_pending`）
     /// Settings the current configuration changes that take a restart to apply (see
     /// `ConfigLoaded::restart_pending`)
@@ -991,6 +998,7 @@ impl PanelMetrics {
         active.loaded_at_unix = unix_timestamp();
         active.last_reload_success = true;
         active.last_reload_error = None;
+        active.last_reload_problems.clear();
         active.restart_pending = config
             .restart_pending
             .iter()
@@ -1092,10 +1100,11 @@ impl PanelMetrics {
         *locked = Some(names);
     }
 
-    fn record_reload_failure(&self, error: &str) {
+    fn record_reload_failure(&self, failed: &ConfigReloadFailed<'_>) {
         let mut active = self.active_config.write();
         active.last_reload_success = false;
-        active.last_reload_error = Some(truncate(error, MAX_ERROR_LENGTH));
+        active.last_reload_error = Some(truncate(failed.error, MAX_ERROR_LENGTH));
+        active.last_reload_problems = clipped(failed.problems);
         self.reload_failure.fetch_add(1, Ordering::Relaxed);
         self.reload_sequence.fetch_add(1, Ordering::Release);
     }
@@ -1120,6 +1129,7 @@ impl PanelMetrics {
             "last_reload": {
                 "success": active.last_reload_success,
                 "error": active.last_reload_error,
+                "problems": active.last_reload_problems,
             },
             "restart_pending": active.restart_pending,
             "problems": active.problems,
@@ -1884,7 +1894,7 @@ impl EngineObserver for PanelMetrics {
 
     fn config_reload_failed(&self, event: &ConfigReloadFailed<'_>) {
         debug_forward!(self.config_reload_failed(event));
-        self.record_reload_failure(event.error);
+        self.record_reload_failure(event);
     }
 }
 
@@ -2251,17 +2261,18 @@ fn request_invalid(what: &str, error: impl std::fmt::Display) -> Rejection {
     )
 }
 
-/// 配置用不了：422，错误连同原因链，截到 [`MAX_ERROR_LENGTH`]
-/// A configuration that cannot be used: 422, the error with its cause chain, cut to
-/// [`MAX_ERROR_LENGTH`]
+/// 配置用不了：422，`message` 是错误连同原因链，截到 [`MAX_ERROR_LENGTH`]；因为配置有问题被拒时，`problems` 逐条列出
+/// 那些问题（见 `config::Problems`），每条截到同样长，一条不落，别的错误时为空
+/// A configuration that cannot be used: 422, `message` the error with its cause chain, cut to
+/// [`MAX_ERROR_LENGTH`]; refused for its problems (see `config::Problems`), `problems` lists them
+/// one by one, each cut to the same length and none left out, empty for any other error
 fn config_invalid(error: &anyhow::Error) -> Rejection {
-    (
-        StatusCode::UNPROCESSABLE_ENTITY,
-        error_json(
-            "config_invalid",
-            &truncate(&format!("{error:#}"), MAX_ERROR_LENGTH),
-        ),
-    )
+    let mut body = error_json(
+        "config_invalid",
+        &truncate(&format!("{error:#}"), MAX_ERROR_LENGTH),
+    );
+    body["error"]["problems"] = json!(clipped(crate::config::Problems::of(error)));
+    (StatusCode::UNPROCESSABLE_ENTITY, body)
 }
 
 async fn diagnostic_trace(request: Request<Incoming>, engine: Engine) -> Response<Full<Bytes>> {
@@ -2889,6 +2900,14 @@ fn truncate(value: &str, max_length: usize) -> String {
     value.chars().take(max_length).collect()
 }
 
+/// 配置的问题逐条截到 [`MAX_ERROR_LENGTH`] / A configuration's problems, each cut to [`MAX_ERROR_LENGTH`]
+fn clipped(problems: &[String]) -> Vec<String> {
+    problems
+        .iter()
+        .map(|problem| truncate(problem, MAX_ERROR_LENGTH))
+        .collect()
+}
+
 fn unix_timestamp() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3381,6 +3400,7 @@ mod tests {
             metrics.config_reload_failed(&ConfigReloadFailed {
                 path: std::path::Path::new("pipeline.json"),
                 error: "broken",
+                problems: &[],
             });
         });
         let bytes = buffer.0.lock().unwrap().clone();
@@ -4197,6 +4217,7 @@ mod tests {
         metrics.config_reload_failed(&ConfigReloadFailed {
             path: std::path::Path::new("pipeline.json"),
             error: "broken",
+            problems: &[],
         });
         metrics.config_loaded(&ConfigLoaded {
             path: Some(std::path::Path::new("pipeline.json")),
@@ -4325,11 +4346,11 @@ mod tests {
         );
     }
 
-    /// 指标的 rcode 标签和配置、查询日志里的写法一样：NOERROR、NXDOMAIN 这样的助记名，扩展 RCODE 16 是 BADVERS，
-    /// 没有名字的写成 RCODE 加数字。以前用 hickory 的 Debug，写成 `NoError`，16 成了 BADSIG
+    /// 指标的 rcode 标签和配置、查询日志里的写法一样：NOERROR、NXDOMAIN 这样的助记名，扩展 RCODE 16 是 BADVERS、
+    /// 23 是 BADCOOKIE，没有名字的写成 RCODE 加数字。以前用 hickory 的 Debug，写成 `NoError`，16 成了 BADSIG
     /// The metrics' rcode labels are spelt as in the config and the query log: mnemonics such as
-    /// NOERROR and NXDOMAIN, the extended RCODE 16 being BADVERS, and one without a name RCODE and
-    /// its number. hickory's Debug used to write them, as `NoError`, and 16 as BADSIG
+    /// NOERROR and NXDOMAIN, the extended RCODE 16 being BADVERS and 23 BADCOOKIE, and one without a
+    /// name RCODE and its number. hickory's Debug used to write them, as `NoError`, and 16 as BADSIG
     #[test]
     fn rcode_labels_are_spelt_as_in_the_config() {
         use crate::config::Transport;
@@ -4341,6 +4362,7 @@ mod tests {
             ResponseCode::NoError,
             ResponseCode::ServFail,
             ResponseCode::from(1, 0),
+            ResponseCode::from(1, 7),
             ResponseCode::from(0xFF, 0xF),
         ] {
             metrics.upstream_result(
@@ -4360,7 +4382,7 @@ mod tests {
         labels.sort_unstable();
         assert_eq!(
             labels,
-            ["BADVERS", "NOERROR", "RCODE4095", "SERVFAIL"],
+            ["BADCOOKIE", "BADVERS", "NOERROR", "RCODE4095", "SERVFAIL"],
             "{output}"
         );
     }
