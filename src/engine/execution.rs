@@ -1983,21 +1983,28 @@ pub(crate) struct Route {
     /// `Route::response_jumped`)
     jumps_left: usize,
     /// 接下来的应答所依据的上游应答在缓存里能留多久：在这些键下回答检查做决定时据的每一份上游应答里最短的那个（见
-    /// `Route::went_by`），还没据过哪份应答时为 None。规则此后给出的静态应答缓存起来，下次不必再问上游，只是不比其中哪一份
-    /// 留得久（见 `phases::static_ttl`）：哪一份到期了，上游都可能答得不一样，回答检查也就可能走另一条路。miss 动作在上游
-    /// 失败以后做的决定不据哪份应答，记作 0，此后给出的都不缓存；请求阶段跳进别的 pipeline、换了键，又从 None 开始：那里直接
-    /// 给出的，直接进那里的请求也照样直接拿到
+    /// `Route::went_by`），还没据过哪份应答时为 None。此后缓存的应答都不比它留得久（见 `Route::cache`），规则给出的静态
+    /// 应答、转发拿到的应答都一样：哪一份到期了，上游都可能答得不一样，回答检查也就可能走另一条路，给出别的应答。请求阶段
+    /// 跳进别的 pipeline、换了键，又从 None 开始：那里给出的，直接进那里的请求也照样拿到
     /// How long the upstream answers what answers next goes by may stay in the cache: the
     /// least of every upstream answer an answer check decided on under these keys (see
-    /// `Route::went_by`), None while none has been gone by. A static answer the rules give
-    /// from here on is cached so as not to ask the upstream again, only no longer than any of
-    /// them may be (see `phases::static_ttl`): once any one expires the upstream may answer
-    /// otherwise, and the checks may take another way. What the miss actions decide after an
-    /// upstream failure goes by no answer and counts as 0, nothing given after it being
-    /// cached; a request-phase jump into another pipeline, changing the keys, starts again
-    /// from None: what is given outright there is given outright to the requests entering
-    /// there directly too
+    /// `Route::went_by`), None while none has been gone by. No answer cached from here on stays
+    /// longer (see `Route::cache`), be it a static answer the rules give or one a forward
+    /// fetches: once any of them expires the upstream may answer otherwise, and the checks may
+    /// take another way to another answer. A request-phase jump into another pipeline,
+    /// changing the keys, starts again from None: what is given there is given to the requests
+    /// entering there directly too
     pub(crate) answer_ttl: Option<u32>,
+    /// 上游失败以后 miss 动作接手了（见 `phases::Forwarding::act`）：此后规则给出的静态应答只是这一次请求的兜底，不是这个
+    /// 问题的应答，不缓存（见 `Route::static_ttl`）。转发拿到的应答照常缓存：故障期间备用上游的回答也是这个问题的回答。
+    /// 请求阶段跳进别的 pipeline 以后和 `answer_ttl` 一样从头记
+    /// The miss actions took over after an upstream failure (see `phases::Forwarding::act`): a
+    /// static answer the rules give from here on is a fallback for this request, not the
+    /// answer to the question, and is not cached (see `Route::static_ttl`). An answer a forward
+    /// fetches is cached as usual: a backup upstream's answer during the failure answers the
+    /// question all the same. A request-phase jump into another pipeline starts it afresh, as
+    /// `answer_ttl`
+    pub(crate) fell_back: bool,
     /// The forwards the request passed in the current pipeline, each with the ECS it sent
     /// and whom its reply applies to; every answer the request caches applies to the
     /// requesters all of them admit (see `CacheEntry::reach`). A forward adds its own here.
@@ -2047,6 +2054,7 @@ impl Route {
             jumped: None,
             jumps_left: request.state.pipeline.settings.response_jump_limit as usize,
             answer_ttl: None,
+            fell_back: false,
             trail: EcsReach::default(),
             echo_floor: 0,
             held_inflight: None,
@@ -2086,6 +2094,7 @@ impl Route {
             .max(self.trail.echo_scope(&request.requester.ecs_view()));
         self.trail = EcsReach::default();
         self.answer_ttl = None;
+        self.fell_back = false;
         self.key_pipeline = p.id.clone();
         // The keys follow the pipeline / 键随 pipeline 改变
         self.keys = request.keys(
@@ -2104,23 +2113,44 @@ impl Route {
         self.skip_rules.extend(rule);
     }
 
-    /// 回答检查据一份能在缓存里留 `ttl` 秒的上游应答做了决定（上游失败以后的 miss 动作是 0）：记进 `answer_ttl`，给出
-    /// 此后的静态应答最多缓存多久
-    /// An answer check decided on an upstream answer that may stay in the cache `ttl` seconds
-    /// (0 for the miss actions after an upstream failure): noted in `answer_ttl`, giving how
-    /// long a static answer from here on may be cached at most
-    pub(crate) fn went_by(&mut self, ttl: u32) -> u32 {
-        let least = self.answer_ttl.map_or(ttl, |before| before.min(ttl));
-        self.answer_ttl = Some(least);
-        least
+    /// 回答检查据一份能在缓存里留 `ttl` 秒的上游应答做了决定：记进 `answer_ttl`，此后缓存的应答最多留这么久
+    /// An answer check decided on an upstream answer that may stay in the cache `ttl` seconds:
+    /// noted in `answer_ttl`, no answer cached from here on staying longer
+    pub(crate) fn went_by(&mut self, ttl: u32) {
+        self.answer_ttl = Some(self.answer_ttl.map_or(ttl, |before| before.min(ttl)));
     }
 
-    /// 在这条路线的键下为 `request` 缓存应答 `bytes`，留 `ttl` 秒，适用于 trail 接受的请求方；`ttl` 为 0 时不写（见
-    /// `phases::ttl_to_cache`、`phases::static_ttl`）。转发得到的、规则给出的应答都经这里写
-    /// Cache the answer `bytes` for `request` under this route's keys for `ttl` seconds, for the
-    /// requesters the trail admits; with `ttl` 0 nothing is cached (see `phases::ttl_to_cache`,
-    /// `phases::static_ttl`). Answers forwards got and answers the rules gave are written here
-    /// alike
+    /// 规则给出的静态应答要缓存多久（再经 [`Self::cache`] 收进 `answer_ttl` 以内）。`carried` 是它带的 TTL（记录里最小的，
+    /// 见 `response::least_ttl`）；不带记录的（deny 的 REFUSED、static_response、问的类型没有记录时的 NODATA）没有自己的
+    /// TTL，留 `answer_ttl`。只有据上游应答给出的才缓存，下次不必再问上游：规则直接给出的（`answer_ttl` 为 None）规则下次
+    /// 照样直接给出（快速路径、规则缓存），不用问谁，从响应缓存拿的话查询日志和规则计数就记不到这条规则，它的 log 动作也不
+    /// 执行；上游失败以后兜底给出的（`fell_back`）只是这一次请求的。请求阶段和响应阶段都照这一处算。min_ttl 只抬上游回答
+    /// 的 TTL，不抬规则写的：抬了缓存时间、记录却不抬，缓存里的记录 TTL 先走完，交出去的就是 TTL 为 0 的记录
+    /// How long a static answer the rules give is to be cached (brought within `answer_ttl` by
+    /// [`Self::cache`] after). `carried` is the TTL it carries (the least of its records', see
+    /// `response::least_ttl`); one without records (deny's REFUSED, static_response, the NODATA
+    /// of a type with no records) has no TTL of its own and stays for `answer_ttl`. Only one
+    /// given by an upstream answer is cached, so the upstream need not be asked next time: one
+    /// the rules give outright (`answer_ttl` None) they give again outright (the fast path, the
+    /// rule cache) with nobody to ask, and taken from the response cache it would be missing
+    /// from the query log and rule counts under its rule, its log action not run; one given as
+    /// a fallback after an upstream failure (`fell_back`) is for this request alone. The request
+    /// phase and the response phase both go by this. min_ttl raises the TTLs of upstream
+    /// answers, not those a rule writes: raising the time cached and not the records would have
+    /// the cached records' TTLs run out first, going out as 0
+    pub(crate) fn static_ttl(&self, carried: Option<u32>) -> u32 {
+        match self.answer_ttl {
+            Some(answer_ttl) if !self.fell_back => carried.unwrap_or(answer_ttl),
+            _ => 0,
+        }
+    }
+
+    /// 在这条路线的键下为 `request` 缓存应答 `bytes`，适用于 trail 接受的请求方：留 `ttl` 秒，但不比 `answer_ttl` 久，为
+    /// 0 时不写（见 `phases::ttl_to_cache`、[`Self::static_ttl`]）。转发拿到的、规则给出的应答都经这里写，都受这个上限
+    /// Cache the answer `bytes` for `request` under this route's keys, for the requesters the
+    /// trail admits: for `ttl` seconds yet no longer than `answer_ttl`, nothing being cached at 0
+    /// (see `phases::ttl_to_cache`, [`Self::static_ttl`]). Answers forwards fetch and answers
+    /// the rules give are written here alike, under this bound alike
     pub(crate) fn cache(
         &self,
         engine: &Engine,
@@ -2130,6 +2160,7 @@ impl Route {
         upstream: Option<Arc<str>>,
         ttl: u32,
     ) {
+        let ttl = self.answer_ttl.map_or(ttl, |most| ttl.min(most));
         if ttl == 0 {
             return;
         }

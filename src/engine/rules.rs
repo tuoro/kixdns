@@ -94,8 +94,8 @@ pub enum ResponseActionResult {
     Static {
         bytes: Bytes,
         rcode: ResponseCode,
-        /// 它带的 TTL：记录里最小的，没有记录时为 None（见 `phases::static_ttl`）/ The TTL it
-        /// carries: the least of its records', None without records (see `phases::static_ttl`)
+        /// 它带的 TTL：记录里最小的，没有记录时为 None（见 `Route::static_ttl`）/ The TTL it
+        /// carries: the least of its records', None without records (see `Route::static_ttl`)
         ttl: Option<u32>,
         source: &'static str,
     },
