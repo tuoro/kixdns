@@ -15,43 +15,17 @@
 //! 应答；保留着问题的重载被拒绝，正在用的配置不变；问题改掉以后重载才生效。不会生效的
 //! background_refresh_rule 不算问题，只在启动和每次重载时记一条 warn。
 
-use std::net::{Ipv4Addr, UdpSocket};
+use std::net::Ipv4Addr;
 use std::path::Path;
-use std::process::{Command, Stdio};
-use std::str::FromStr;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
-use hickory_proto::rr::{Name, RData, RecordType};
+use hickory_proto::op::ResponseCode;
 
 mod common;
-use common::{Kernel, free_port};
-
-/// The reply to an A query for `name`, if one comes
-fn ask(port: u16, name: &str) -> Option<Message> {
-    let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    socket
-        .set_read_timeout(Some(Duration::from_millis(500)))
-        .unwrap();
-    let mut query = Message::new(7, MessageType::Query, OpCode::Query);
-    query.metadata.recursion_desired = true;
-    query.add_query(Query::query(Name::from_str(name).unwrap(), RecordType::A));
-    socket
-        .send_to(&query.to_vec().unwrap(), (Ipv4Addr::LOCALHOST, port))
-        .unwrap();
-    let mut buf = [0u8; 512];
-    let n = socket.recv(&mut buf).ok()?;
-    Message::from_vec(&buf[..n]).ok()
-}
+use common::{Kernel, ask, eventually, first_a, free_port, run_logging};
 
 fn static_ip(port: u16) -> Option<Ipv4Addr> {
-    ask(port, "ok.test")?
-        .answers
-        .iter()
-        .find_map(|r| match &r.data {
-            RData::A(a) => Some(a.0),
-            _ => None,
-        })
+    first_a(&ask(port, "ok.test")?)
 }
 
 /// A configuration answering ok.test with `ip` and old.test with `rcode`
@@ -93,38 +67,11 @@ fn write_config_with(path: &Path, port: u16, ip: &str, rcode: &str, extra: serde
     std::fs::rename(&staged, path).unwrap();
 }
 
-fn eventually(limit: Duration, mut check: impl FnMut() -> bool) -> bool {
-    let start = Instant::now();
-    while start.elapsed() < limit {
-        if check() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    false
-}
-
 /// 起一个读 `config` 的内核，日志按 `level` 写进 `log`（None 是默认级别），等它开始应答
 /// Start a kernel reading `config`, logging into `log` at `level` (None for the default
 /// level), and wait until it answers
 fn start(config: &Path, log: &Path, port: u16, level: Option<&str>) -> Kernel {
-    let output = std::fs::File::create(log).unwrap();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_kixdns"));
-    command
-        .args(["run", "--config"])
-        .arg(config)
-        .env_remove("RUST_LOG");
-    if let Some(level) = level {
-        command.env("RUST_LOG", level);
-    }
-    let kernel = Kernel(
-        command
-            .stdout(output.try_clone().unwrap())
-            .stderr(output)
-            .stdin(Stdio::null())
-            .spawn()
-            .unwrap(),
-    );
+    let kernel = run_logging(config, log, level);
     assert!(
         eventually(Duration::from_secs(20), || static_ip(port).is_some()),
         "kernel did not start"
