@@ -2775,7 +2775,7 @@ async fn a_config_change_made_before_the_watch_starts_is_reloaded() {
         .config_source(&path, &source)
         .build()
         .expect("build engine");
-    let _watching = watch.start(engine.clone()).expect("start");
+    let _watching = watch.start(engine.clone(), source).expect("start");
 
     assert!(
         recorder
@@ -2790,6 +2790,124 @@ async fn a_config_change_made_before_the_watch_starts_is_reloaded() {
             })
             .await,
         "the change made before the start must be reloaded: {:#?}",
+        recorder.events()
+    );
+}
+
+/// 写 `contents`，修改时间定成 `modified` / Writes `contents`, the modification time set to `modified`
+fn write_modified_at(path: &Path, contents: &str, modified: std::time::SystemTime) {
+    std::fs::write(path, contents).expect("write config");
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .and_then(|file| file.set_modified(modified))
+        .expect("set modification time");
+}
+
+/// 监视装好、读完配置以后报来一次改动，监视开始以后读出启动时读到的那份 `read`，交回引擎和它的观察者。`write` 在读完
+/// 以后、开始之前改文件，参数是读之前的修改时间
+/// The watch installed and the configuration read, a change is reported, and once the watch
+/// starts it reads what startup read as `read`; the engine and its observer are handed back.
+/// `write` changes the file after the read and before the start, given the modification time
+/// from before the read
+fn watch_started_after(
+    path: &Path,
+    read: &str,
+    write: impl FnOnce(std::time::SystemTime),
+) -> (Engine, Arc<Recorder>, kixdns::watcher::FileWatch) {
+    std::fs::write(path, read).unwrap();
+    let modified = std::fs::metadata(path).unwrap().modified().unwrap();
+    let watch = kixdns::watcher::ConfigWatch::new(path).expect("watch");
+    let (config, source) = kixdns::config::load_config_with_source(path).expect("load");
+    write(modified);
+    let recorder = Arc::new(Recorder::default());
+    let engine = Engine::builder(RuntimePipelineConfig::from_config(config).expect("compile"))
+        .observer(recorder.clone())
+        .config_source(path, &source)
+        .build()
+        .expect("build engine");
+    let watching = watch.start(engine.clone(), source).expect("start");
+    (engine, recorder, watching)
+}
+
+/// 报来的改动之后文件还是读之前的样子、内容和启动时读到的一字不差：不重载，代数还是 1。macOS 的 FSEvents 会把装监视
+/// 之前不久的写入这样报给刚装上的监视；这里一字不差地再写一遍、把修改时间改回去，哪个平台上都一样。以前同一份配置
+/// 在启动以后又重载一次，配置里有问题时多记一条重载失败
+/// The file, after the change reported, looking as it did before it was read and holding word
+/// for word what startup read: no reload, the generation still 1. macOS's FSEvents reports a
+/// write made shortly before the watch was installed this way to the watch just installed;
+/// here it is written again word for word and its modification time put back, alike on every
+/// platform. The same configuration used to be reloaded once more after startup, a failed
+/// reload logged besides for a configuration with a problem
+#[tokio::test]
+async fn a_change_reported_to_the_config_as_read_at_startup_is_not_reloaded() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pipeline.json");
+    let v1 = static_config("192.0.2.1");
+    let (engine, recorder, _watching) = watch_started_after(&path, &v1, |modified| {
+        write_modified_at(&path, &v1, modified)
+    });
+
+    // 比读到写完的最长等待（0.3 秒不再写）久得多 / Far longer than the longest wait for a write to
+    // be over (0.3 seconds without writing)
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(engine.config_generation(), 1, "{:#?}", recorder.events());
+}
+
+/// 启动以后一字不差地再存一次，这是开始以后的头一次改动，照样重载：这样存是让重载重读 MMDB、监视不了的 Geo 文件
+/// Saved again word for word after startup, the first change since the start, it is reloaded
+/// all the same: saving so is how a reload is made to read the MMDB or Geo files that cannot be
+/// watched again
+#[tokio::test]
+async fn the_config_saved_again_word_for_word_after_startup_is_reloaded() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pipeline.json");
+    let v1 = static_config("192.0.2.1");
+    let (_engine, recorder, _watching) = watch_started_after(&path, &v1, |_| {});
+
+    // 一秒以后存的那样，修改时间往后挪了 / As saved a second later, the modification time moved on
+    let later = std::fs::metadata(&path).unwrap().modified().unwrap() + Duration::from_secs(1);
+    write_modified_at(&path, &v1, later);
+    assert!(
+        recorder
+            .wait_for(Duration::from_secs(5), |events| {
+                events
+                    .iter()
+                    .any(|event| matches!(event, Event::ConfigLoaded { generation: 2, .. }))
+            })
+            .await,
+        "saved again, the config must be reloaded: {:#?}",
+        recorder.events()
+    );
+}
+
+/// 修改时间只精确到秒的文件系统上，读完以后同一秒里改成一样长的别的内容，修改时间和长度都没变，照样重载：内容对不上
+/// On a file system keeping the modification time to the second, other content of the same
+/// length written within the second after the read, its time and length unchanged, is
+/// reloaded all the same: the content differs
+#[tokio::test]
+async fn a_change_of_the_same_length_and_time_after_the_read_is_reloaded() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pipeline.json");
+    let (v1, v2) = (static_config("192.0.2.1"), static_config("192.0.2.2"));
+    assert_eq!(v1.len(), v2.len());
+    let (_engine, recorder, _watching) = watch_started_after(&path, &v1, |modified| {
+        write_modified_at(&path, &v2, modified)
+    });
+
+    assert!(
+        recorder
+            .wait_for(Duration::from_secs(5), |events| {
+                events.iter().any(|event| {
+                    matches!(
+                        event,
+                        Event::ConfigLoaded { generation: 2, source, .. }
+                            if source.as_deref() == Some(v2.as_str())
+                    )
+                })
+            })
+            .await,
+        "the change must be reloaded: {:#?}",
         recorder.events()
     );
 }
@@ -2819,7 +2937,7 @@ async fn hot_reload_reports_success_and_failure() {
 
     let _watch = kixdns::watcher::ConfigWatch::new(&path)
         .expect("watch")
-        .start(engine.clone())
+        .start(engine.clone(), v1.clone())
         .expect("start");
 
     // Successful reload: re-swap until the watcher reports the new generation.

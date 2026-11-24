@@ -153,11 +153,11 @@ struct DataStatus {
     files: Vec<(PathBuf, String)>,
     /// 监视装不上时说它的那句话 / The sentence saying the watch could not be installed, when it could not
     watch: Option<String>,
-    /// 监视着、却有位置监视不上的文件（那里的变化看不到），各带读它之前它什么样和说它的那句话；热重载时有哪个换了样子就
-    /// 重新加载（见 [`Loaded::is_current`]）
-    /// The files watched, yet with places that cannot be (changes there going unseen), each with
-    /// what it looked like before it was read and the sentence saying so; a hot reload loads
-    /// again once any of them looks otherwise (see [`Loaded::is_current`])
+    /// 监视着、却有位置监视不上的文件（监视看不到那里的变化），各带读它之前它什么样和说它的那句话；热重载时有哪个换了样子
+    /// 就重新加载（见 [`Loaded::is_current`]）
+    /// The files watched, yet with places that cannot be (the watch not seeing changes there),
+    /// each with what it looked like before it was read and the sentence saying so; a hot reload
+    /// loads again once any of them looks otherwise (see [`Loaded::is_current`])
     partly_watched: Vec<(Stamped, String)>,
     /// 规则用到、却没有数据提供的标签，说它们的那句话 / The sentence naming the tags rules use that no data provides
     tags: Option<String>,
@@ -618,7 +618,7 @@ fn load_geosite(
             }
             parsed
         } else {
-            error!(path = %path.display(), "GeoSite data file not found, waiting for it to appear");
+            error!(path = %path.display(), "GeoSite data file not found");
             problems.missing("GeoSite data file", path);
             Vec::new()
         };
@@ -772,7 +772,7 @@ fn load_geoip(
     let mut gave_nothing = None;
     for path in &files {
         if !path.exists() {
-            error!(path = %path.display(), "GeoIP data file not found, waiting for it to appear");
+            error!(path = %path.display(), "GeoIP data file not found");
             problems.missing("GeoIP data file", path);
             continue;
         }

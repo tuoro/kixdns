@@ -88,6 +88,16 @@ async fn doh_answers(port: u16) -> bool {
         .is_ok_and(|r| r.status() == reqwest::StatusCode::OK)
 }
 
+/// 连上几个，监听口每接受一个都碰上接受错误：XNU 的 accept 碰上 EMFILE 会丢掉排队的那个连接，只连一个只碰上一次，
+/// 每次都记和隔一阵才记一条分不出来（Linux 上连接留在队列里，每 100 ms 再碰一次）
+/// Several connect, and the listener meets the accept error on accepting each: XNU's accept,
+/// meeting EMFILE, drops the connection queued, so one alone meets it once, and logging each
+/// time could not be told from logging once in a while (on Linux the connection stays queued,
+/// met again every 100 ms)
+fn probes<T>(connect: impl FnMut() -> std::io::Result<T>) -> Vec<std::io::Result<T>> {
+    std::iter::repeat_with(connect).take(5).collect()
+}
+
 /// Poll until `check` holds, for up to `limit`.
 async fn eventually<F, Fut>(limit: Duration, mut check: F) -> bool
 where
@@ -194,15 +204,15 @@ async fn listeners_answer_again_after_running_out_of_descriptors() {
     // With the descriptors gone, the DoH listener and the control socket meet the
     // same accept error.
     // 句柄用光以后，DoH 监听口和控制通道也碰上同一个接受错误。
-    let doh_probe = TcpStream::connect_timeout(
-        &(Ipv4Addr::LOCALHOST, doh_port).into(),
-        Duration::from_millis(500),
-    );
-    // 连上几个，控制通道每接受一个都碰上这个错误 / Several connect, and the control socket meets
-    // the error on accepting each
-    let control_probes: Vec<_> = (0..5).map(|_| UnixStream::connect(&control)).collect();
+    let doh_probes = probes(|| {
+        TcpStream::connect_timeout(
+            &(Ipv4Addr::LOCALHOST, doh_port).into(),
+            Duration::from_millis(500),
+        )
+    });
+    let control_probes = probes(|| UnixStream::connect(&control));
     tokio::time::sleep(Duration::from_millis(300)).await;
-    drop(doh_probe);
+    drop(doh_probes);
     drop(control_probes);
     drop(held);
 
@@ -225,6 +235,6 @@ async fn listeners_answer_again_after_running_out_of_descriptors() {
     let log = std::fs::read_to_string(&log).unwrap();
     let logged = |what: &str| log.lines().filter(|line| line.contains(what)).count();
     assert_eq!(logged("tcp accept failed"), 1, "{log}");
-    assert!(logged("DoH accept failed") <= 1, "{log}");
-    assert!(logged("control socket accept failed") <= 1, "{log}");
+    assert_eq!(logged("DoH accept failed"), 1, "{log}");
+    assert_eq!(logged("control socket accept failed"), 1, "{log}");
 }
