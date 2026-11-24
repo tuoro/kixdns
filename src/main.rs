@@ -406,18 +406,22 @@ async fn run_dns_server(
     // not missed (see `watcher::ConfigWatch`)
     let watch = watcher::ConfigWatch::new(&config);
     let (cfg, config_source) = load_config_with_source(&config).context("load initial config")?;
-    // 启动时照旧加载，升级以后已经在用的配置行为不变；重载和面板的校验会拒绝它们。和重载拒绝时一样记 error，
-    // 默认日志级别就看得到：以前只记 warn，默认级别下谁也不知道下一次改配置会被拒
-    // Startup loads them as before, so a configuration in use keeps its behaviour across an
-    // upgrade; a reload and the panel's validation refuse them. They are logged at error, as
-    // the reload refusing them is, so the default log level shows them: they used to be a
-    // warn, and at the default level nobody learnt that the next change would be refused
+    // 启动时照样加载（超过上限的设置按上限用，见 `config::problems`），升级以后已经在用的配置照样起得来；重载和面板的校验
+    // 会拒绝它们。和重载拒绝时一样记 error，默认日志级别就看得到：以前只记 warn，默认级别下谁也不知道下一次改配置会被拒
+    // Startup loads them all the same (a setting over its limit held to it, see
+    // `config::problems`), so a configuration in use still starts after an upgrade; a reload and
+    // the panel's validation refuse them. They are logged at error, as the reload refusing them
+    // is, so the default log level shows them: they used to be a warn, and at the default level
+    // nobody learnt that the next change would be refused
     let problems = kixdns::config::problems(&cfg);
     let version = cfg.version.clone();
     for problem in &problems {
-        error!(%problem, "configuration problem, loaded as before; a reload or a save from the panel refuses it");
+        error!(%problem, "configuration problem, loaded all the same; a reload or a save from the panel refuses it");
     }
-    let cfg = RuntimePipelineConfig::from_config(cfg).context("compile configuration")?;
+    // 错误开头就写着是哪个设置或匹配器，和重载、校验时一样（见 `config::compile`）/ An error starts
+    // with the setting or matcher it is about, as on a reload and in validation (see
+    // `config::compile`)
+    let cfg = RuntimePipelineConfig::from_config(cfg)?;
     // Listener addresses and DoH prerequisites, checked exactly as
     // config::validate does / 监听地址与 DoH 前置条件，检查方式与 config::validate 一致
     let listeners = cfg.settings.listeners()?;
@@ -472,17 +476,29 @@ async fn run_dns_server(
     let engine = engine.build().context("initialize DNS engine")?;
 
     // 监视不了时配置文件改了不会重载，面板保存的配置也不生效：记一条 error，默认日志级别看得到，面板经控制通道读
-    // （`config` 的 `watch_error`）
+    // （`config` 的 `watch_error`）。文件改了指向、新的地方监视不上时也一样，又监视上了就清掉
     // Without the watch a change to the configuration file is not reloaded, nor is a save from
     // the panel applied: an error is logged, seen at the default log level, and the panel reads
-    // it over the control channel (`config`'s `watch_error`)
+    // it over the control channel (`config`'s `watch_error`). So too when the file comes to lead
+    // somewhere that cannot be watched, cleared once it is watched again
+    #[cfg(unix)]
+    let on_watch = {
+        let metrics = panel_metrics.clone();
+        move |error: Option<&notify::Error>| {
+            if let Some(metrics) = &metrics {
+                metrics.config_watched(error.map(ToString::to_string));
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let on_watch = |_: Option<&notify::Error>| {};
     let _config_watch = watch
-        .and_then(|watch| watch.start(engine.clone()))
+        .and_then(|watch| watch.start_reporting(engine.clone(), on_watch))
         .inspect_err(|err| {
             error!(path = %config.display(), error = %err, "cannot watch the config file, changes to it are not reloaded");
             #[cfg(unix)]
             if let Some(metrics) = &panel_metrics {
-                metrics.config_not_watched(err.to_string());
+                metrics.config_watched(Some(err.to_string()));
             }
         })
         .ok();

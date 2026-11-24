@@ -48,10 +48,24 @@ impl ConfigWatch {
     /// Reloads `engine` from the configuration file on every change to it (those queued before
     /// the start included), until the returned [`FileWatch`] is dropped
     pub fn start(self, engine: Engine) -> notify::Result<FileWatch> {
+        self.start_reporting(engine, |_| {})
+    }
+
+    /// 同 [`ConfigWatch::start`]，每次重载之前文件重新解析、监视跟着换，监视得怎样交给 `on_watch`：新的地方为什么监视
+    /// 不上，都监视上了是 None（见 [`PendingWatch::start_reporting`]）
+    /// As [`ConfigWatch::start`], and before each reload, as the file is resolved again with the
+    /// watches following, how it is watched goes to `on_watch`: why its new places cannot be
+    /// watched, None when every one is (see [`PendingWatch::start_reporting`])
+    pub fn start_reporting(
+        self,
+        engine: Engine,
+        mut on_watch: impl FnMut(Option<&notify::Error>) + Send + 'static,
+    ) -> notify::Result<FileWatch> {
         self.0
-            .start("config-watcher", move |path| {
-                // 启动时只记警告的那些写法，重载时拒绝（见 config::compile）
-                // What startup only warns about, a reload refuses (see config::compile)
+            .start_reporting("config-watcher", move |path| {
+                // 启动时只记错误、照样加载的那些写法，重载时拒绝（见 config::compile）
+                // What startup only logs as errors and loads all the same, a reload refuses (see
+                // config::compile)
                 let loaded = config::load_config_with_source(path).and_then(|(cfg, raw)| {
                     let version = cfg.version.clone();
                     config::compile(cfg).map(|cfg| (cfg, raw, version))
@@ -69,7 +83,7 @@ impl ConfigWatch {
                         engine.notify_config_reload_failed(path, &err);
                     }
                 }
-            })
+            }, move |_, watched| on_watch(watched))
             .map_err(notify::Error::io)
     }
 }
@@ -109,7 +123,22 @@ impl PendingWatch {
     pub(crate) fn start(
         self,
         name: &str,
+        on_change: impl FnMut(&Path) + Send + 'static,
+    ) -> std::io::Result<FileWatch> {
+        self.start_reporting(name, on_change, |_, _| {})
+    }
+
+    /// 同 [`PendingWatch::start`]，每次回调之前文件重新解析、监视跟着换以后，把它监视得怎样交给 `on_watch`：参数是
+    /// 配置里写的路径，和它新的位置为什么监视不上（那里的变化看不到；这时也记一条 error），都监视上了是 None
+    /// As [`PendingWatch::start`], and each time a file is resolved again before its callback,
+    /// with the watches following, how it is watched goes to `on_watch`: the path as configured,
+    /// and why its new places cannot be watched (changes there go unseen; an error is logged
+    /// too), None when every one is
+    pub(crate) fn start_reporting(
+        self,
+        name: &str,
         mut on_change: impl FnMut(&Path) + Send + 'static,
+        mut on_watch: impl FnMut(&Path, Option<&notify::Error>) + Send + 'static,
     ) -> std::io::Result<FileWatch> {
         let Self {
             watcher,
@@ -128,7 +157,13 @@ impl PendingWatch {
             .spawn(move || {
                 // 监视随线程一起结束 / The watch ends with the thread
                 let (mut watcher, mut targets) = (watcher, targets);
-                pump(&mut watcher, &mut targets, &rx, &mut on_change);
+                pump(
+                    &mut watcher,
+                    &mut targets,
+                    &rx,
+                    &mut on_change,
+                    &mut on_watch,
+                );
             })?;
         Ok(FileWatch {
             stop: tx,
@@ -254,27 +289,26 @@ impl Targets {
         }
     }
 
-    /// 文件 `index` 重新解析一遍，监视换到新的监视点所在的目录 / Resolves file `index` again and moves
-    /// the watches to the directories of its new watch points
-    fn refresh(&mut self, watcher: &mut RecommendedWatcher, index: usize) {
-        let points = match watch_points(&self.files[index].configured) {
-            Ok(points) => points,
-            Err(err) => {
-                warn!(path = %self.files[index].configured.display(), error = %err, "cannot resolve the watched file again");
-                return;
-            }
-        };
+    /// 文件 `index` 重新解析一遍，监视换到新的监视点所在的目录。解析不了（监视留在原处），或者有监视点所在的目录
+    /// 监视不上时报错：那里的变化看不到
+    /// Resolves file `index` again and moves the watches to the directories of its new watch
+    /// points. An error when it cannot be resolved (the watches staying where they were), or a
+    /// watch point's directory cannot be watched: changes there go unseen
+    fn refresh(&mut self, watcher: &mut RecommendedWatcher, index: usize) -> notify::Result<()> {
+        let points = watch_points(&self.files[index].configured).map_err(notify::Error::io)?;
         // 先装新的再撤旧的，两边都用着的目录不会断开 / The new watches go in before the old come out,
         // so a directory both use is never dropped
+        let mut unwatched = None;
         for dir in points.iter().filter_map(|point| point.parent()) {
             if let Err(err) = self.add_dir(watcher, dir) {
-                warn!(dir = %dir.display(), error = %err, "cannot watch a directory the file now resolves through");
+                unwatched.get_or_insert(err);
             }
         }
         let old = std::mem::replace(&mut self.files[index].points, points);
         for dir in old.iter().filter_map(|point| point.parent()) {
             self.remove_dir(watcher, dir);
         }
+        unwatched.map_or(Ok(()), Err)
     }
 
     /// 监视点在 `paths` 里的文件 / The files with a watch point among `paths`
@@ -426,15 +460,18 @@ fn watch_points(path: &Path) -> std::io::Result<Vec<PathBuf>> {
 }
 
 /// 把变化交给 `on_change`，直到收到停止消息或通道关闭。一阵改动等到改了的文件都写完（见 [`Change::settle`]）、
-/// 最多 [`AT_MOST`]，每个文件重新解析、监视跟着换，再各回调一次。
+/// 最多 [`AT_MOST`]，每个文件重新解析、监视跟着换，监视得怎样交给 `on_watch`（见 [`PendingWatch::start_reporting`]），
+/// 再各回调一次。
 /// Hands changes to `on_change` until told to stop or the channel closes. A burst of changes
 /// is waited for until every file changed is written (see [`Change::settle`]), at most
-/// [`AT_MOST`]; then each file is resolved again with the watches following, and called back once.
+/// [`AT_MOST`]; then each file is resolved again with the watches following, how it is watched
+/// goes to `on_watch` (see [`PendingWatch::start_reporting`]), and it is called back once.
 fn pump(
     watcher: &mut RecommendedWatcher,
     targets: &mut Targets,
     rx: &Receiver<Message>,
     mut on_change: impl FnMut(&Path),
+    mut on_watch: impl FnMut(&Path, Option<&notify::Error>),
 ) {
     let close_reported = RecommendedWatcher::kind() == WatcherKind::Inotify;
     let mut burst: Option<Burst> = None;
@@ -464,8 +501,13 @@ fn pump(
                     // 先跟上新的解析结果再回调：回调读文件时，新位置上的变化已经在监视之下
                     // The watches follow the new resolution before the callback: by the time it
                     // reads the file, changes at the new places are being watched
-                    targets.refresh(watcher, index);
-                    on_change(&targets.files[index].configured);
+                    let watched = targets.refresh(watcher, index);
+                    let configured = &targets.files[index].configured;
+                    if let Err(err) = &watched {
+                        error!(path = %configured.display(), error = %err, "cannot watch the file where it now leads, changes there go unseen");
+                    }
+                    on_watch(configured, watched.as_ref().err());
+                    on_change(configured);
                 }
             }
             Ok(Message::Stop) | Err(RecvTimeoutError::Disconnected) => return,
@@ -760,6 +802,7 @@ mod tests {
     }
 
     /// 收到一次回调，报的是配置里写的路径 / One callback, reporting the path as configured
+    #[cfg(unix)]
     fn called_back(rx: &Receiver<PathBuf>, configured: &Path, what: &str) {
         assert_eq!(
             rx.recv_timeout(Duration::from_secs(5)).ok().as_deref(),
@@ -918,11 +961,75 @@ mod tests {
 
         std::fs::remove_file(&configured).unwrap();
         symlink(real.join("new/data.json"), &configured).unwrap();
-        targets.refresh(&mut watcher, 0);
+        targets.refresh(&mut watcher, 0).expect("watched");
         assert_eq!(dirs(&targets), [real.join("conf"), real.join("new")]);
         assert_eq!(
             targets.files[0].points,
             [configured.clone(), real.join("new/data.json")]
         );
+    }
+
+    /// 符号链接改指向一个监视不上的地方（目录不存在）以后，`on_watch` 拿到为什么（另记一条 error），又指回监视得上的
+    /// 地方以后拿到 None；回调照常。以前只记一条 warn，配置文件的 `watch_error` 也不变，面板以为它还监视着
+    /// Once a symlink is pointed somewhere that cannot be watched (a directory that does not
+    /// exist), `on_watch` is handed why (and an error logged), and once it points back
+    /// somewhere watchable, None; the callback runs as ever. Only a warn used to be logged,
+    /// the configuration file's `watch_error` staying as it was, so the panel took it as watched
+    #[cfg(unix)]
+    #[test]
+    fn a_link_leading_where_nothing_can_be_watched_is_reported() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().expect("tempdir");
+        let (conf, good) = (root.path().join("conf"), root.path().join("good"));
+        std::fs::create_dir(&conf).unwrap();
+        std::fs::create_dir(&good).unwrap();
+        std::fs::write(good.join("data.json"), "good").unwrap();
+        let configured = conf.join("data.json");
+        symlink(good.join("data.json"), &configured).unwrap();
+        let point_at = |target: PathBuf| {
+            symlink(target, conf.join("data.json.tmp")).unwrap();
+            std::fs::rename(conf.join("data.json.tmp"), &configured).unwrap();
+        };
+
+        let (tx, rx) = mpsc::channel();
+        let (called, called_rx) = mpsc::channel();
+        let _watch = PendingWatch::new(std::slice::from_ref(&configured))
+            .expect("watch")
+            .start_reporting(
+                "test-watch",
+                move |path| {
+                    let _ = called.send(path.to_path_buf());
+                },
+                move |path, watched| {
+                    let _ = tx.send((path.to_path_buf(), watched.map(ToString::to_string)));
+                },
+            )
+            .expect("start");
+
+        point_at(root.path().join("missing").join("data.json"));
+        let (path, watched) = rx.recv_timeout(Duration::from_secs(5)).expect("reported");
+        assert_eq!(path, configured);
+        assert!(
+            watched
+                .as_deref()
+                .is_some_and(|why| why.contains("missing")),
+            "{watched:?}"
+        );
+        called_back(
+            &called_rx,
+            &configured,
+            "the link pointed somewhere unwatchable",
+        );
+        // 同一次改动的后续事件各报一次，在回调之前，已经随回调收完 / What else the same change
+        // brings is reported before its callback, so it is in by now
+        while rx.try_recv().is_ok() {}
+
+        point_at(good.join("data.json"));
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)).ok(),
+            Some((configured.clone(), None)),
+            "watched again"
+        );
+        called_back(&called_rx, &configured, "the link pointed back");
     }
 }
