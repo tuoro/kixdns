@@ -1,10 +1,9 @@
 use super::types::InflightMap;
-use crate::matcher::RuntimePipelineConfig;
+use crate::matcher::{GeoTags, RuntimePipelineConfig};
 use bytes::Bytes;
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{DNSClass, RecordType};
 use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
-use rustc_hash::FxHashSet;
 use std::sync::Arc;
 
 /// RAII Guard for cleaning up inflight request map
@@ -184,57 +183,15 @@ impl Drop for RefreshingGuard {
     }
 }
 
-/// 提取配置中使用的 GeoSite tags / Extract GeoSite tags used in configuration
-///
-/// 扫描配置以查找所有在匹配器中实际使用的GeoSite标签，这样可以只从数据文件中加载这些标签 / Scans the configuration to find all GeoSite tags actually used in matchers, so we can load only those tags from the data file.
+/// 规则（连同 pipeline_select 和回答检查）用到的 GeoSite 标签（已经是小写），排好序、去掉重复：数据文件只读这些标签
+/// The GeoSite tags rules use (pipeline_select and answer checks included), lowercase already,
+/// sorted and deduplicated: data files are read for these tags alone
 pub fn extract_geosite_tags_from_config(cfg: &RuntimePipelineConfig) -> Vec<String> {
-    let mut tags_set: FxHashSet<std::sync::Arc<str>> = FxHashSet::default();
-
-    // Scan pipeline_select rules / 扫描 pipeline_select 规则
-    for rule in &cfg.pipeline_select {
-        for matcher in &rule.matchers {
-            if let crate::matcher::RuntimePipelineSelectorMatcher::Request(
-                crate::matcher::RuntimeMatcher::GeoSite { tag }
-                | crate::matcher::RuntimeMatcher::GeoSiteNot { tag },
-            ) = &matcher.matcher
-            {
-                tags_set.insert(tag.clone());
-            }
-        }
-    }
-
-    // Scan all pipeline rules / 扫描所有 pipeline 规则
-    for pipeline in &cfg.pipelines {
-        for rule in &pipeline.rules {
-            // Scan request matchers / 扫描请求匹配器
-            for matcher in rule.matchers.iter() {
-                if let crate::matcher::RuntimeMatcher::GeoSite { tag } = &matcher.matcher {
-                    tags_set.insert(tag.clone());
-                }
-                if let crate::matcher::RuntimeMatcher::GeoSiteNot { tag } = &matcher.matcher {
-                    tags_set.insert(tag.clone());
-                }
-            }
-
-            // Scan response matchers / 扫描响应匹配器
-            for matcher in rule.response_matchers() {
-                if let crate::matcher::RuntimeResponseMatcher::ResponseRequestDomainGeoSite {
-                    value,
-                } = &matcher.matcher
-                {
-                    tags_set.insert(value.clone());
-                }
-                if let crate::matcher::RuntimeResponseMatcher::ResponseRequestDomainGeoSiteNot {
-                    value,
-                } = &matcher.matcher
-                {
-                    tags_set.insert(value.clone());
-                }
-            }
-        }
-    }
-
-    tags_set.into_iter().map(|s| s.to_string()).collect()
+    used_tags(
+        cfg.geo_tags()
+            .filter_map(GeoTags::site)
+            .map(std::slice::from_ref),
+    )
 }
 
 /// 规则按 GeoIP 匹配的国家代码和命名标签（已经是大写），排好序、去掉重复；`geoip_private` 不需要
@@ -242,39 +199,12 @@ pub fn extract_geosite_tags_from_config(cfg: &RuntimePipelineConfig) -> Vec<Stri
 /// The country codes and named tags rules match on GeoIP (uppercase already), sorted and
 /// deduplicated; `geoip_private` needs no GeoIP data and does not count
 pub fn extract_geoip_tags_from_config(cfg: &RuntimePipelineConfig) -> Vec<String> {
-    let selector_codes = cfg
-        .pipeline_select
-        .iter()
-        .flat_map(|rule| &rule.matchers)
-        .filter_map(|matcher| match &matcher.matcher {
-            crate::matcher::RuntimePipelineSelectorMatcher::Request(
-                crate::matcher::RuntimeMatcher::GeoipCountry { country_codes },
-            ) => Some(country_codes),
-            _ => None,
-        });
-    let rules = cfg.pipelines.iter().flat_map(|pipeline| &pipeline.rules);
-    let request_codes = rules
-        .clone()
-        .flat_map(|rule| rule.matchers.iter())
-        .filter_map(|matcher| match &matcher.matcher {
-            crate::matcher::RuntimeMatcher::GeoipCountry { country_codes } => Some(country_codes),
-            _ => None,
-        });
-    let response_codes = rules
-        .flat_map(crate::matcher::RuntimeRule::response_matchers)
-        .filter_map(|matcher| match &matcher.matcher {
-            crate::matcher::RuntimeResponseMatcher::ResponseAnswerIpGeoipCountry {
-                country_codes,
-            } => Some(country_codes),
-            _ => None,
-        });
+    used_tags(cfg.geo_tags().filter_map(GeoTags::ip))
+}
 
-    let mut tags: Vec<String> = selector_codes
-        .chain(request_codes)
-        .chain(response_codes)
-        .flatten()
-        .map(|code| code.to_string())
-        .collect();
+/// 几组标签合起来，排好序、去掉重复 / Groups of tags put together, sorted and deduplicated
+fn used_tags<'a>(groups: impl Iterator<Item = &'a [Arc<str>]>) -> Vec<String> {
+    let mut tags: Vec<String> = groups.flatten().map(|tag| tag.to_string()).collect();
     tags.sort_unstable();
     tags.dedup();
     tags

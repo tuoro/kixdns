@@ -318,6 +318,36 @@ impl GeoData {
     }
 }
 
+/// 一个匹配器读的 Geo 数据：GeoSite 的一个标签，或者 GeoIP 的一组国家代码和标签（都已是规则里编译好的写法，见
+/// [`geosite_tag`] 和 `normalize_geoip_country_codes`）。要不要哪份数据、加载哪些标签、规则读了哪些 Geo 数据都由它得出
+/// The Geo data a matcher reads: one GeoSite tag, or a set of GeoIP country codes and tags
+/// (each as the rule compiled it, see [`geosite_tag`] and `normalize_geoip_country_codes`).
+/// Whether either data is needed, which tags are loaded and which Geo data rules read all
+/// follow from it
+#[derive(Debug, Clone, Copy)]
+pub enum GeoTags<'a> {
+    Site(&'a Arc<str>),
+    Ip(&'a [Arc<str>]),
+}
+
+impl<'a> GeoTags<'a> {
+    /// GeoSite 的标签 / The GeoSite tag
+    pub fn site(self) -> Option<&'a Arc<str>> {
+        match self {
+            Self::Site(tag) => Some(tag),
+            Self::Ip(_) => None,
+        }
+    }
+
+    /// GeoIP 的国家代码和标签 / The GeoIP country codes and tags
+    pub fn ip(self) -> Option<&'a [Arc<str>]> {
+        match self {
+            Self::Ip(codes) => Some(codes),
+            Self::Site(_) => None,
+        }
+    }
+}
+
 /// 编译好的一条规则。规则级的运算符编译时已经定进每个匹配器的运算符里（见 [`apply_rule_operator`]），不另存
 /// A compiled rule. The rule-level operators are settled into each matcher's operator as it
 /// compiles (see [`apply_rule_operator`]) and not kept apart
@@ -554,16 +584,17 @@ impl RuntimePipelineConfig {
 
         fill_requester_scopes(&mut pipelines, &reads, &pipeline_id_index);
 
-        let select_needs = |needs: fn(&RuntimePipelineSelectorMatcher) -> bool| {
+        let select_needs = |needs: fn(GeoTags<'_>) -> bool| {
             pipeline_select
                 .iter()
                 .flat_map(|rule| &rule.matchers)
-                .any(|m| needs(&m.matcher))
+                .filter_map(|m| m.matcher.geo_tags())
+                .any(needs)
         };
         let mut runtime = Self {
             settings: cfg.settings,
-            select_needs_geosite: select_needs(RuntimePipelineSelectorMatcher::needs_geosite),
-            select_needs_geoip: select_needs(RuntimePipelineSelectorMatcher::needs_geoip),
+            select_needs_geosite: select_needs(|tags| tags.site().is_some()),
+            select_needs_geoip: select_needs(|tags| tags.ip().is_some()),
             pipeline_select,
             pipelines,
             pipeline_id_index,
@@ -591,6 +622,25 @@ impl RuntimePipelineConfig {
 
     pub fn upstream_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_millis(self.settings.upstream_timeout_ms)
+    }
+
+    /// 配置里每个匹配器读的 Geo 数据：pipeline_select 的、规则的、回答检查的 / The Geo data every
+    /// matcher of the configuration reads: pipeline_select's, the rules', the answer checks'
+    pub fn geo_tags(&self) -> impl Iterator<Item = GeoTags<'_>> {
+        let select = self
+            .pipeline_select
+            .iter()
+            .flat_map(|rule| &rule.matchers)
+            .filter_map(|m| m.matcher.geo_tags());
+        let rules = self.pipelines.iter().flat_map(|pipeline| &pipeline.rules);
+        let request = rules
+            .clone()
+            .flat_map(|rule| rule.matchers.iter())
+            .filter_map(|m| m.matcher.geo_tags());
+        let response = rules
+            .flat_map(RuntimeRule::response_matchers)
+            .filter_map(|m| m.matcher.geo_tags());
+        select.chain(request).chain(response)
     }
 }
 
@@ -774,19 +824,28 @@ impl RuntimeMatcher {
         }
     }
 
-    /// 要不要 GeoSite 数据 / Whether it needs GeoSite data
+    /// 读的 Geo 数据（`geoip_private` 不读）/ The Geo data it reads (`geoip_private` reads none)
     #[inline]
-    pub const fn needs_geosite(&self) -> bool {
-        matches!(
-            self,
-            RuntimeMatcher::GeoSite { .. } | RuntimeMatcher::GeoSiteNot { .. }
-        )
+    pub fn geo_tags(&self) -> Option<GeoTags<'_>> {
+        match self {
+            RuntimeMatcher::GeoSite { tag } | RuntimeMatcher::GeoSiteNot { tag } => {
+                Some(GeoTags::Site(tag))
+            }
+            RuntimeMatcher::GeoipCountry { country_codes } => Some(GeoTags::Ip(country_codes)),
+            _ => None,
+        }
     }
 
-    /// 要不要 GeoIP 数据（`geoip_private` 不要）/ Whether it needs GeoIP data (`geoip_private` does not)
+    /// 要不要 GeoSite 数据 / Whether it needs GeoSite data
     #[inline]
-    pub const fn needs_geoip(&self) -> bool {
-        matches!(self, RuntimeMatcher::GeoipCountry { .. })
+    pub fn needs_geosite(&self) -> bool {
+        matches!(self.geo_tags(), Some(GeoTags::Site(_)))
+    }
+
+    /// 要不要 GeoIP 数据 / Whether it needs GeoIP data
+    #[inline]
+    pub fn needs_geoip(&self) -> bool {
+        matches!(self.geo_tags(), Some(GeoTags::Ip(_)))
     }
 }
 
@@ -825,17 +884,14 @@ impl RuntimePipelineSelectorMatcher {
         RuntimeMatcher::from_config(request).map(Self::Request)
     }
 
-    /// 要不要 GeoSite 数据；不要的话选 pipeline 时不拿它的锁 / Whether it needs GeoSite data; without
-    /// that, choosing a pipeline takes no lock on it
+    /// 读的 Geo 数据；不读的那份，选 pipeline 时不拿它的锁 / The Geo data it reads; choosing a
+    /// pipeline takes no lock on what it does not read
     #[inline]
-    pub const fn needs_geosite(&self) -> bool {
-        matches!(self, Self::Request(matcher) if matcher.needs_geosite())
-    }
-
-    /// 要不要 GeoIP 数据 / Whether it needs GeoIP data
-    #[inline]
-    pub const fn needs_geoip(&self) -> bool {
-        matches!(self, Self::Request(matcher) if matcher.needs_geoip())
+    pub fn geo_tags(&self) -> Option<GeoTags<'_>> {
+        match self {
+            Self::ListenerLabel { .. } => None,
+            Self::Request(matcher) => matcher.geo_tags(),
+        }
     }
 
     #[inline]

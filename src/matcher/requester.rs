@@ -239,24 +239,16 @@ impl RuleReads {
         for rule in rules {
             let (response_matchers, on_match, on_miss) =
                 ResponsePhase::parts(rule.response_phase.as_deref());
-            for m in rule.matchers.iter() {
-                if matches!(
-                    m.matcher,
-                    RuntimeMatcher::GeoSite { .. } | RuntimeMatcher::GeoSiteNot { .. }
-                ) {
-                    reads.geo.site = true;
-                }
-            }
-            for m in response_matchers {
-                match m.matcher {
-                    RuntimeResponseMatcher::ResponseRequestDomainGeoSite { .. }
-                    | RuntimeResponseMatcher::ResponseRequestDomainGeoSiteNot { .. } => {
-                        reads.geo.site = true;
-                    }
-                    RuntimeResponseMatcher::ResponseAnswerIpGeoipCountry { .. } => {
-                        reads.geo.ip = true;
-                    }
-                    _ => {}
+            // 请求匹配器读的 GeoIP 只按客户端地址判断，不算（见 [`GeoData`]）/ The GeoIP request
+            // matchers read judges the client address alone and does not count (see [`GeoData`])
+            reads.geo.site |= rule.matchers.iter().any(|m| m.matcher.needs_geosite());
+            for tags in response_matchers
+                .iter()
+                .filter_map(|m| m.matcher.geo_tags())
+            {
+                match tags {
+                    GeoTags::Site(_) => reads.geo.site = true,
+                    GeoTags::Ip(_) => reads.geo.ip = true,
                 }
             }
             for m in rule.matchers.iter() {
