@@ -343,15 +343,29 @@ impl Engine {
     }
 
     /// 从后台刷新要更新的槽位里去掉被刷新的那份应答（见 `RefreshTarget`），不论之后被续用或复制过；已经被取代、
-    /// 不在了的什么都不做
+    /// 不在了的什么都不做。刷新成功时多半已经照同一个问题、同一个适用范围写回了新应答，取代了它：先在读锁下看它还在不在，
+    /// 还在才拿写锁去掉，不必每次刷新都多拿一次写锁、顺带清扫
     /// Drop the answer a background refresh renews from its slot (see `RefreshTarget`),
-    /// whatever renewed or copied it since; nothing happens when it was replaced and is gone
+    /// whatever renewed or copied it since; nothing happens when it was replaced and is gone. A
+    /// refresh that succeeds has mostly written a new answer back under the same question and
+    /// reach, which took its place: it is looked for under the read lock first and the write
+    /// lock taken only while it is still there, rather than one more write lock, sweep and all,
+    /// on every refresh
     pub(crate) fn drop_refreshed(&self, question: &CachedQuestion<'_>, target: &RefreshTarget) {
-        self.cache_remove(target.slot, |entry| {
+        let refreshed = |entry: &CacheEntry| {
             question.matches(entry)
                 && entry.reach == target.reach
                 && entry.fetched_at == target.fetched_at
-        });
+        };
+        let still_there = self
+            .cache
+            .get_with(target.slot, |slot| {
+                slot.entries().any(|entry| refreshed(entry))
+            })
+            .unwrap_or(false);
+        if still_there {
+            self.cache_remove(target.slot, refreshed);
+        }
     }
 
     /// 把一份应答存进槽位 `slot`（见 `CacheSlot::with`）。新应答只经过这里写入，先过
