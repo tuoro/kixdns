@@ -475,11 +475,13 @@ async fn run_dns_server(
     let engine = engine.build().context("initialize DNS engine")?;
 
     // 监视不了时配置文件改了不会重载，面板保存的配置也不生效：记一条 error，默认日志级别看得到，面板经控制通道读
-    // （`config` 的 `watch_error`）。文件改了指向、新的地方监视不上时也一样，又监视上了就清掉
+    // （`config` 的 `watch_error`）。装的时候就有位置监视不上、文件改了指向以后新的地方监视不上时也一样，又监视上了就
+    // 清掉（见 `watcher::ConfigWatch::start_reporting`）
     // Without the watch a change to the configuration file is not reloaded, nor is a save from
     // the panel applied: an error is logged, seen at the default log level, and the panel reads
-    // it over the control channel (`config`'s `watch_error`). So too when the file comes to lead
-    // somewhere that cannot be watched, cleared once it is watched again
+    // it over the control channel (`config`'s `watch_error`). So too when some of its places
+    // cannot be watched as the watch is installed, or the file comes to lead somewhere that
+    // cannot be, cleared once it is watched again (see `watcher::ConfigWatch::start_reporting`)
     #[cfg(unix)]
     let on_watch = {
         let metrics = panel_metrics.clone();
