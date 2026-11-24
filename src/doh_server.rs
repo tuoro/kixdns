@@ -33,7 +33,7 @@ use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 use crate::engine::{Engine, OnTheSpot};
 use crate::observe::ClientTransport;
@@ -180,9 +180,13 @@ pub async fn run_doh(
         let (stream, peer) = match listener.accept().await {
             Ok(accepted) => accepted,
             Err(err) => {
-                // Never end the loop on an accept error (see accept_retry_delay)
-                // 接受出错不退出循环（见 accept_retry_delay）
-                warn!(error = %err, "DoH accept failed, retrying");
+                // 接受出错不退出循环，记法和 TCP 监听器一样（见 `listeners::tcp::run_tcp`）/ Never end the loop
+                // on an accept error, logged as the TCP listener logs it (see `listeners::tcp::run_tcp`)
+                crate::warn_sparse!(
+                    event = "doh_accept_failed",
+                    error = %err,
+                    "DoH accept failed, retrying"
+                );
                 tokio::time::sleep(crate::socket_utils::accept_retry_delay(&err)).await;
                 continue;
             }
@@ -235,6 +239,7 @@ pub async fn run_doh(
                     crate::warn_sparse!(
                         event = "doh_tls_handshake_failed",
                         error = %e,
+                        client_ip = %peer.ip(),
                         "DoH TLS handshake failed"
                     );
                 }
@@ -646,17 +651,18 @@ fn build_tls_acceptor(cert_path: &str, key_path: &str) -> anyhow::Result<TlsAcce
     Ok(TlsAcceptor::from(Arc::new(tls_config)))
 }
 
-/// 从 PEM 文件加载证书 / Load certificates from PEM file
+/// 从 PEM 文件 `path` 读证书链；读不了的错误说是哪个文件 / Reads the certificate chain from the
+/// PEM file `path`; an error reading it names the file
 fn load_certs(path: &str) -> anyhow::Result<Vec<CertificateDer<'static>>> {
     CertificateDer::pem_file_iter(path)
-        .context("open cert file")?
-        .collect::<Result<Vec<_>, _>>()
-        .context("parse PEM certificates")
+        .and_then(Iterator::collect)
+        .with_context(|| format!("read DoH certificate {path}"))
 }
 
-/// 从 PEM 文件加载私钥 / Load private key from PEM file
+/// 从 PEM 文件 `path` 读私钥；读不了的错误说是哪个文件 / Reads the private key from the PEM file
+/// `path`; an error reading it names the file
 fn load_private_key(path: &str) -> anyhow::Result<PrivateKeyDer<'static>> {
-    PrivateKeyDer::from_pem_file(path).context("parse PEM private key")
+    PrivateKeyDer::from_pem_file(path).with_context(|| format!("read DoH private key {path}"))
 }
 
 // ============================================================================
@@ -885,6 +891,35 @@ mod tests {
             run_doh(listener, certificate, served, Arc::from("/dns-query")).await
         });
         (address, server, dir)
+    }
+
+    /// TLS 握手失败的告警说是哪个客户端：客户端连上来发的不是 TLS / The warning of a failed TLS
+    /// handshake names the client: one that connects and sends something other than TLS
+    #[tokio::test]
+    async fn a_failed_tls_handshake_is_logged_with_the_client() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (warnings, guard) = crate::engine::test_support::Warnings::capture();
+        let (address, server, _dir) = doh_server(&make_static_engine("NXDOMAIN")).await;
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        stream.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
+        // 服务端记下告警、放下连接以后这边才读到头 / The end is read here only after the server has
+        // logged the warning and let the connection go
+        let mut buf = [0u8; 64];
+        while let Ok(Ok(1..)) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), stream.read(&mut buf)).await
+        {
+        }
+        drop(guard);
+        let lines = warnings.lines();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("DoH TLS handshake failed")
+                    && line.contains(r#"event="doh_tls_handshake_failed""#)
+                    && line.contains("client_ip=127.0.0.1")),
+            "{lines:#?}"
+        );
+        server.abort();
     }
 
     /// 内存不够时不接新连接，TLS 握手之前就关掉：连接和握手本身也占内存

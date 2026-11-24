@@ -114,6 +114,22 @@ fn until(kernel: &mut Kernel, check: impl Fn() -> bool) -> bool {
     }
 }
 
+/// 等内核自己退出，最多 10 秒：到时还在跑就带着它的日志失败，不一直挂着 / Waits for the kernel to exit by
+/// itself, 10 seconds at most: one still running by then fails the test with its log instead of
+/// hanging
+fn exit_of(kernel: &mut Kernel, dir: &Path) -> std::process::ExitStatus {
+    let start = Instant::now();
+    loop {
+        if let Some(status) = kernel.0.try_wait().unwrap() {
+            return status;
+        }
+        if start.elapsed() > Duration::from_secs(10) {
+            panic!("the kernel did not exit in 10 s: {}", log_of(dir));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// 系统分配范围里只空出比最大的上游池多四分之一的端口，监听口是其中一个：上游 socket 要是先开，多半会挑走它
 /// With only a quarter more ports of the system's range free than the largest upstream pool, the listening
 /// port among them, upstream sockets would mostly take it, were they opened first
@@ -203,7 +219,7 @@ fn a_taken_dns_port_ends_the_kernel_with_the_reason() {
         let _tcp = (!held_udp).then(|| TcpListener::bind(bind).unwrap());
         let dir = tempfile::TempDir::new().unwrap();
         let mut kernel = start(dir.path(), settings.clone());
-        let status = kernel.0.wait().unwrap();
+        let status = exit_of(&mut kernel, dir.path());
         let log = log_of(dir.path());
         assert!(!status.success());
         assert!(log.contains(reason), "{log}");
