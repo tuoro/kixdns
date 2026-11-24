@@ -484,16 +484,32 @@ pub struct RuntimePipelineSelectorMatcherWithOp {
     pub matcher: RuntimePipelineSelectorMatcher,
 }
 
+/// 编好的 `compiled`；编不了时为 None，`refused` 记一条开头写着它在哪（`place`）的错误
+/// What `compiled` holds; None when it could not be compiled, `refused` noting an error starting
+/// with where it is (`place`)
+fn compiled<T>(
+    refused: &mut Vec<String>,
+    place: std::fmt::Arguments<'_>,
+    compiled: anyhow::Result<T>,
+) -> Option<T> {
+    compiled
+        .map_err(|err| refused.push(format!("{place}: {err:#}")))
+        .ok()
+}
+
 impl RuntimePipelineConfig {
     /// 把一份配置编译成运行时的样子，转发时要用的都在这里先算好，只算这一遍：拆好的上游、几个 forward 合成的一次转发。
-    /// 编译不了的匹配器连同它的位置报出来，写成 `pipelines[0].rules[2].matchers[1]` 这样的路径，和读不懂的键一样
+    /// 说不通的设置（见 `GlobalSettings::validate`）和编译不了的匹配器一次列全（见 [`config::Problems`]），匹配器的开头
+    /// 写着它的位置，写成 `pipelines[0].rules[2].matchers[1]` 这样的路径，和读不懂的键一样
     /// Compiles a configuration into its runtime form, working out here, once, what forwarding
-    /// needs: the upstreams split and the one forward several forwards merge into. A matcher
-    /// that cannot be compiled is reported with its place, a path like
-    /// `pipelines[0].rules[2].matchers[1]` as for the keys not read
-    pub fn from_config(mut cfg: PipelineConfig) -> anyhow::Result<Self> {
+    /// needs: the upstreams split and the one forward several forwards merge into. Settings that
+    /// make no sense (see `GlobalSettings::validate`) and matchers that cannot be compiled are
+    /// listed all at once (see [`config::Problems`]), a matcher's starting with its place, a path
+    /// like `pipelines[0].rules[2].matchers[1]` as for the keys not read
+    pub fn from_config(mut cfg: PipelineConfig) -> Result<Self, config::Problems> {
         cfg.settings.hold_to_limits();
-        cfg.settings.validate()?;
+        let mut refused = Vec::new();
+        config::Problems::gather(&mut refused, cfg.settings.validate());
         let warnings = config::warnings(&cfg);
         // 默认上游有几个时同时问 / Several default upstreams are asked at once
         cfg.settings.pre_split_default_upstream();
@@ -509,34 +525,37 @@ impl RuntimePipelineConfig {
                 // 预计算多 Forward 规则的合并上游（性能优化）。
                 // 消除热路径上每请求的 FxHashSet + format! + join 开销。
                 r.compute_merged_forward();
-                let mut matchers = r
+                let mut matchers: Vec<_> = r
                     .matchers
                     .into_iter()
                     .enumerate()
-                    .map(|(k, m)| {
-                        Ok(RuntimeMatcherWithOp {
+                    .filter_map(|(k, m)| {
+                        let matcher = RuntimeMatcher::from_config(m.matcher);
+                        let place = format_args!("pipelines[{i}].rules[{j}].matchers[{k}]");
+                        compiled(&mut refused, place, matcher).map(|matcher| RuntimeMatcherWithOp {
                             operator: m.operator,
-                            matcher: RuntimeMatcher::from_config(m.matcher).with_context(|| {
-                                format!("pipelines[{i}].rules[{j}].matchers[{k}]")
-                            })?,
+                            matcher,
                         })
                     })
-                    .collect::<anyhow::Result<Vec<_>>>()?;
+                    .collect();
                 apply_rule_operator(&mut matchers, r.matcher_operator, |m| &mut m.operator);
 
-                let mut response_matchers = r
+                let mut response_matchers: Vec<_> = r
                     .response_matchers
                     .into_iter()
                     .enumerate()
-                    .map(|(k, rm)| {
-                        Ok(RuntimeResponseMatcherWithOp {
-                            operator: rm.operator,
-                            matcher: RuntimeResponseMatcher::from_config(rm.matcher).with_context(
-                                || format!("pipelines[{i}].rules[{j}].response_matchers[{k}]"),
-                            )?,
+                    .filter_map(|(k, rm)| {
+                        let matcher = RuntimeResponseMatcher::from_config(rm.matcher);
+                        let place =
+                            format_args!("pipelines[{i}].rules[{j}].response_matchers[{k}]");
+                        compiled(&mut refused, place, matcher).map(|matcher| {
+                            RuntimeResponseMatcherWithOp {
+                                operator: rm.operator,
+                                matcher,
+                            }
                         })
                     })
-                    .collect::<anyhow::Result<Vec<_>>>()?;
+                    .collect();
                 apply_rule_operator(&mut response_matchers, r.response_matcher_operator, |rm| {
                     &mut rm.operator
                 });
@@ -593,18 +612,21 @@ impl RuntimePipelineConfig {
 
         let mut pipeline_select = Vec::new();
         for (i, s) in cfg.pipeline_select.into_iter().enumerate() {
-            let mut matchers = s
+            let mut matchers: Vec<_> = s
                 .matchers
                 .into_iter()
                 .enumerate()
-                .map(|(k, m)| {
-                    Ok(RuntimePipelineSelectorMatcherWithOp {
-                        operator: m.operator,
-                        matcher: RuntimePipelineSelectorMatcher::from_config(m.matcher)
-                            .with_context(|| format!("pipeline_select[{i}].matchers[{k}]"))?,
+                .filter_map(|(k, m)| {
+                    let matcher = RuntimePipelineSelectorMatcher::from_config(m.matcher);
+                    let place = format_args!("pipeline_select[{i}].matchers[{k}]");
+                    compiled(&mut refused, place, matcher).map(|matcher| {
+                        RuntimePipelineSelectorMatcherWithOp {
+                            operator: m.operator,
+                            matcher,
+                        }
                     })
                 })
-                .collect::<anyhow::Result<Vec<_>>>()?;
+                .collect();
             apply_rule_operator(&mut matchers, s.matcher_operator, |m| &mut m.operator);
             pipeline_select.push(RuntimePipelineSelectRule {
                 pipeline: s.pipeline,
@@ -612,6 +634,7 @@ impl RuntimePipelineConfig {
             });
         }
 
+        config::Problems::refuse(refused)?;
         cfg.settings.default_upstream_shared =
             Some(Arc::from(cfg.settings.default_upstream.as_str()));
 
@@ -1291,7 +1314,7 @@ mod tests {
     }
 
     /// 按 JSON 建运行时配置 / A runtime configuration built from JSON
-    fn runtime_of(raw: serde_json::Value) -> anyhow::Result<RuntimePipelineConfig> {
+    fn runtime_of(raw: serde_json::Value) -> Result<RuntimePipelineConfig, config::Problems> {
         RuntimePipelineConfig::from_config(serde_json::from_value(raw).expect("parse config"))
     }
 
