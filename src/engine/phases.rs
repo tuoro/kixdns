@@ -232,10 +232,10 @@ fn usable_hit(
 }
 
 /// Checks the response cache: a fresh answer goes out with its TTLs aged and may start a
-/// background refresh; an expired one is served stale, waits on its refresh, or is dropped
-/// as serve_stale says.
-/// 查响应缓存：新鲜的应答按停留时间减 TTL 后给出，必要时发起后台刷新；过期的按 serve_stale
-/// 的设置当作 stale 提供、等它的刷新，或者删掉。
+/// background refresh; an expired one still of use is served stale or waits on its refresh as
+/// serve_stale says; one of no further use is a miss, left where it is (see `usable_hit`).
+/// 查响应缓存：新鲜的应答按停留时间减 TTL 后给出，必要时发起后台刷新；过期还能用的按 serve_stale
+/// 的设置当作 stale 提供或者等它的刷新；不能再用的算未命中，留在原处（见 `usable_hit`）。
 pub(crate) fn check_cache_logged(
     engine: &Engine,
     context: &CacheLookupContext<'_>,
