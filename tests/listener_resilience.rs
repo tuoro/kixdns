@@ -3,19 +3,19 @@
 //! Runs the real binary under a low descriptor limit, uses up its descriptors
 //! with DNS-over-TCP connections, has the DoH listener and the control socket
 //! hit the same accept error, then lets the connections go. Every listener must
-//! answer again. An accept error used to end the accept loop for good: TCP was
-//! refused from then on while UDP kept answering, so nothing restarted it.
+//! answer again, and the TCP and DoH listeners, meeting the error every 100 ms
+//! meanwhile, log it once in a while rather than each time.
 //!
 //! 监听口熬得过接受出错：在压低的句柄上限下跑真的程序，用 DNS over TCP 连接把句柄用光，让 DoH
-//! 监听口和控制通道也碰上同一个接受错误，再把连接放掉，每个监听口都要能再应答。以前一次接受出错
-//! 就让接受循环永久退出：此后 TCP 一律拒绝连接，UDP 却照答，没有谁会把它重启。
+//! 监听口和控制通道也碰上同一个接受错误，再把连接放掉，每个监听口都要能再应答；这期间 TCP 和 DoH
+//! 监听口每 100 ms 碰上一次这个错误，隔一阵才记一条，不是每次都记。
 #![cfg(unix)]
 
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, TcpStream, UdpSocket};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
@@ -143,14 +143,17 @@ async fn listeners_answer_again_after_running_out_of_descriptors() {
     let config_path = dir.path().join("config.json");
     std::fs::write(&config_path, config.to_string()).unwrap();
 
+    let log = dir.path().join("kixdns.log");
+    let output = std::fs::File::create(&log).unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_kixdns"));
     command
         .args(["run", "--config"])
         .arg(&config_path)
         .arg("--admin-socket")
         .arg(&control)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .env("RUST_LOG", "warn")
+        .stdout(output.try_clone().unwrap())
+        .stderr(output);
     // SAFETY: setrlimit is async-signal-safe and touches only the child.
     unsafe {
         command.pre_exec(|| {
@@ -217,4 +220,8 @@ async fn listeners_answer_again_after_running_out_of_descriptors() {
         "the control socket must answer again once descriptors are free"
     );
     assert!(udp_answers(dns_port), "UDP keeps answering throughout");
+    let log = std::fs::read_to_string(&log).unwrap();
+    let logged = |what: &str| log.lines().filter(|line| line.contains(what)).count();
+    assert_eq!(logged("tcp accept failed"), 1, "{log}");
+    assert!(logged("DoH accept failed") <= 1, "{log}");
 }

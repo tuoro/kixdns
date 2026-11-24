@@ -1,17 +1,15 @@
 //! 入站 DoH 起不来时 DNS 照常答，控制通道 `config` 结果的 `doh_error` 写着原因；没配 DoH 时它是 null。
 //!
-//! 在真程序上跑：配了 bind_doh，证书和私钥的文件却不存在。DNS 照常应答，`doh_error` 是读证书失败的原因，带着原因链；
-//! 不配 DoH 时 `doh_error` 在，是 null。以前 DoH 起不来只记一行错误日志，控制通道里看不出来，面板保存一个写错的证书
-//! 路径也会被接受，重启以后 DoH 就静默关掉了。
+//! 在真程序上跑：配了 bind_doh，证书或私钥的文件却不存在。DNS 照常应答，`doh_error` 说读不了的是证书还是私钥、哪个文件，
+//! 带着原因链；不配 DoH 时 `doh_error` 在，是 null。
 //!
 //! The inbound DoH failing to start leaves DNS answering, and `doh_error` in the control
 //! channel's `config` result gives the reason; with no DoH configured it is null.
 //!
-//! Runs the real binary with bind_doh configured and the certificate and key files missing.
-//! DNS answers as usual, and `doh_error` is why the certificate could not be read, with its
-//! cause chain; without DoH configured `doh_error` is there and null. A DoH failing to start
-//! used to be one error line in the log and nothing on the control channel, so the panel
-//! saving a wrong certificate path was accepted too, and after a restart DoH was quietly off.
+//! Runs the real binary with bind_doh configured and the certificate or the key file missing.
+//! DNS answers as usual, and `doh_error` says whether the certificate or the key could not be
+//! read and which file, with its cause chain; without DoH configured `doh_error` is there and
+//! null.
 #![cfg(unix)]
 
 use std::net::Ipv4Addr;
@@ -72,26 +70,39 @@ fn doh_error_of(config: &serde_json::Value, port: u16) -> serde_json::Value {
         .clone()
 }
 
-/// 证书和私钥都不存在：DNS 照常答，`doh_error` 说证书打不开，带着系统给的原因
-/// With the certificate and the key both missing, DNS answers as usual and `doh_error` says the
-/// certificate cannot be opened, with the reason the system gives
+/// 证书和私钥都不存在时说证书，证书在、私钥不存在时说私钥：DNS 照常答，`doh_error` 写着读不了的文件和系统给的原因
+/// With the certificate and the key both missing it is the certificate, and with the
+/// certificate there and the key missing the key: DNS answers as usual, and `doh_error` names
+/// the file that cannot be read, with the reason the system gives
 #[test]
-fn dns_answers_and_doh_error_says_why_when_the_certificate_cannot_be_read() {
-    let dir = tempfile::TempDir::new().unwrap();
-    let (config, port) = config_with(serde_json::json!({
-        "bind_doh": format!("127.0.0.1:{}", free_port()),
-        "doh_tls_cert": dir.path().join("cert.pem"),
-        "doh_tls_key": dir.path().join("key.pem"),
-    }));
-    let doh_error = doh_error_of(&config, port);
-    let reason = doh_error
-        .as_str()
-        .unwrap_or_else(|| panic!("doh_error is not a reason: {doh_error}"));
-    let prefix = "open cert file: ";
-    assert!(
-        reason.starts_with(prefix) && reason.len() > prefix.len(),
-        "{reason}"
-    );
+fn dns_answers_and_doh_error_says_which_file_cannot_be_read() {
+    for certificate_there in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (cert, key) = (dir.path().join("cert.pem"), dir.path().join("key.pem"));
+        if certificate_there {
+            let pair = rcgen::KeyPair::generate().unwrap();
+            let params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+            std::fs::write(&cert, params.self_signed(&pair).unwrap().pem()).unwrap();
+        }
+        let (config, port) = config_with(serde_json::json!({
+            "bind_doh": format!("127.0.0.1:{}", free_port()),
+            "doh_tls_cert": cert,
+            "doh_tls_key": key,
+        }));
+        let doh_error = doh_error_of(&config, port);
+        let reason = doh_error
+            .as_str()
+            .unwrap_or_else(|| panic!("doh_error is not a reason: {doh_error}"));
+        let prefix = if certificate_there {
+            format!("read DoH private key {}: ", key.display())
+        } else {
+            format!("read DoH certificate {}: ", cert.display())
+        };
+        assert!(
+            reason.starts_with(&prefix) && reason.len() > prefix.len(),
+            "{reason}"
+        );
+    }
 }
 
 /// 没配 DoH：`doh_error` 是 null / Without DoH configured `doh_error` is null

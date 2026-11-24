@@ -3177,11 +3177,11 @@ mod validation_tests {
     }
 
     /// 执行不到的跳转不算进圈：请求动作里作决定的那个之后的（log、replace_txt_response 不作决定），请求阶段不是 forward
-    /// 的规则的回答动作，回答动作里作决定的那个之后的（log、forward 不作决定）。执行得到的照算。以前每个动作都算，
+    /// 的规则（allow 也不是）的回答动作，回答动作里作决定的那个之后的（log、forward 不作决定）。执行得到的照算。以前每个动作都算，
     /// a [forward, jump b] 和 b [jump a] 报成一个圈，回静态应答的规则 on_match 跳回自己也报
     /// Jumps that never run make no circle: those after the action deciding the request phase
     /// (log and replace_txt_response decide nothing), a rule's answer actions when its request
-    /// phase is no forward, and those after the answer action that decides (log and forward
+    /// phase is no forward (nor is allow), and those after the answer action that decides (log and forward
     /// decide nothing). Those that run count as before. Every action used to count, a
     /// [forward, jump b] with b [jump a] being warned about as a circle, and a rule answering
     /// statically whose on_match jumps back to its own pipeline too
@@ -3239,13 +3239,17 @@ mod validation_tests {
             ),
             1
         );
-        // 回答阶段：只有请求阶段是 forward 时才有 / The answer phase: there only when the request
-        // phase is a forward
-        assert_eq!(
-            circles(answer(vec![static_ip.clone()], vec![jump("a")]), vec![]),
-            0
-        );
-        assert_eq!(circles(answer(vec![jump("b")], vec![jump("b")]), vec![]), 0);
+        // 回答阶段：只有请求阶段是 forward 时才有，跳回规则自己所在的 pipeline 也执行不到；allow 也转发给默认上游，
+        // 却没有回答阶段 / The answer phase: there only when the request phase is a forward, so a
+        // jump back to the rule's own pipeline does not run either; allow forwards to the default
+        // upstream too, yet has no answer phase
+        for decision in [static_ip.clone(), jump("b"), action("allow")] {
+            assert_eq!(
+                circles(answer(vec![decision.clone()], vec![jump("a")]), vec![]),
+                0,
+                "{decision}"
+            );
+        }
         assert_eq!(
             circles(
                 answer(vec![action("log"), action("forward")], vec![jump("a")]),

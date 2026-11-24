@@ -11,7 +11,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
-use tracing::warn;
 
 /// 在 `listener` 上接 TCP 连接，一直接下去，不返回 / Accepts TCP connections on `listener` for good, never
 /// returning
@@ -24,9 +23,15 @@ pub(super) async fn run_tcp(listener: TcpListener, engine: Engine) -> ! {
         let (stream, peer) = match listener.accept().await {
             Ok(accepted) => accepted,
             Err(err) => {
-                // Never end the loop on an accept error (see accept_retry_delay)
-                // 接受出错不退出循环（见 accept_retry_delay）
-                warn!(error = %err, "tcp accept failed, retrying");
+                // 接受出错不退出循环（见 accept_retry_delay）。文件描述符用完时每个监听口每 100 ms 碰上一次，隔一阵才记一条
+                // Never end the loop on an accept error (see accept_retry_delay). With file
+                // descriptors used up every listener meets one each 100 ms, so one is logged
+                // once in a while
+                crate::warn_sparse!(
+                    event = "tcp_accept_failed",
+                    error = %err,
+                    "tcp accept failed, retrying"
+                );
                 tokio::time::sleep(crate::socket_utils::accept_retry_delay(&err)).await;
                 continue;
             }
