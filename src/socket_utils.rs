@@ -180,11 +180,15 @@ pub fn spread_datagrams(_socket: &Socket) -> io::Result<()> {
     Ok(())
 }
 
-/// 这个 socket 因为接收缓冲满丢过多少报文；读不到时是 None
-/// How many datagrams this socket has dropped for a full receive buffer; None when that cannot be read
+/// 这个 socket 的 SO_MEMINFO：按 `SK_MEMINFO_*` 排的各项内存计数，只要到丢包数这一项，内核按给的长度填；读不到时是
+/// None。丢包数和接收缓冲都从这一次读里取
+/// This socket's SO_MEMINFO: its memory counts in `SK_MEMINFO_*` order, only as far as the drops,
+/// the kernel filling what the length allows; None when it cannot be read. The drops and the
+/// receive buffer are both taken from this one read
 #[cfg(target_os = "linux")]
-pub fn udp_receive_drops(socket: &tokio::net::UdpSocket) -> Option<u32> {
-    // 只要到丢包这一项，内核按给的长度填 / Only as far as the drops; the kernel fills what the length allows
+fn udp_meminfo(
+    socket: &tokio::net::UdpSocket,
+) -> Option<[u32; libc::SK_MEMINFO_DROPS as usize + 1]> {
     let mut info = [0u32; libc::SK_MEMINFO_DROPS as usize + 1];
     let mut len = std::mem::size_of_val(&info) as libc::socklen_t;
     // SAFETY: the buffer and its length are valid for the call, which only writes within them
@@ -197,7 +201,14 @@ pub fn udp_receive_drops(socket: &tokio::net::UdpSocket) -> Option<u32> {
             &mut len,
         )
     };
-    (ret == 0).then(|| info[libc::SK_MEMINFO_DROPS as usize])
+    (ret == 0).then_some(info)
+}
+
+/// 这个 socket 因为接收缓冲满丢过多少报文；读不到时是 None
+/// How many datagrams this socket has dropped for a full receive buffer; None when that cannot be read
+#[cfg(target_os = "linux")]
+pub fn udp_receive_drops(socket: &tokio::net::UdpSocket) -> Option<u32> {
+    udp_meminfo(socket).map(|info| info[libc::SK_MEMINFO_DROPS as usize])
 }
 
 /// 这个 socket 的接收缓冲现在记着多少字节、最多记多少（内核翻过倍的大小）；读不到时是 None
@@ -205,19 +216,7 @@ pub fn udp_receive_drops(socket: &tokio::net::UdpSocket) -> Option<u32> {
 /// kernel doubled); None when that cannot be read
 #[cfg(target_os = "linux")]
 pub fn udp_receive_queue(socket: &tokio::net::UdpSocket) -> Option<(u32, u32)> {
-    let mut info = [0u32; libc::SK_MEMINFO_RCVBUF as usize + 1];
-    let mut len = std::mem::size_of_val(&info) as libc::socklen_t;
-    // SAFETY: the buffer and its length are valid for the call, which only writes within them
-    let ret = unsafe {
-        libc::getsockopt(
-            socket.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_MEMINFO,
-            info.as_mut_ptr().cast(),
-            &mut len,
-        )
-    };
-    (ret == 0).then(|| {
+    udp_meminfo(socket).map(|info| {
         (
             info[libc::SK_MEMINFO_RMEM_ALLOC as usize],
             info[libc::SK_MEMINFO_RCVBUF as usize],
