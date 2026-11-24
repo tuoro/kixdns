@@ -11,7 +11,7 @@ use bytes::{Bytes, BytesMut};
 use hickory_proto::rr::RecordType;
 use tracing::debug;
 
-use super::execution::UnreadableQuery;
+use super::execution::request_timeout_ms;
 use super::{Engine, FastPathResponse, PreParsedData, utils};
 use crate::observe::ClientTransport;
 use crate::proto_utils;
@@ -88,59 +88,58 @@ impl Engine {
     }
 
     /// 快速路径没能当场回答的查询：在整体请求时限内走完整处理，完整路径读得了的总有应答（见
-    /// `Engine::handle_packet_full`）。读不了的查询回 FORMERR（RFC 6891 第 6.1.1 节，见
-    /// `proto_utils::formerr_reply`），读得了读不了在读的那一刻就定下了（见 [`UnreadableQuery`]），不必为此再解析一遍；超时
-    /// 回 SERVFAIL（见 `proto_utils::servfail_reply`）。这两种各记一条日志。`pre_parsed` 为 None 时快速解析没成，从头解析。
+    /// `Engine::handle_packet_full`）。`pre_parsed` 为 None 时快速解析没成，先从头读（见 `Engine::read_full`）；读不了的查询回
+    /// FORMERR（RFC 6891 第 6.1.1 节，见 `proto_utils::formerr_reply`），读得了读不了在读的那一刻就定下了（见
+    /// `UnreadableQuery`），不必为此再解析一遍；超时回 SERVFAIL（见 `proto_utils::servfail_reply`）。这两种各记一条日志
     /// A query the fast path could not answer on the spot: the full path within the overall
     /// request timeout, which always answers a query it can read (see
-    /// `Engine::handle_packet_full`). A query that cannot be read gets FORMERR (RFC 6891
-    /// section 6.1.1, see `proto_utils::formerr_reply`), which was settled the moment it was
-    /// read (see [`UnreadableQuery`]) with no second parse for it; a timeout gets SERVFAIL (see
-    /// `proto_utils::servfail_reply`). Each of the two is logged. With `pre_parsed` None the
-    /// quick parse failed, and the query is parsed from scratch.
+    /// `Engine::handle_packet_full`). With `pre_parsed` None the quick parse failed, and the query
+    /// is read from scratch first (see `Engine::read_full`); a query that cannot be read gets
+    /// FORMERR (RFC 6891 section 6.1.1, see `proto_utils::formerr_reply`), which was settled the
+    /// moment it was read (see `UnreadableQuery`) with no second parse for it; a timeout gets
+    /// SERVFAIL (see `proto_utils::servfail_reply`). Each of the two is logged
     pub async fn answer_after_fast_path(
         &self,
         packet: &[u8],
         peer: SocketAddr,
         pre_parsed: Option<PreParsedData>,
     ) -> Bytes {
-        // 每个查询重新取整体请求时限（含 hedge 与 TCP fallback）。RFC 7766 的客户端会把一条连接用
-        // 很久，热重载改了 request_timeout 之后，这条连接上的后续查询必须跟着新值走。
-        // Re-read the overall request timeout (hedge and TCP fallback included) per query. An
-        // RFC 7766 client keeps one connection open for a long time, so queries that follow a
-        // reload must use the new request_timeout.
-        let timeout_ms = self.get_request_timeout_ms();
-        let answered = tokio::time::timeout(Duration::from_millis(timeout_ms), async {
-            match pre_parsed {
-                Some(pre_parsed) => Ok(self.handle_packet_full(packet, peer, pre_parsed).await),
-                None => self.handle_packet(packet, peer).await,
-            }
-        })
-        .await;
         let listener = self.listener_name();
-        match answered {
-            Ok(Ok(answer)) => answer,
-            Ok(Err(UnreadableQuery)) => {
-                debug!("{listener} query cannot be read, answering FORMERR");
-                proto_utils::formerr_reply(packet)
-            }
+        let Ok(pre_parsed) = pre_parsed.map_or_else(|| self.read_full(packet, peer), Ok) else {
+            debug!("{listener} query cannot be read, answering FORMERR");
+            return proto_utils::formerr_reply(packet);
+        };
+        // 时限（含 hedge 与 TCP 回落）和告警里的上游超时都照请求自己的那份配置（见 [`PreParsedData`]）：请求里面等上游、等过期
+        // 应答的刷新都按它定上限，外层的时限换成别的配置的，照它等着的应答就会被截成 SERVFAIL。重载以后来的查询照新配置
+        // The time limit (hedge and TCP fallback included) and the upstream timeout in the
+        // warning come from the request's own configuration (see [`PreParsedData`]): the waits
+        // within the request, for an upstream or a stale answer's refresh, are bounded by it, and
+        // an outer limit of another configuration would cut what they wait for into SERVFAIL.
+        // Queries after a reload follow the new configuration
+        let settings = &pre_parsed.state.pipeline.settings;
+        let (timeout_ms, upstream_timeout_ms) =
+            (request_timeout_ms(settings), settings.upstream_timeout_ms);
+        tokio::time::timeout(
+            Duration::from_millis(timeout_ms),
+            self.handle_packet_full(packet, peer, pre_parsed),
+        )
+        .await
+        .unwrap_or_else(|_| {
             // 每个监听器各算各的节流：UDP 上一直在超时，TCP、DoH 的超时照样看得见 / Each listener
             // throttles on its own: with UDP timing out all the time, TCP and DoH timeouts still show
-            Err(_) => {
-                let (qname, qtype) = question_text(packet).unzip();
-                crate::warn_sparse!(
-                    per listener;
-                    event = "request_timeout",
-                    timeout_ms,
-                    upstream_timeout_ms = self.get_upstream_timeout_ms(),
-                    qname = qname.map(tracing::field::display),
-                    qtype = qtype.map(tracing::field::debug),
-                    client_ip = %peer.ip(),
-                    "{listener} request timeout"
-                );
-                proto_utils::servfail_reply(packet)
-            }
-        }
+            let (qname, qtype) = question_text(packet).unzip();
+            crate::warn_sparse!(
+                per listener;
+                event = "request_timeout",
+                timeout_ms,
+                upstream_timeout_ms,
+                qname = qname.map(tracing::field::display),
+                qtype = qtype.map(tracing::field::debug),
+                client_ip = %peer.ip(),
+                "{listener} request timeout"
+            );
+            proto_utils::servfail_reply(packet)
+        })
     }
 
     /// 日志里的监听器名 / The listener's name in the logs
@@ -166,4 +165,178 @@ fn question_text(packet: &[u8]) -> Option<(String, RecordType)> {
         proto_utils::name_text(question.name()),
         question.query_type(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::Ipv4Addr;
+    use std::time::{Duration, Instant};
+
+    use bytes::BytesMut;
+    use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
+    use hickory_proto::rr::{Name, RecordType};
+    use hickory_proto::serialize::binary::BinDecodable;
+    use serde_json::{Value, json};
+
+    use super::OnTheSpot;
+    use crate::engine::test_support::{
+        Warnings, answering_upstream, ask, counting_settings, engine_from, first_a, peer,
+        silent_upstream,
+    };
+    use crate::engine::{Engine, PreParsedData};
+    use crate::matcher::RuntimePipelineConfig;
+
+    const ANSWER: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 1);
+
+    /// 客户端等过期应答的刷新最多等这么久 / How long a client waits at most for a stale answer's refresh
+    const CLIENT_WAIT: Duration = Duration::from_millis(600);
+
+    fn query() -> Vec<u8> {
+        let mut query = Message::new(0x4c4c, MessageType::Query, OpCode::Query);
+        query.metadata.recursion_desired = true;
+        query.add_query(Query::query(
+            Name::from_ascii("xslow.test.").unwrap(),
+            RecordType::A,
+        ));
+        query.to_vec().unwrap()
+    }
+
+    /// 快速解析读不了、要从头读的同一个查询：第一个标签以空格开头 / The same query, which the quick
+    /// parse cannot read and which is read from scratch: its first label starts with a space
+    fn query_read_from_scratch() -> Vec<u8> {
+        let mut packet = query();
+        packet[13] = b' ';
+        packet
+    }
+
+    /// 全部转发给 `upstream`、设置照 `settings` 的配置 / A configuration forwarding everything to
+    /// `upstream`, with `settings`
+    fn forwarding(upstream: &str, settings: Value) -> Value {
+        json!({
+            "settings": counting_settings(settings),
+            "pipelines": [{ "id": "main", "rules": [{
+                "name": "all", "matchers": [{ "type": "any" }],
+                "actions": [{ "type": "forward", "upstream": upstream }]
+            }]}]
+        })
+    }
+
+    fn reload(engine: &Engine, config: Value) {
+        let config: crate::config::PipelineConfig = serde_json::from_value(config).unwrap();
+        engine.reload(RuntimePipelineConfig::from_config(config).unwrap());
+    }
+
+    /// 快速路径交给完整路径的：读好的查询，快速解析读不了时为 None / What the fast path hands on to
+    /// the full path: the query as read, None when the quick parse cannot read it
+    fn handed_on(engine: &Engine, packet: &[u8]) -> Option<PreParsedData> {
+        match engine.on_the_spot(packet, peer(), &mut BytesMut::new()) {
+            OnTheSpot::Forward(pre_parsed) => pre_parsed,
+            OnTheSpot::Reply | OnTheSpot::Drop => panic!("not handed on to the full path"),
+        }
+    }
+
+    /// 快速路径之后、读时限之前重载成短得多的时限：请求照选它的那份配置等过期应答的刷新，等到头交出过期应答，不被新配置的
+    /// 时限截成 SERVFAIL
+    /// A reload to far shorter limits after the fast path and before the limit is read: the
+    /// request waits for the stale answer's refresh as the configuration that picked it says,
+    /// and hands out the stale answer when the wait is over, not cut into SERVFAIL by the new
+    /// configuration's limit
+    #[tokio::test]
+    async fn a_reload_after_the_fast_path_still_serves_the_stale_answer() {
+        let upstream = answering_upstream(ANSWER, 1).await;
+        let config = |upstream_ms: u64, request_ms: u64| {
+            forwarding(
+                &upstream.address,
+                json!({
+                    "min_ttl": 0,
+                    "serve_stale": true,
+                    "serve_stale_client_timeout_ms": CLIENT_WAIT.as_millis() as u64,
+                    "upstream_timeout_ms": upstream_ms,
+                    "request_timeout_ms": request_ms
+                }),
+            )
+        };
+        let engine = engine_from(config(1000, 4000));
+        assert_eq!(first_a(&ask(&engine, &query(), peer()).await), Some(ANSWER));
+        upstream.silence(true);
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+
+        let pre_parsed = handed_on(&engine, &query());
+        assert!(
+            pre_parsed.is_some(),
+            "the stale answer waits on the refresh"
+        );
+        reload(&engine, config(200, 300));
+        let started = Instant::now();
+        let reply = engine
+            .answer_after_fast_path(&query(), peer(), pre_parsed)
+            .await;
+        let took = started.elapsed();
+        assert_eq!(first_a(&reply), Some(ANSWER), "the stale answer");
+        assert!(
+            took >= CLIENT_WAIT,
+            "handed out after the wait, took {took:?}"
+        );
+    }
+
+    /// 请求等着上游时重载成别的时限：到点照选它的那份配置回 SERVFAIL，告警里的整体时限和上游超时都是那份配置的。快速解析
+    /// 读得了的查询和要从头读的一样
+    /// A reload to other limits while the request waits on the upstream: it is answered
+    /// SERVFAIL when the limit of the configuration that picked it runs out, and the warning's
+    /// overall limit and upstream timeout are both that configuration's. A query the quick
+    /// parse reads and one read from scratch alike
+    #[tokio::test]
+    async fn the_timeout_warning_names_the_limits_of_one_configuration() {
+        // 上游从不回答：引擎先用 UDP 试、再改用 TCP，加起来比请求时限长，所以先到点的是监听器的计时 / The upstream never
+        // answers: the engine tries UDP and then TCP, longer in all than the request timeout, so
+        // the listener's timer runs out first
+        let upstream = silent_upstream().await.to_string();
+        let config = |upstream_ms: u64, request_ms: u64| {
+            forwarding(
+                &upstream,
+                json!({
+                    "upstream_timeout_ms": upstream_ms,
+                    "request_timeout_ms": request_ms,
+                    "enable_tcp_fallback": true
+                }),
+            )
+        };
+        let (warnings, guard) = Warnings::capture();
+        for (case, packet) in [
+            ("quick parse", query()),
+            ("read from scratch", query_read_from_scratch()),
+        ] {
+            let engine = engine_from(config(300, 450));
+            let pre_parsed = handed_on(&engine, &packet);
+            assert_eq!(pre_parsed.is_some(), case == "quick parse", "{case}");
+            let started = Instant::now();
+            let (reply, ()) = tokio::join!(
+                engine.answer_after_fast_path(&packet, peer(), pre_parsed),
+                async {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    reload(&engine, config(1000, 3000));
+                }
+            );
+            let took = started.elapsed();
+            assert_eq!(
+                Message::from_bytes(&reply).unwrap().metadata.response_code,
+                ResponseCode::ServFail,
+                "{case}"
+            );
+            assert!(
+                took >= Duration::from_millis(450) && took < Duration::from_millis(1000),
+                "{case} took {took:?}"
+            );
+        }
+        drop(guard);
+        let lines = warnings.lines();
+        let of_one_configuration = lines
+            .iter()
+            .filter(|line| {
+                line.contains("DNS request timeout")
+                    && line.contains("timeout_ms=450 upstream_timeout_ms=300 ")
+            })
+            .count();
+        assert_eq!(of_one_configuration, 2, "{lines:#?}");
+    }
 }
