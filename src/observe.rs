@@ -116,16 +116,23 @@ pub trait EngineObserver: Send + Sync + 'static {
     /// whose upstream answer stands as the request-phase decision forwarded it.
     fn decision_made(&self, ctx: &RequestContext<'_>, event: &DecisionMade<'_>) {}
 
+    /// 为这个请求查了响应缓存：规则运行之前一次，请求阶段每次 `jump_to_pipeline` 以后可能在目标 pipeline 的键下再查一次。
+    /// 每次查之后恰好跟一个 [`cache_hit`] 或 [`cache_miss`]。另外只有一种 `cache_hit`：上游失败以后缓存再看一眼（不报
+    /// `cache_lookup`），找到的应答跟在这个请求的 miss 之后报，新鲜的（这期间别的请求或后台刷新写进来的）是
+    /// [`CacheHitKind::Fresh`]，过期的是 [`CacheHitKind::StaleUpstreamFailure`]。一个请求最多报一个 [`cache_hit`]，
+    /// 所以缓存答了多少请求按带 hit 的请求数，不按查的次数。后台刷新的请求不查缓存，三种都不报
     /// The response cache was consulted for the request: once before the rules
     /// run, and possibly again under the target pipeline's key after each
     /// request-phase `jump_to_pipeline`. Exactly one [`cache_hit`] or
-    /// [`cache_miss`] follows each lookup. The one other `cache_hit` is a request
-    /// whose upstream failed being answered from a stale entry
-    /// ([`CacheHitKind::StaleUpstreamFailure`]), reported after its misses. A
-    /// request reports at most one [`cache_hit`], so the share of requests
-    /// answered from the cache is counted by requests with a hit, not by
-    /// lookups. Background refresh requests bypass the cache and report none of
-    /// the three.
+    /// [`cache_miss`] follows each lookup. The one other `cache_hit` comes once
+    /// the upstream failed: the cache is looked at again, with no `cache_lookup`
+    /// reported, and an answer found there is reported after the request's
+    /// misses, [`CacheHitKind::Fresh`] for a fresh one (written meanwhile by
+    /// another request or a background refresh) and
+    /// [`CacheHitKind::StaleUpstreamFailure`] for a stale one. A request reports
+    /// at most one [`cache_hit`], so the share of requests answered from the
+    /// cache is counted by requests with a hit, not by lookups. Background
+    /// refresh requests bypass the cache and report none of the three.
     ///
     /// [`cache_hit`]: EngineObserver::cache_hit
     /// [`cache_miss`]: EngineObserver::cache_miss
@@ -163,10 +170,13 @@ pub trait EngineObserver: Send + Sync + 'static {
         false
     }
 
+    /// 响应缓存答了这个请求。每个请求最多报一次，和它的某次 [`cache_lookup`] 成对；上游失败以后再看一眼找到的那次除外，
+    /// 它跟在这个请求的 miss 之后，新鲜的报 Fresh、过期的报 StaleUpstreamFailure（见 [`cache_lookup`]）
     /// The response cache answered the request. Reported at most once per
-    /// request, and paired with one of its [`cache_lookup`]s, except a
-    /// [`CacheHitKind::StaleUpstreamFailure`] hit, which follows the request's
-    /// misses (see [`cache_lookup`]).
+    /// request, and paired with one of its [`cache_lookup`]s, except the hit
+    /// found looking again once the upstream failed, which follows the
+    /// request's misses, Fresh for a fresh answer and StaleUpstreamFailure for a
+    /// stale one (see [`cache_lookup`]).
     ///
     /// [`cache_lookup`]: EngineObserver::cache_lookup
     fn cache_hit(&self, ctx: &RequestContext<'_>, event: &CacheHit<'_>) {}

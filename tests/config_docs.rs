@@ -120,27 +120,46 @@ fn every_setting_has_a_row_in_the_settings_tables() {
     }
 }
 
+/// 文档里的 JSON 示例都加载得了：完整的配置照写的读，只是一个动作的（ECS 那段）放进一条规则里读，一样不能有内核不读的键
+/// 和配置问题。以前动作示例不经检查，拼错的键也看不出来
+/// The JSON examples in the documentation all load: a whole configuration read as written, and
+/// one that is a single action (the ECS snippet) read within a rule, with no key the kernel does
+/// not read nor any problem either way. The action example used to go unchecked, a misspelt key
+/// in it going unseen
 #[test]
 fn documented_config_examples_load() {
     for (path, _) in DOCS {
         let doc = read(path);
-        // 只有完整配置才单独解析；ECS 那段只是一个动作 / Only whole configurations parse on their own; the ECS snippet is a single action
-        let examples: Vec<&str> = doc
+        let (configs, actions): (Vec<&str>, Vec<&str>) = doc
             .split("~~~json\n")
             .skip(1)
             .filter_map(|block| block.split("~~~").next())
-            .filter(|block| block.contains("\"pipelines\""))
-            .collect();
+            .partition(|block| block.contains("\"pipelines\""));
         assert!(
-            !examples.is_empty(),
+            !configs.is_empty(),
             "{path}: no configuration examples found"
         );
-        for example in examples {
-            // 面板保存时会拒绝的，示例里也不能有：配置问题、编译不了的匹配器、说不通的设置和监听地址（见 config::compile）
-            // Nothing the panel would refuse to save may appear in an example either: problems,
-            // matchers that do not compile, settings and listeners that make no sense (see
-            // config::compile)
-            if let Err(err) = parse_config(example).and_then(compile) {
+        assert!(!actions.is_empty(), "{path}: no action examples found");
+        let actions = actions.into_iter().map(|example| {
+            let action: Value = serde_json::from_str(example).unwrap_or_else(|err| {
+                panic!("{path}: action example is no JSON: {err}\n{example}")
+            });
+            let config = json!({ "pipelines": [{ "id": "main", "rules": [{
+                "name": "example", "matchers": [{ "type": "any" }], "actions": [action]
+            }] }] });
+            (example, config.to_string())
+        });
+        for (example, config) in configs
+            .into_iter()
+            .map(|example| (example, example.to_owned()))
+            .chain(actions)
+        {
+            // 面板保存时会拒绝的，示例里也不能有：内核不读的键和别的配置问题、编译不了的匹配器、说不通的设置和监听地址（见
+            // config::compile）
+            // Nothing the panel would refuse to save may appear in an example either: keys the
+            // kernel does not read and the other problems, matchers that do not compile, settings
+            // and listeners that make no sense (see config::compile)
+            if let Err(err) = parse_config(&config).and_then(compile) {
                 panic!("{path}: example does not load: {err:#}\n{example}");
             }
         }
