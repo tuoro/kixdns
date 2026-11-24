@@ -702,6 +702,23 @@ pub(crate) fn write_certificate(dir: &std::path::Path) -> (String, String) {
     (cert, key)
 }
 
+/// 让回调点每次都问当前线程的订阅者要不要记，在线程上装订阅者抓日志之前调用。只登记着一个订阅者时，tracing 按碰到回调点
+/// 的那个线程自己的订阅者缓存回调点要不要记：别的测试线程（没装订阅者）先碰到某个日志，抓日志的线程就再也收不到它。全局放
+/// 一个什么都不收的订阅者，抓日志时登记的就总有两个，回调点改成每次都问当前线程的订阅者
+/// Makes callsites ask the current thread's subscriber every time whether they are wanted; call
+/// it before installing a subscriber on a thread to capture logs. With a single subscriber
+/// registered, tracing caches whether a callsite is wanted by asking the subscriber of
+/// whichever thread hits it first: another test thread (with none installed) hitting a log
+/// first would hide it from the capturing thread for good. A global subscriber that takes
+/// nothing keeps two registered while a test captures, so callsites ask the current thread's
+/// subscriber every time
+pub(crate) fn callsites_ask_every_time() {
+    static GLOBAL: std::sync::Once = std::sync::Once::new();
+    GLOBAL.call_once(|| {
+        let _ = tracing::subscriber::set_global_default(tracing::subscriber::NoSubscriber::new());
+    });
+}
+
 /// 测试期间记下的 warn 及以上的日志 / The warn-and-above log lines written during a test
 #[derive(Clone, Default)]
 pub(crate) struct Warnings(Arc<Mutex<Vec<u8>>>);
@@ -713,19 +730,7 @@ impl Warnings {
     /// dropped; on the single-threaded runtime `#[tokio::test]` uses by default, the
     /// tasks the engine spawns run on this thread too
     pub(crate) fn capture() -> (Self, tracing::subscriber::DefaultGuard) {
-        // 只登记着一个订阅者时，tracing 按碰到回调点的那个线程自己的订阅者缓存回调点要不要记：别的测试
-        // 线程（没装订阅者）先碰到引擎里的某个 warn，这里就再也收不到它。全局放一个什么都不收的订阅者，
-        // 抓日志时登记的就总有两个，回调点改成每次都问当前线程的订阅者
-        // With a single subscriber registered, tracing caches whether a callsite is wanted by
-        // asking the subscriber of whichever thread hits it first: another test thread (with
-        // none installed) hitting one of the engine's warns first would hide it from here for
-        // good. A global subscriber that takes nothing keeps two registered while a test
-        // captures, so callsites ask the current thread's subscriber every time
-        static GLOBAL: std::sync::Once = std::sync::Once::new();
-        GLOBAL.call_once(|| {
-            let _ =
-                tracing::subscriber::set_global_default(tracing::subscriber::NoSubscriber::new());
-        });
+        callsites_ask_every_time();
         let warnings = Self::default();
         let writer = warnings.clone();
         let subscriber = tracing_subscriber::fmt()
