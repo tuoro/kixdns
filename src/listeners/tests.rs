@@ -3873,12 +3873,14 @@ async fn a_cache_hit_carries_the_query_id_and_ages_its_ttls() {
 }
 
 /// 引擎在请求时限内答不上来时，监听器到点回 SERVFAIL：不早于时限，也不等引擎自己放弃。快速解析
-/// 读得了的查询和要从头解析的一样，UDP 和 TCP 一样
+/// 读得了的查询和要从头解析的一样，UDP 和 TCP 一样。每次超时记的告警说是哪个监听器、哪个查询、哪个客户端
 /// When the engine cannot answer within the request timeout, the listener answers
 /// SERVFAIL when it runs out: not before, and without waiting for the engine to give up.
-/// A query the quick parse reads and one parsed from scratch alike, over UDP as over TCP
+/// A query the quick parse reads and one parsed from scratch alike, over UDP as over TCP.
+/// The warning each timeout logs names the listener, the query and the client
 #[tokio::test]
 async fn listeners_answer_servfail_when_the_request_timeout_runs_out() {
+    let (warnings, guard) = crate::engine::test_support::Warnings::capture();
     // 上游从不回答：引擎先用 UDP 试三分之一个时限、再试一个时限，再改用 TCP 等一个时限，加起来比
     // 请求时限长得多，所以先到点的是监听器自己的计时
     // The upstream never answers: the engine tries UDP for a third of the timeout and
@@ -3915,6 +3917,22 @@ async fn listeners_answer_servfail_when_the_request_timeout_runs_out() {
             assert!(
                 took >= TIMEOUT && took < TIMEOUT * 2,
                 "{case} over {transport} took {took:?}"
+            );
+        }
+    }
+    drop(guard);
+    let lines = warnings.lines();
+    for listener in ["UDP", "TCP"] {
+        for qname in ["quick.test", r"\032slow.test"] {
+            let named = |line: &&String| {
+                line.contains(&format!("{listener} request timeout"))
+                    && line.contains(&format!("qname={qname} "))
+                    && line.contains("client_ip=127.0.0.1")
+            };
+            assert_eq!(
+                lines.iter().filter(named).count(),
+                1,
+                "{listener} {qname}: {lines:#?}"
             );
         }
     }
