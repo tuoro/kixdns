@@ -575,10 +575,67 @@ impl Action {
             _ => None,
         }
     }
+
+    /// 请求阶段执行到它，这条规则的动作就到此为止（见 `engine::pipeline`）：除了 log 和 replace_txt_response（手上没有
+    /// 应答可换，什么也不做）都是
+    /// Whether this action, run in the request phase, is the last of its rule's to run (see
+    /// `engine::pipeline`): every action but log and replace_txt_response (with no answer in
+    /// hand to replace, it does nothing)
+    fn ends_request(&self) -> bool {
+        !matches!(self, Action::Log { .. } | Action::ReplaceTxtResponse { .. })
+    }
+
+    /// 回答阶段执行到它，这串动作就到此为止（见 `engine::rules`）：除了 log 和 forward（问到的应答换掉手上的，接着执行
+    /// 后面的动作）都是
+    /// Whether this action, run in the answer phase, is the last of its list to run (see
+    /// `engine::rules`): every action but log and forward (the reply it gets replaces the
+    /// answer in hand, and the actions after it run on)
+    fn ends_response(&self) -> bool {
+        !matches!(self, Action::Log { .. } | Action::Forward { .. })
+    }
+}
+
+/// `actions` 里执行得到的：按写的顺序到第一个 `ends` 的为止（含它）
+/// The part of `actions` that runs: in the order written, up to and including the first that
+/// `ends`
+fn run_until(actions: &[Action], ends: fn(&Action) -> bool) -> &[Action] {
+    let end = actions
+        .iter()
+        .position(ends)
+        .map_or(actions.len(), |i| i + 1);
+    &actions[..end]
 }
 
 /// Rule helper functions / Rule 辅助函数
 impl Rule {
+    /// 请求阶段作决定的那个动作：第一个不是 log、replace_txt_response 的（见 [`Action::ends_request`]），一个都没有时为 None
+    /// The action deciding the request phase: the first that is neither log nor
+    /// replace_txt_response (see [`Action::ends_request`]), None when there is none
+    fn request_decision(&self) -> Option<&Action> {
+        self.actions.iter().find(|action| action.ends_request())
+    }
+
+    /// 规则命中以后执行得到的动作，按执行的顺序：请求阶段的到作决定的那个为止（见 [`Rule::request_decision`]）；它是
+    /// forward 时才有回答阶段，response_actions_on_match、response_actions_on_miss 各到第一个作决定的为止（见
+    /// [`Action::ends_response`]）。后面的动作执行不到，跳转也就跳不过去
+    /// The actions that run once the rule matches, in the order they run: the request phase's
+    /// up to the one deciding it (see [`Rule::request_decision`]); only when that is a forward
+    /// is there an answer phase, response_actions_on_match and response_actions_on_miss each up
+    /// to the first that decides (see [`Action::ends_response`]). The actions after never run,
+    /// nor do their jumps go anywhere
+    pub(crate) fn actions_run(&self) -> impl Iterator<Item = &Action> {
+        let request = run_until(&self.actions, Action::ends_request);
+        let forwards = matches!(request.last(), Some(Action::Forward { .. }));
+        let response = [
+            &self.response_actions_on_match,
+            &self.response_actions_on_miss,
+        ]
+        .into_iter()
+        .filter(move |_| forwards)
+        .flat_map(|actions| run_until(actions, Action::ends_response));
+        request.iter().chain(response)
+    }
+
     /// 合并转发时问的那几个 forward（写了地址的，见 `compute_merged_forward`）共用的 ecs：写得一样
     /// 时就是它，写得不一样时为 Err。合并后只有一次转发，只能发一个 ECS
     /// The ecs shared by the forwards a merged forward asks (those naming an address, see
@@ -620,19 +677,15 @@ impl Rule {
         if forward_count <= 1 {
             return;
         }
-        // 动作按写的顺序执行，合并只在轮到 forward 时才算：forward 前面已经写了别的作决定的动作（日志不作决定）
-        // 时，规则给的是那个动作的结果，后面的 forward 轮不到。不这样的话，这条规则走完整路径时去转发，走
-        // 快速路径时照第一个动作回静态应答
+        // 动作按写的顺序执行，合并只在轮到 forward 时才算：forward 前面已经写了别的作决定的动作（见
+        // [`Rule::request_decision`]）时，规则给的是那个动作的结果，后面的 forward 轮不到。不这样的话，这条规则走完整
+        // 路径时去转发，走快速路径时照第一个动作回静态应答
         // Actions run in the order written, and the merge counts only when a forward's turn
-        // comes: with another deciding action written before the forwards (a log decides
-        // nothing), what the rule gives is that action's outcome and the forwards never have
-        // their turn. Otherwise the rule forwards on the full path while the fast path answers
-        // its static first action
-        let first_to_decide = self
-            .actions
-            .iter()
-            .find(|action| !matches!(action, Action::Log { .. }));
-        if !matches!(first_to_decide, Some(Action::Forward { .. })) {
+        // comes: with another deciding action written before the forwards (see
+        // [`Rule::request_decision`]), what the rule gives is that action's outcome and the
+        // forwards never have their turn. Otherwise the rule forwards on the full path while the
+        // fast path answers its static first action
+        if !matches!(self.request_decision(), Some(Action::Forward { .. })) {
             return;
         }
 
@@ -1537,14 +1590,17 @@ pub fn warnings(cfg: &PipelineConfig) -> Vec<String> {
 }
 
 /// 绕成圈的 jump_to_pipeline，每个圈在合上它的那条规则报一条 [`warnings`]：从这条规则跳过去，一路跳下去能回到它所在的
-/// pipeline。规则的跳转和回答动作的跳转都算。规则有匹配条件，不一定每个查询都绕得上，所以只告警、不拒绝；绕上的查询跳满
-/// `response_jump_limit` 才回 SERVFAIL，回答阶段每跳一次还要再问一次上游（见 [`MAX_JUMP_LIMIT`]）
+/// pipeline。规则的跳转和回答动作的跳转都算，执行不到的不算（见 [`Rule::actions_run`]）。规则有匹配条件，不一定每个查询
+/// 都绕得上，所以只告警、不拒绝；绕上的查询把能跳的次数跳满才回 SERVFAIL（请求阶段 `response_jump_limit` 次，回答动作头一次
+/// 跳转起另算这么多次），回答阶段每跳一次还要再问一次上游（见 [`MAX_JUMP_LIMIT`]）
 /// The jump_to_pipeline actions that go round in a circle, each circle one of the [`warnings`]
 /// at the rule that closes it: jumping on from that rule comes back round to its own pipeline.
-/// Rule jumps and answer-action jumps alike count. Rules have matchers, so not every query need
-/// go round, which is why this warns and refuses nothing; a query that does jumps the whole
-/// `response_jump_limit` before it is answered SERVFAIL, and in the answer phase asks an upstream
-/// again on every jump (see [`MAX_JUMP_LIMIT`])
+/// Rule jumps and answer-action jumps alike count, those that never run do not (see
+/// [`Rule::actions_run`]). Rules have matchers, so not every query need go round, which is why
+/// this warns and refuses nothing; a query that does makes every jump it may before it is
+/// answered SERVFAIL (`response_jump_limit` in the request phase, and as many again from an
+/// answer action's first jump on), and in the answer phase asks an upstream again on every jump
+/// (see [`MAX_JUMP_LIMIT`])
 fn jump_cycles(cfg: &PipelineConfig) -> Vec<String> {
     // 一个 id 写了几次时跳转找到最后那个，和运行时一样（见 `RuntimePipelineConfig::pipeline`）；跳到不存在的
     // pipeline 是一条 [`problems`]，不算在这里 / With an id written several times a jump finds the
@@ -1564,12 +1620,7 @@ fn jump_cycles(cfg: &PipelineConfig) -> Vec<String> {
         .map(|pipeline| {
             let mut jumps = Vec::new();
             for (j, rule) in pipeline.rules.iter().enumerate() {
-                for action in rule
-                    .actions
-                    .iter()
-                    .chain(&rule.response_actions_on_match)
-                    .chain(&rule.response_actions_on_miss)
-                {
+                for action in rule.actions_run() {
                     if let Action::JumpToPipeline { pipeline } = action
                         && let Some(&target) = by_id.get(&**pipeline)
                     {
@@ -1614,7 +1665,7 @@ fn jump_cycles(cfg: &PipelineConfig) -> Vec<String> {
                     path.push((target, 0));
                 }
                 Visit::OnPath => found.push(format!(
-                    "pipelines[{at}].rules[{rule}]: jumping to \"{}\" comes back round to \"{}\", so a query that keeps going round is answered SERVFAIL once it has jumped response_jump_limit times, and in the answer phase asks an upstream again on every jump",
+                    "pipelines[{at}].rules[{rule}]: jumping to \"{}\" comes back round to \"{}\", so a query that keeps going round is answered SERVFAIL once it has made every jump it may (response_jump_limit in the request phase, and as many again from an answer action's first jump on), and in the answer phase asks an upstream again on every jump",
                     cfg.pipelines[target].id, cfg.pipelines[at].id
                 )),
                 Visit::Done => {}
@@ -2536,6 +2587,24 @@ mod merged_forward_tests {
         ));
     }
 
+    /// 写在 forward 前面的 replace_txt_response 不挡着合并：请求阶段手上没有应答可换，它什么也不做，轮到的照样是 forward
+    /// （见 `Rule::request_decision`）。以前只有 log 不算，这样的规则只问第一个 forward 的上游
+    /// A replace_txt_response written before the forwards keeps them merged: in the request
+    /// phase there is no answer in hand to replace, so it does nothing and the forward still has
+    /// its turn (see `Rule::request_decision`). Only a log used to count as nothing, and such a
+    /// rule asked the first forward's upstream alone
+    #[test]
+    fn a_replace_txt_response_before_the_forwards_leaves_them_merged() {
+        assert_eq!(
+            merged(json!([
+                { "type": "replace_txt_response", "text": "t" },
+                { "type": "forward", "upstream": "1.1.1.1:53" },
+                { "type": "forward", "upstream": "8.8.8.8:53" }
+            ])),
+            ["udp://1.1.1.1:53", "udp://8.8.8.8:53"]
+        );
+    }
+
     /// 合并后的这一次转发只能发一个 ECS：几个 forward 的 ecs 写得一样时就是它；写得不一样（包括有的写、
     /// 有的不写）时为 None，和不写 ecs 一样。没写 upstream 的 forward 不在合并里，它的 ecs 不算
     /// The one merged forward can send one ECS only: the forwards' ecs when they all write
@@ -2927,7 +2996,7 @@ mod validation_tests {
         };
         let back = |place: &str, to: &str, from: &str| {
             format!(
-                "{place}: jumping to \"{to}\" comes back round to \"{from}\", so a query that keeps going round is answered SERVFAIL once it has jumped response_jump_limit times, and in the answer phase asks an upstream again on every jump"
+                "{place}: jumping to \"{to}\" comes back round to \"{from}\", so a query that keeps going round is answered SERVFAIL once it has made every jump it may (response_jump_limit in the request phase, and as many again from an answer action's first jump on), and in the answer phase asks an upstream again on every jump"
             )
         };
 
@@ -3030,6 +3099,102 @@ mod validation_tests {
                 .iter()
                 .any(|warning| warning.contains("comes back round")),
             "a jump to a pipeline that does not exist is a problem, not a circle"
+        );
+    }
+
+    /// 执行不到的跳转不算进圈：请求动作里作决定的那个之后的（log、replace_txt_response 不作决定），请求阶段不是 forward
+    /// 的规则的回答动作，回答动作里作决定的那个之后的（log、forward 不作决定）。执行得到的照算。以前每个动作都算，
+    /// a [forward, jump b] 和 b [jump a] 报成一个圈，回静态应答的规则 on_match 跳回自己也报
+    /// Jumps that never run make no circle: those after the action deciding the request phase
+    /// (log and replace_txt_response decide nothing), a rule's answer actions when its request
+    /// phase is no forward, and those after the answer action that decides (log and forward
+    /// decide nothing). Those that run count as before. Every action used to count, a
+    /// [forward, jump b] with b [jump a] being warned about as a circle, and a rule answering
+    /// statically whose on_match jumps back to its own pipeline too
+    #[test]
+    fn jumps_that_never_run_make_no_circle() {
+        let action = |kind: &str| serde_json::json!({ "type": kind });
+        let jump = |to: &str| serde_json::json!({ "type": "jump_to_pipeline", "pipeline": to });
+        let txt = serde_json::json!({ "type": "replace_txt_response", "text": "t" });
+        let static_ip = serde_json::json!({ "type": "static_ip_response", "ip": "192.0.2.1" });
+        let circles = |a: serde_json::Value, b: Vec<serde_json::Value>| {
+            let config = serde_json::json!({
+                "settings": { "default_upstream": "1.1.1.1:53" },
+                "pipelines": [
+                    { "id": "a", "rules": [a] },
+                    { "id": "b", "rules": [rule("back", serde_json::json!([{ "type": "any" }]), serde_json::Value::Array(b))] }
+                ]
+            });
+            super::warnings(&super::parse_config(&config.to_string()).expect("parses"))
+                .into_iter()
+                .filter(|warning| warning.contains("comes back round"))
+                .count()
+        };
+        let any = serde_json::json!([{ "type": "any" }]);
+        let request = |actions: Vec<serde_json::Value>| {
+            rule("r", any.clone(), serde_json::Value::Array(actions))
+        };
+        let answer = |actions: Vec<serde_json::Value>, on_match: Vec<serde_json::Value>| {
+            serde_json::json!({
+                "name": "r",
+                "matchers": any,
+                "actions": actions,
+                "response_actions_on_miss": on_match
+            })
+        };
+        // 请求阶段 / The request phase
+        assert_eq!(
+            circles(request(vec![action("forward"), jump("b")]), vec![jump("a")]),
+            0
+        );
+        assert_eq!(
+            circles(
+                request(vec![action("continue"), jump("b")]),
+                vec![jump("a")]
+            ),
+            0
+        );
+        assert_eq!(
+            circles(request(vec![static_ip.clone(), jump("b")]), vec![jump("a")]),
+            0
+        );
+        assert_eq!(
+            circles(
+                request(vec![action("log"), txt.clone(), jump("b")]),
+                vec![jump("a")]
+            ),
+            1
+        );
+        // 回答阶段：只有请求阶段是 forward 时才有 / The answer phase: there only when the request
+        // phase is a forward
+        assert_eq!(
+            circles(answer(vec![static_ip.clone()], vec![jump("a")]), vec![]),
+            0
+        );
+        assert_eq!(circles(answer(vec![jump("b")], vec![jump("b")]), vec![]), 0);
+        assert_eq!(
+            circles(
+                answer(vec![action("log"), action("forward")], vec![jump("a")]),
+                vec![]
+            ),
+            1
+        );
+        assert_eq!(
+            circles(
+                answer(vec![action("forward")], vec![txt.clone(), jump("b")]),
+                vec![jump("a")]
+            ),
+            0
+        );
+        assert_eq!(
+            circles(
+                answer(
+                    vec![action("forward")],
+                    vec![action("log"), action("forward"), jump("b")]
+                ),
+                vec![jump("a")]
+            ),
+            1
         );
     }
 

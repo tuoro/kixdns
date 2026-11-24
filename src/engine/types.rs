@@ -380,12 +380,12 @@ pub struct EngineInner {
 }
 
 impl EngineInner {
-    /// 从运行时配置建，算出各 pipeline 的缓存命名空间；还没有 Geo 数据，存进去之前由 `GeoSources` 带上 / Built from a
-    /// runtime configuration, with the cache namespaces of its pipelines; it has no Geo data yet,
-    /// which `GeoSources` gives it before it is stored
-    pub(crate) fn new(cfg: RuntimePipelineConfig) -> Self {
+    /// 从运行时配置和它用到的 Geo 数据 `geo`（由 `GeoSources` 读好）建，算出各 pipeline 的缓存命名空间（见
+    /// [`Self::at_geo`]）
+    /// Built from a runtime configuration and the Geo data `geo` it uses (read by `GeoSources`),
+    /// with the cache namespaces of its pipelines (see [`Self::at_geo`])
+    pub(crate) fn new(cfg: RuntimePipelineConfig, geo: GeoManagers) -> Self {
         let config_namespaces = build_cache_namespaces(&cfg);
-        let geo = GeoManagers::default();
         let no_pipeline_namespace = {
             let mut hasher = DefaultHasher::new();
             hash_global_settings_semantics(&cfg.settings, &mut hasher);
@@ -398,14 +398,6 @@ impl EngineInner {
             no_pipeline_namespace,
             pipeline: cfg,
         }
-    }
-
-    /// 就地换成 Geo 数据 `geo`，命名空间跟着换（见 [`Self::at_geo`]），给还没存进去的新状态用
-    /// Takes the Geo data `geo` in place, the namespaces with it (see [`Self::at_geo`]), for a
-    /// new state not stored yet
-    pub(crate) fn set_geo(&mut self, geo: GeoManagers) {
-        self.cache_namespaces = with_geo(&self.pipeline, &self.config_namespaces, &geo);
-        self.geo = geo;
     }
 
     /// 同样的配置，换成 Geo 数据 `geo` 和按它算的命名空间：用到某个标签的 pipeline，那个标签的数据换了样子就换一个

@@ -280,18 +280,13 @@ pub(crate) struct GeoSources {
 }
 
 impl GeoSources {
-    /// 读进 `inner` 的配置用到的 Geo 数据，引擎状态从带着这份数据的 `inner` 开始，再监视数据文件
-    /// Reads in the Geo data `inner`'s configuration uses, the engine state starting as `inner`
+    /// 读进配置 `cfg` 用到的 Geo 数据，引擎状态从带着这份数据的 `cfg` 开始，再监视数据文件
+    /// Reads in the Geo data the configuration `cfg` uses, the engine state starting as `cfg`
     /// with that data, then watches the data files
-    pub(crate) fn load(mut inner: EngineInner) -> Self {
-        let (geosite, site) =
-            load_geosite(GeoSiteSpec::of(&inner.pipeline), &GeoSiteManager::default());
-        let (geoip, ip) = load_geoip(
-            GeoIpSpec::of(&inner.pipeline),
-            None,
-            &GeoIpManager::default(),
-        );
-        inner.set_geo(GeoManagers { geoip, geosite });
+    pub(crate) fn load(cfg: RuntimePipelineConfig) -> Self {
+        let (geosite, site) = load_geosite(GeoSiteSpec::of(&cfg), &GeoSiteManager::default());
+        let (geoip, ip) = load_geoip(GeoIpSpec::of(&cfg), None, &GeoIpManager::default());
+        let inner = EngineInner::new(cfg, GeoManagers { geoip, geosite });
         let state = Arc::new(ArcSwap::from_pointee(inner));
         let status = Arc::default();
         Self {
@@ -313,14 +308,14 @@ impl GeoSources {
         Arc::clone(&self.status)
     }
 
-    /// 热重载到 `inner`：它要的 Geo 数据和现在的不同时读进新数据，改为监视新的文件。新配置连同它的 Geo 数据和按这份数据
-    /// 算的命名空间一次换进状态，新规则从第一个请求起就用新的标签和文件
-    /// Hot reload to `inner`: when the Geo data it needs differs from the data loaded, new data
-    /// is read in and the watches move to the new files. The new configuration goes into the
-    /// state at once with its Geo data and the namespaces worked out from that data, so the new
-    /// rules find the new tags and files from their first query
-    pub(crate) fn follow(&mut self, mut inner: EngineInner) {
-        let spec = GeoSiteSpec::of(&inner.pipeline);
+    /// 热重载到配置 `cfg`：它要的 Geo 数据和现在的不同时读进新数据，改为监视新的文件。新配置连同它的 Geo 数据和按这份
+    /// 数据算的命名空间一次换进状态，新规则从第一个请求起就用新的标签和文件
+    /// Hot reload to the configuration `cfg`: when the Geo data it needs differs from the data
+    /// loaded, new data is read in and the watches move to the new files. The new configuration
+    /// goes into the state at once with its Geo data and the namespaces worked out from that
+    /// data, so the new rules find the new tags and files from their first query
+    pub(crate) fn follow(&mut self, cfg: RuntimePipelineConfig) {
+        let spec = GeoSiteSpec::of(&cfg);
         let (geosite, site) = (!self.geosite.is_current(&spec))
             .then(|| {
                 info!(paths = ?spec.paths, tags = spec.tags.len(), "GeoSite data follows the new configuration");
@@ -331,7 +326,7 @@ impl GeoSources {
                 load_geosite(spec, &self.state.load().geo.geosite)
             })
             .unzip();
-        let spec = GeoIpSpec::of(&inner.pipeline);
+        let spec = GeoIpSpec::of(&cfg);
         let (geoip, ip) = (!self.geoip.is_current(&spec))
             .then(|| {
                 info!(tags = ?spec.tags, db_path = ?spec.db_path, dat_path = ?spec.dat_path, "GeoIP data follows the new configuration");
@@ -347,8 +342,7 @@ impl GeoSources {
             geoip: Arc::clone(geoip.as_ref().unwrap_or(&current.geo.geoip)),
             geosite: Arc::clone(geosite.as_ref().unwrap_or(&current.geo.geosite)),
         };
-        inner.set_geo(geo(&self.state.load()));
-        let inner = Arc::new(inner);
+        let inner = Arc::new(EngineInner::new(cfg, geo(&self.state.load())));
         self.state.rcu(|current| inner.at_geo(geo(current)));
         if let Some(site) = site {
             self.geosite = site.watch(&GEOSITE, &self.state, &self.status);
