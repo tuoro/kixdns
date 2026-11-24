@@ -13,16 +13,23 @@ use hickory_proto::rr::{Name, RecordType};
 use serde_json::{Value, json};
 
 use crate::engine::Engine;
-use crate::engine::response::{name_wire_len, txt_size_problem};
+use crate::engine::response::txt_size_problem;
 use crate::engine::test_support::{answering_upstream, counting_settings, engine_from, peer};
 
 /// 问的名字，编码以后 8 字节 / The name asked, 8 bytes once encoded
 const QNAME: &str = "t.test.";
-/// 问 [`QNAME`] 时一条静态 TXT 的 RDATA 最多能有多长：65535 减去报文头 12、问题段 8 + 4、记录名字的指针 2
-/// 和固定部分 10、OPT 11、ECS 选项 24 / The longest RDATA a static TXT can have when [`QNAME`] is
-/// asked: 65535 less the header (12), the question (8 + 4), the record's name pointer (2)
-/// and fixed part (10), an OPT (11) and an ECS option (24)
-const ROOM: usize = 65535 - 12 - 8 - 4 - 2 - 10 - 11 - 24;
+/// 一条静态 TXT 的 RDATA 最多能有多长：按最长的名字（255 字节）算，65535 减去报文头 12、问题段 255 + 4、记录名字的
+/// 指针 2 和固定部分 10、OPT 11、ECS 选项 24 / The longest RDATA a static TXT can have, reckoned
+/// with the longest name (255 bytes): 65535 less the header (12), the question (255 + 4), the
+/// record's name pointer (2) and fixed part (10), an OPT (11) and an ECS option (24)
+const ROOM: usize = 65535 - 12 - 255 - 4 - 2 - 10 - 11 - 24;
+
+/// 最长的名字：编码以后 255 字节（三个 63 字节的标签、一个 61 字节的，各带长度字节，加上根）/ The longest
+/// name: 255 bytes once encoded (three labels of 63 bytes and one of 61, each with its length
+/// byte, and the root)
+fn longest_name() -> String {
+    format!("{0}.{0}.{0}.{1}.", "a".repeat(63), "a".repeat(61))
+}
 
 /// RDATA 正好 `rdata` 字节的 TXT 内容：一段 255 字节（加长度字节 256），最后一段补齐
 /// TXT content whose RDATA is exactly `rdata` bytes: segments of 255 (256 with the length
@@ -38,20 +45,20 @@ fn text_of_rdata(rdata: usize) -> Vec<String> {
     text
 }
 
-/// 三种问法：不带 EDNS，带 EDNS，带 EDNS 和一个回显最长的 ECS（IPv6 /128）
-/// Three ways of asking: without EDNS, with EDNS, and with EDNS and the ECS whose echo is
-/// longest (IPv6 /128)
-fn queries() -> [(&'static str, Vec<u8>); 3] {
-    let base = || {
+/// 四种问法：不带 EDNS，带 EDNS，带 EDNS 和一个回显最长的 ECS（IPv6 /128），最长的名字带着这样的 ECS
+/// Four ways of asking: without EDNS, with EDNS, with EDNS and the ECS whose echo is longest
+/// (IPv6 /128), and the longest name with such an ECS
+fn queries() -> [(&'static str, Vec<u8>); 4] {
+    let base = |name: &str| {
         let mut query = Message::new(0x3333, MessageType::Query, OpCode::Query);
         query.add_query(Query::query(
-            Name::from_ascii(QNAME).unwrap(),
+            Name::from_ascii(name).unwrap(),
             RecordType::TXT,
         ));
         query
     };
-    let with_edns = |subnet: bool| {
-        let mut query = base();
+    let with_edns = |name: &str, subnet: bool| {
+        let mut query = base(name);
         let mut edns = Edns::new();
         edns.set_max_payload(1232);
         if subnet {
@@ -66,9 +73,10 @@ fn queries() -> [(&'static str, Vec<u8>); 3] {
         query.to_vec().unwrap()
     };
     [
-        ("plain", base().to_vec().unwrap()),
-        ("edns", with_edns(false)),
-        ("ecs", with_edns(true)),
+        ("plain", base(QNAME).to_vec().unwrap()),
+        ("edns", with_edns(QNAME, false)),
+        ("ecs", with_edns(QNAME, true)),
+        ("longest name", with_edns(&longest_name(), true)),
     ]
 }
 
@@ -102,43 +110,37 @@ fn summary(reply: &[u8]) -> (ResponseCode, bool, u16) {
 }
 
 #[test]
-fn name_wire_len_counts_a_length_byte_per_label_and_the_root() {
-    for (name, len) in [(".", 1), ("t.test.", 8), ("www.example.com.", 17)] {
-        assert_eq!(
-            name_wire_len(&Name::from_ascii(name).unwrap()),
-            len,
-            "{name}"
-        );
-    }
+fn the_longest_name_is_255_bytes_once_encoded() {
+    use hickory_proto::serialize::binary::BinEncodable as _;
+    let name = Name::from_ascii(longest_name()).unwrap();
+    assert_eq!(name.to_bytes().unwrap().len(), 255);
 }
 
-/// 上限算上每段的长度字节，按问的名字和留给 OPT、ECS 的地方算到字节：正好 [`ROOM`] 装得下，多一个字节不行。
+/// 上限算上每段的长度字节，按最长的名字和留给 OPT、ECS 的地方算到字节：正好 [`ROOM`] 装得下，多一个字节不行。
 /// 以前只数内容：256 段 255 字节（RDATA 65536）也算放得下
-/// The limit counts each segment's length byte and is exact to the byte for the name asked
+/// The limit counts each segment's length byte and is exact to the byte for the longest name
 /// and the room kept for an OPT and ECS: exactly [`ROOM`] fits, one byte more does not. Only
 /// the content used to count: 256 segments of 255 bytes (RDATA 65536) passed
 #[test]
 fn txt_size_problem_counts_length_bytes_against_the_whole_message() {
-    let name_len = name_wire_len(&Name::from_ascii(QNAME).unwrap());
-    assert_eq!(txt_size_problem(&text_of_rdata(ROOM), name_len), None);
-    assert!(txt_size_problem(&text_of_rdata(ROOM + 1), name_len).is_some());
-    assert!(txt_size_problem(&vec!["a".repeat(255); 256], name_len).is_some());
-    // 配置检查按最短的根名字算 / The configuration check takes the shortest name, the root
-    let root_room = ROOM + 7;
-    assert_eq!(txt_size_problem(&text_of_rdata(root_room), 1), None);
-    assert!(txt_size_problem(&text_of_rdata(root_room + 1), 1).is_some());
-    let long_segment = txt_size_problem(&["a".repeat(256)], 1).unwrap();
+    assert_eq!(txt_size_problem(&text_of_rdata(ROOM)), None);
+    assert!(txt_size_problem(&text_of_rdata(ROOM + 1)).is_some());
+    assert!(txt_size_problem(&vec!["a".repeat(255); 256]).is_some());
+    let long_segment = txt_size_problem(&["a".repeat(256)]).unwrap();
     assert!(
         long_segment.contains("segment of 256 bytes"),
         "{long_segment}"
     );
 }
 
-/// 配置检查报出不管问什么名字都装不下的 TXT，静态的和替换的一样；按根名字正好装得下的不报
-/// The configuration check names a TXT that fits no question at all, static or replaced
-/// alike; one that just fits for the root name is no problem
+/// 配置检查报出不是问什么名字都装得下的 TXT，静态的和替换的一样：按最长的名字（255 字节）算，正好装得下的不报，多一个
+/// 字节的报。以前按最短的根名字算，问长名字时装不下的照样通过，每个这样的查询记一条不限频的 warn
+/// The configuration check names a TXT that does not fit every question, static or replaced
+/// alike: reckoned with the longest name (255 bytes), one that just fits is no problem and one
+/// byte more is. The shortest name, the root, used to be taken, so one not fitting a long name
+/// asked passed, and every such query logged a warn with no limit
 #[test]
-fn the_configuration_check_names_a_txt_no_answer_can_hold() {
+fn the_configuration_check_names_a_txt_some_answer_cannot_hold() {
     let problems = |text: Vec<String>| {
         crate::config::problems(
             &serde_json::from_value(json!({
@@ -160,8 +162,8 @@ fn the_configuration_check_names_a_txt_no_answer_can_hold() {
             .unwrap(),
         )
     };
-    assert_eq!(problems(text_of_rdata(ROOM + 7)), Vec::<String>::new());
-    for text in [text_of_rdata(ROOM + 8), vec!["a".repeat(255); 256]] {
+    assert_eq!(problems(text_of_rdata(ROOM)), Vec::<String>::new());
+    for text in [text_of_rdata(ROOM + 1), vec!["a".repeat(255); 256]] {
         let found = problems(text);
         assert_eq!(found.len(), 2, "{found:#?}");
         assert!(
@@ -173,13 +175,16 @@ fn the_configuration_check_names_a_txt_no_answer_can_hold() {
     }
 }
 
-/// 请求阶段的静态 TXT：正好装得下的不管怎么问都作答，报文不超过 65535 字节；多一个字节的回 SERVFAIL、不带 TC。
-/// 第二次问由规则缓存作答，结果一样。以前装不下时回 NOERROR、TC 置位、没有答案，带 EDNS 来问时还会交出超过
-/// 65535 字节的报文
-/// A request-phase static TXT: one that just fits is answered however it is asked, the
-/// message at most 65535 bytes; one byte more is SERVFAIL without TC. Asked again, the rule
-/// cache answers, alike. What did not fit used to be NOERROR with TC set and no answers,
-/// and asked with EDNS a message over 65535 bytes could come out
+/// 请求阶段的静态 TXT：按最长的名字正好装得下的，不管问什么名字、怎么问都作答，报文不超过 65535 字节；多一个字节的
+/// 问短名字也回 SERVFAIL、不带 TC（编应答时就编成了 SERVFAIL，见 `StaticAnswer::txt`）。第二次问由规则缓存作答，结果
+/// 一样。以前装不下时回 NOERROR、TC 置位、没有答案，带 EDNS 来问时还会交出超过 65535 字节的报文；后来按问的名字逐个
+/// 查询再算一遍
+/// A request-phase static TXT: one that just fits for the longest name is answered whatever
+/// name is asked and however, the message at most 65535 bytes; one byte more is SERVFAIL
+/// without TC for a short name too (the answer is compiled to SERVFAIL, see
+/// `StaticAnswer::txt`). Asked again, the rule cache answers, alike. What did not fit used to
+/// be NOERROR with TC set and no answers, and asked with EDNS a message over 65535 bytes could
+/// come out; later it was worked out again for the name asked, query by query
 #[tokio::test]
 async fn a_static_txt_fits_the_message_or_is_servfail() {
     // 65490：以前客户端带 EDNS 来问时，引擎交出 65537 字节的报文，比一个 DNS 报文的上限还长
@@ -219,9 +224,9 @@ async fn a_static_txt_fits_the_message_or_is_servfail() {
     }
 }
 
-/// 回答以后换成的 TXT 也一样：正好装得下的作答，多一个字节的回 SERVFAIL。以前替换时不查大小
-/// A TXT the answer is replaced with is the same: one that just fits is answered, one byte
-/// more is SERVFAIL. Replacing used not to check the size at all
+/// 回答以后换成的 TXT 也一样：按最长的名字正好装得下的作答，多一个字节的回 SERVFAIL。以前替换时不查大小
+/// A TXT the answer is replaced with is the same: one that just fits for the longest name is
+/// answered, one byte more is SERVFAIL. Replacing used not to check the size at all
 #[tokio::test]
 async fn a_replaced_txt_fits_the_message_or_is_servfail() {
     let upstream = answering_upstream(std::net::Ipv4Addr::new(192, 0, 2, 1), 300).await;

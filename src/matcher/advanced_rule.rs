@@ -42,10 +42,11 @@ impl RuntimeRule {
 /// the configuration's text again
 #[derive(Debug, Clone)]
 pub enum StaticAnswer {
-    /// 只有 RCODE、不带记录：static_response、deny（REFUSED），以及写的地址或 CNAME 目标读不出来时的 SERVFAIL（配置检查
-    /// 报过）
+    /// 只有 RCODE、不带记录：static_response、deny（REFUSED），以及写的地址或 CNAME 目标读不出来、TXT 装不下时的 SERVFAIL
+    /// （配置检查报过）
     /// An RCODE alone, with no records: static_response, deny (REFUSED), and the SERVFAIL of an
-    /// address or CNAME target that cannot be read (which the configuration check reports)
+    /// address or CNAME target that cannot be read, or of a TXT that does not fit (which the
+    /// configuration check reports)
     Rcode(ResponseCode),
     /// 按问题给的记录 / Records given by the question
     Records(StaticRecords),
@@ -104,9 +105,14 @@ impl StaticAnswer {
         })
     }
 
-    /// static_txt_response 和 replace_txt_response 的应答 / What static_txt_response and
-    /// replace_txt_response answer
+    /// static_txt_response 和 replace_txt_response 的应答；按最长的名字算装不下时是 SERVFAIL（见
+    /// `engine::response::txt_size_problem`），编好的 TXT 问什么名字都装得下 / What static_txt_response and
+    /// replace_txt_response answer; SERVFAIL when it does not fit for the longest name (see
+    /// `engine::response::txt_size_problem`), so a TXT compiled fits whatever name is asked
     pub fn txt(text: &[String], ttl: Option<u32>) -> Self {
+        if crate::engine::response::txt_size_problem(text).is_some() {
+            return Self::Rcode(ResponseCode::ServFail);
+        }
         Self::Records(StaticRecords::Txt {
             text: text.into(),
             ttl: ttl.unwrap_or(Self::DEFAULT_TTL),

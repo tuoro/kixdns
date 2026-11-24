@@ -26,12 +26,15 @@ use tracing::debug;
 
 use super::transport::{UdpClient, UdpExchange};
 
-/// 问一次 bootstrap 最多等多久：A 和 AAAA 同时问，各自最多等这么久。从没问到过的名字，建连要等它问完，而建连一共只有
+/// 解析一个名字最多等多久：问 bootstrap 时 A 和 AAAA 同时问，各自最多等这么久；系统的解析器也最多等这么久，到时报
+/// `resolve 名字: no answer in 2000ms`。建连要等名字解析完（经 bootstrap 的只有从没问到过的名字要等），而建连一共只有
 /// `transport::CONNECT_BUDGET`（5 秒），剩下的留给 TCP 和 TLS 握手
-/// How long one asking of bootstrap waits at most: A and AAAA are asked at once, each waited
-/// for this long at most. For a name never given any addresses the connect waits for the asking,
-/// and a connect has `transport::CONNECT_BUDGET` (5 seconds) in all, the rest of which the TCP
-/// and TLS handshakes need
+/// How long resolving one name waits at most: asking bootstrap, A and AAAA are asked at once,
+/// each waited for this long at most; the system resolver is waited for this long at most too,
+/// `resolve name: no answer in 2000ms` coming then. A connect waits for its name to be resolved
+/// (through bootstrap only a name never given any addresses waits), and a connect has
+/// `transport::CONNECT_BUDGET` (5 seconds) in all, the rest of which the TCP and TLS handshakes
+/// need
 const ASK_BUDGET: Duration = Duration::from_secs(2);
 
 /// 一族地址（A 或 AAAA）这次没问到时，多久之后再问（见 [`Known::new`]）。这时这一族要么没有地址（头一回问），要么是上回
@@ -171,8 +174,12 @@ impl Bootstrap {
             return Ok(vec![SocketAddr::new(ip, port)]);
         }
         let Some(through) = &self.through else {
-            return Ok(tokio::net::lookup_host((host, port))
+            let resolved = timeout(ASK_BUDGET, tokio::net::lookup_host((host, port)))
                 .await
+                .map_err(|_| {
+                    anyhow::anyhow!("resolve {host}: no answer in {}ms", ASK_BUDGET.as_millis())
+                })?;
+            return Ok(resolved
                 .with_context(|| format!("resolve {host}"))?
                 .collect());
         };
@@ -579,6 +586,7 @@ mod tests {
             &bootstrap,
             &format!("upstream.test:{port}"),
             deadline,
+            |stream| async { Ok(stream) },
         )
         .await
         .expect("connected to the address A gives");

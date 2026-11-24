@@ -1995,7 +1995,11 @@ impl TakenPage {
                 // 编好的记录读不回来只会是程序写错了：这一条只留序号，整页照样能读
                 // An encoded record that does not read back can only be a bug: it keeps just its number,
                 // and the page still reads
-                tracing::error!(seq, "查询日志里有一条编好的记录读不回来");
+                tracing::error!(
+                    event = "querylog_record_unreadable",
+                    seq,
+                    "a record encoded in the query log does not read back"
+                );
                 json.0.truncate(at);
                 json.raw("{\"seq\":");
                 json.number(seq);
