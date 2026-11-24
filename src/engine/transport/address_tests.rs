@@ -5,9 +5,9 @@ use rustls::pki_types::ServerName;
 
 #[test]
 fn doq_target_requires_sni_for_ip() {
-    assert!(parse_doq_target("doq://223.5.5.5:853").is_err());
-    assert!(parse_doq_target("doq://223.5.5.5:853?sni=alidns.com").is_ok());
-    assert!(parse_doq_target("doq://dns.alidns.com:853").is_ok());
+    assert!(parse_doq_target("223.5.5.5:853").is_err());
+    assert!(parse_doq_target("223.5.5.5:853?sni=alidns.com").is_ok());
+    assert!(parse_doq_target("dns.alidns.com:853").is_ok());
 }
 
 /// DoT、DoQ 的上游必须有建连时用得上的主机名：空的不行，做不成 TLS 服务器名的（`%20`、`.`）
@@ -72,8 +72,72 @@ fn dot_and_doq_addresses_take_the_last_sni_and_name_their_protocol_in_errors() {
         doq_error("dns.example/path?sni=dns.example"),
         "doq upstream should not contain path"
     );
-    assert!(dot_error("dot://[::1").starts_with("invalid dot upstream url"));
-    assert!(doq_error("doq://[::1").starts_with("invalid doq upstream url"));
+    assert!(dot_error("[::1").starts_with("invalid dot upstream url"));
+    assert!(doq_error("[::1").starts_with("invalid doq upstream url"));
+}
+
+/// DoT、DoQ 的上游和 DoH 一样不收第二个前缀，配置检查报出来：`dot://tcp://1.1.1.1:53` 不会在 53 端口上做 DoT，
+/// `tls://https://dns.google:443` 不会去连 853
+/// DoT and DoQ upstreams take no second prefix, as DoH ones do, and the configuration check
+/// reports it: `dot://tcp://1.1.1.1:53` does not speak DoT on port 53, nor does
+/// `tls://https://dns.google:443` dial 853
+#[test]
+fn a_dot_or_doq_upstream_with_a_second_prefix_is_refused() {
+    use crate::config::Transport;
+    for (address, transport) in [
+        ("tcp://1.1.1.1:53", Transport::Dot),
+        ("https://dns.google:443", Transport::Dot),
+        ("dot://dns.example", Transport::Dot),
+        ("http://dns.example:853?sni=dns.example", Transport::Doq),
+        ("doq://dns.example", Transport::Doq),
+    ] {
+        let err = check_upstream_address(address, transport)
+            .expect_err(address)
+            .to_string();
+        assert!(err.contains("a second prefix"), "{address}: {err}");
+    }
+}
+
+/// DoT 只收 `sni`、`servername` 参数，DoQ 再收 `0rtt`、`enable_0rtt`（值不分大小写）；拼错的参数、另一种传输的参数、
+/// 读不懂的 0rtt 值都报出来，不悄悄忽略或者改照全局设置
+/// DoT takes the `sni` and `servername` parameters alone, DoQ `0rtt` and `enable_0rtt` too
+/// (values in any case); a misspelt parameter, one of the other transport and a 0rtt value it
+/// cannot read are all reported, neither ignored unseen nor left to the global setting
+#[test]
+fn a_tls_upstream_takes_only_the_parameters_its_transport_reads() {
+    use crate::config::Transport;
+    for (address, transport, fragment) in [
+        ("1.1.1.1:853?sin=one.one.one.one", Transport::Dot, "\"sin\""),
+        ("dns.example:853?0rtt=1", Transport::Dot, "\"0rtt\""),
+        ("dns.example:853?zerortt=1", Transport::Doq, "\"zerortt\""),
+        ("dns.example:853?0rtt=ture", Transport::Doq, "\"ture\""),
+        (
+            "dns.example:853?enable_0rtt=",
+            Transport::Doq,
+            "enable_0rtt",
+        ),
+    ] {
+        let err = format!(
+            "{:#}",
+            check_upstream_address(address, transport).expect_err(address)
+        );
+        assert!(err.contains(fragment), "{address}: {err}");
+    }
+    for (address, enable_0rtt) in [
+        ("dns.example:853?0rtt=false", Some(false)),
+        ("dns.example:853?ENABLE_0RTT=On&sni=dns.example", Some(true)),
+        ("dns.example:853?0rtt=yes&0rtt=0", Some(false)),
+        ("dns.example:853?SNI=dns.example", None),
+    ] {
+        assert_eq!(
+            parse_doq_target(address).expect(address).enable_0rtt,
+            enable_0rtt,
+            "{address}"
+        );
+    }
+    assert!(
+        check_upstream_address("1.1.1.1:853?ServerName=one.one.one.one", Transport::Dot).is_ok()
+    );
 }
 
 #[test]

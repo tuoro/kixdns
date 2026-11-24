@@ -238,9 +238,9 @@ pub struct DohClient {
     /// How many direct connections an upstream may have at most: one per worker thread, with
     /// one normally in use (see `doh_h2::BUSY_AT`)
     direct_connections: usize,
-    /// 测试里改走明文 http：引擎把 DoH 上游一律当 https，本机的假 DoH 上游只会说 http
-    /// Plain http in tests: the engine takes every DoH upstream as https, and the local fake
-    /// DoH upstream speaks http only
+    /// 测试里改走明文 http，经 reqwest：引擎把 DoH 上游一律当 https，本机的假 DoH 上游只会说 http，直连只说 https
+    /// Plain http in tests, through reqwest: the engine takes every DoH upstream as https, the
+    /// local fake DoH upstream speaks http only, and the direct connection https only
     #[cfg(test)]
     plain_http: AtomicBool,
     /// 测试里另外信任的证书，直连和 reqwest 都认 / Certificates also trusted in tests, by the direct connection and reqwest alike
@@ -496,13 +496,12 @@ impl DohClient {
         #[cfg(test)]
         let url = &self.scheme_for_tests(url.clone());
         let host = target.host_override.as_deref();
-        // 握手时选了 h2 的 https 上游直连（见 `doh_h2`）；明文 http、设了代理时照旧经 reqwest
-        // An https upstream that picks h2 in the handshake is connected to directly (see
-        // `doh_h2`); plain http, or a proxy set, goes through reqwest as before
-        let uri = target
-            .uri
-            .as_ref()
-            .filter(|_| self.direct_h2 && url.scheme() == "https");
+        // 握手时选了 h2 的上游直连（见 `doh_h2`）；设了代理时经 reqwest
+        // An upstream that picks h2 in the handshake is connected to directly (see `doh_h2`);
+        // with a proxy set it goes through reqwest
+        let uri = target.uri.as_ref().filter(|_| self.direct_h2);
+        #[cfg(test)]
+        let uri = uri.filter(|_| !self.plain_http.load(Ordering::Relaxed));
 
         let start = tokio::time::Instant::now();
         let generation = state.generation.load(Ordering::Acquire);
@@ -742,6 +741,7 @@ impl DohClient {
         }
         crate::warn_sparse!(
             per upstream;
+            event = "doh_pool_rebuilt",
             upstream = upstream,
             consecutive_errors = count,
             threshold = self.health_error_threshold,
