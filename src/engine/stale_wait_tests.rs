@@ -20,6 +20,8 @@ use crate::engine::test_support::{Upstream, ask, counting_settings, first_a, pee
 use crate::observe::{CacheHit, CacheHitKind, EngineObserver, RequestContext};
 
 const ANSWER: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 1);
+/// 上游后来换成的回答 / The answer the upstream later gives instead
+const MOVED: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 2);
 /// 客户端最多等这么久 / How long a client waits at most
 const CLIENT_WAIT_MS: u64 = 1500;
 
@@ -192,33 +194,56 @@ async fn a_stale_answer_with_no_refresh_running_is_served_at_once() {
     assert_eq!(*kinds.0.lock(), vec![CacheHitKind::Stale]);
 }
 
-/// 规则自己给出的过期应答没有上游可等，马上交出，记成直接交出的那种；它的刷新照样发起，把它重新决定一遍。以前也是马上交出，
-/// 却记成上游失败
-/// A stale answer the rules gave has no upstream to wait for: it goes out at once, recorded as
-/// served at once, its refresh starting all the same to decide it again. It went out at once
-/// before too, yet was recorded as an upstream failure
+/// 规则据上游应答给出的过期应答和别的一样先等刷新：刷新去问上游、把规则重新走一遍，这回上游的回答不再让检查给出 NXDOMAIN，
+/// 客户端等到的是新的回答。以前把它当作没有上游可等的应答马上交出，规则早该给别的了还交出旧的
+/// A stale answer the rules gave by an upstream answer waits for its refresh like any other:
+/// the refresh asks the upstream and runs the rules again, the upstream's answer no longer has
+/// the check give NXDOMAIN, and the client gets the new answer it waited for. It used to go out
+/// at once as an answer with no upstream to wait for, the old one served when the rules would
+/// have given another
 #[tokio::test]
-async fn a_stale_answer_the_rules_gave_is_served_at_once() {
-    let up = failing_later(Arc::new(AtomicBool::new(false)), Duration::ZERO).await;
+async fn a_stale_answer_the_rules_gave_waits_for_its_refresh() {
+    let moved = Arc::new(AtomicBool::new(false));
+    let up = {
+        let moved = moved.clone();
+        upstream(move |query| {
+            let address = if moved.load(Ordering::SeqCst) {
+                MOVED
+            } else {
+                ANSWER
+            };
+            let mut reply = Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
+            reply.metadata.recursion_desired = query.metadata.recursion_desired;
+            reply.add_queries(query.queries.iter().cloned());
+            reply.add_answer(Record::from_rdata(
+                query.queries[0].name().clone(),
+                1,
+                RData::A(A(address)),
+            ));
+            vec![(Duration::ZERO, reply.to_vec().unwrap())]
+        })
+        .await
+    };
     let kinds = Arc::new(StaleKinds::default());
     let engine = engine_with(
         json!({ "min_ttl": 1 }),
         json!({
             "name": "checked", "matchers": [{ "type": "any" }],
             "actions": [{ "type": "forward", "upstream": up.address }],
+            "response_matchers": [{ "type": "response_answer_ip", "cidr": format!("{ANSWER}/32") }],
             "response_actions_on_match": [{ "type": "static_response", "rcode": "NXDOMAIN" }]
         }),
         kinds.clone(),
     );
-    ask(&engine, &query(), peer()).await;
-    tokio::time::sleep(Duration::from_millis(1_200)).await;
-
-    let started = Instant::now();
     let reply = ask(&engine, &query(), peer()).await;
     assert_eq!(
         Message::from_vec(&reply).unwrap().metadata.response_code,
         ResponseCode::NXDomain
     );
-    assert!(started.elapsed() < Duration::from_millis(500), "no wait");
-    assert_eq!(*kinds.0.lock(), vec![CacheHitKind::Stale]);
+    moved.store(true, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+
+    assert_eq!(first_a(&ask(&engine, &query(), peer()).await), Some(MOVED));
+    assert_eq!(up.queries(), 2, "the refresh asked the upstream");
+    assert!(kinds.0.lock().is_empty(), "{:?}", kinds.0.lock());
 }

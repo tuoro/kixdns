@@ -11,12 +11,10 @@ use crate::engine::response_log::{ResponseInfo, Source};
 use crate::engine::rules::{self, ResponseActionResult, ResponseContext};
 use crate::engine::types::{EngineInner, InflightEntry, InflightQuestion};
 use crate::engine::upstream::{UpstreamFailure, reject_failure_reply_on_refresh};
-use crate::engine::utils::engine_helpers::{build_response, build_servfail_response_fast};
 use crate::engine::utils::{InflightCleanupGuard, set_id};
 use crate::matcher::{Requester, RuntimeResponseMatcherWithOp};
 use crate::observe::{CacheHit, CacheHitKind};
 use crate::proto_utils;
-use anyhow::Context;
 use bytes::{Bytes, BytesMut};
 use hickory_proto::op::{Message, ResponseCode};
 use hickory_proto::rr::{DNSClass, Record, RecordType};
@@ -36,15 +34,7 @@ pub enum ForwardResult {
     Success(Bytes),
     /// Request needs to continue (e.g. Action::Continue)
     /// Boxed to reduce enum size (ResponseContext is ~256 bytes)
-    /// `answer_ttl`：回答检查看的那份上游应答在缓存里能留多久，此后据它给出的静态应答都不超过这么久（见
-    /// `Route::answer_ttl`）；miss 动作在上游失败以后做的 continue 手里没有应答，是 0
-    /// `answer_ttl`: how long the upstream answer the answer check read may stay in the cache,
-    /// which no static answer given by it from here on outlasts (see `Route::answer_ttl`); 0 for
-    /// a continue the miss actions made after an upstream failure, with no answer in hand
-    Continue {
-        ctx: Box<Option<ResponseContext>>,
-        answer_ttl: u32,
-    },
+    Continue { ctx: Box<Option<ResponseContext>> },
     /// 响应动作跳到 `pipeline`：请求在那里接着走规则，转发照原样发出这次转发发出的 `packet`，它带的 ECS 是 `carried`；应答
     /// 照旧缓存在跳转前这个 pipeline 的键下（见 `Route::jumped`、`Route::key_pipeline`）。这次转发登记的条目留给请求（见
     /// `Route::held_inflight`），等它拿到最终的应答再交出去
@@ -52,12 +42,11 @@ pub enum ForwardResult {
     /// forwards sending `packet`, what this forward sent, as it is, with `carried` as its ECS;
     /// answers are still cached under the key of this pipeline, the one jumped from (see
     /// `Route::jumped`, `Route::key_pipeline`). The entry this forward registered stays with the request (see
-    /// `Route::held_inflight`) and is handed the final answer. `answer_ttl` as on Continue
+    /// `Route::held_inflight`) and is handed the final answer
     Jump {
         pipeline: Arc<str>,
         packet: Bytes,
         carried: ForwardEcs,
-        answer_ttl: u32,
     },
 }
 use hickory_proto::serialize::binary::BinDecodable;
@@ -141,22 +130,22 @@ pub(crate) fn kept_past_ttl(settings: &GlobalSettings) -> Duration {
 }
 
 /// 过期还能用的 `hit`（见 [`Age::Stale`]）是不是现在就交出去、按哪种上报：没开 serve_stale_client_timeout_ms
-/// 时马上交出；规则自己给出的应答没有上游可等，也马上交出（它的刷新照样发起，见 `serve_stale`）；别的先等上游（见
-/// `Engine::answer_from_cache`），只有这份应答刚刷新失败过的不等（RFC 8767 第 5 节，见 `REFRESH_FAILURE_RECHECK`）。
-/// 查缓存和快速路径都按这一处判断
+/// 时马上交出；开着的先等上游（见 `Engine::answer_from_cache`），只有这份应答刚刷新失败过的不等（RFC 8767 第 5 节，见
+/// `REFRESH_FAILURE_RECHECK`）。规则据上游应答给出的也一样等：它的刷新照样去问上游、把规则重新走一遍。查缓存和快速路径
+/// 都按这一处判断
 /// Whether `hit`, past its TTL and still of use (see [`Age::Stale`]), goes out right now, and
-/// reported as what: at once with serve_stale_client_timeout_ms off; at once too for an
-/// answer the rules gave, with no upstream to wait for (its refresh starts all the same, see
-/// `serve_stale`); any other waits on the upstream first (see `Engine::answer_from_cache`), and
-/// only an answer whose refresh failed lately does not wait (RFC 8767 section 5, see
-/// `REFRESH_FAILURE_RECHECK`). The cache lookup and the fast path both go by this alone
+/// reported as what: at once with serve_stale_client_timeout_ms off; with it on it waits on
+/// the upstream first (see `Engine::answer_from_cache`), and only an answer whose refresh
+/// failed lately does not wait (RFC 8767 section 5, see `REFRESH_FAILURE_RECHECK`). One the
+/// rules gave by an upstream answer waits alike: its refresh asks the upstream all the same
+/// and runs the rules again. The cache lookup and the fast path both go by this alone
 pub(crate) fn stale_at_once(
     engine: &Engine,
     settings: &GlobalSettings,
     slot: u64,
     hit: &CacheEntry,
 ) -> Option<CacheHitKind> {
-    if settings.serve_stale_client_timeout_ms == 0 || hit.upstream.is_none() {
+    if settings.serve_stale_client_timeout_ms == 0 {
         Some(CacheHitKind::Stale)
     } else if failed_lately(engine, slot, hit) {
         Some(CacheHitKind::StaleUpstreamFailure)
@@ -190,7 +179,7 @@ pub(crate) fn cache_hit_of(
     }
 }
 
-/// [`check_cache_logged`] 在缓存里找到的 / What [`check_cache_logged`] found in the cache
+/// [`check_cache`] 在缓存里找到的 / What [`check_cache`] found in the cache
 pub(crate) enum Looked {
     /// 交出去的应答 / The answer that goes out
     Answered(Bytes),
@@ -202,18 +191,22 @@ pub(crate) enum Looked {
     Missed,
 }
 
-/// 查一次缓存：槽位里这个请求的那份应答、它存了多少秒、现在算什么
+/// 查一次缓存：槽位里这个请求的那份应答、它存了多少秒、现在算什么，只给新鲜的、过期还能用的。槽位里的应答全都不能再
+/// 用了，缓存才把整个槽位清掉；往槽位里写的时候顺带去掉不能再用的（见 `CacheSlot::with`），所以拿到的这份可能已经不能再
+/// 用，现在算什么在这里判断。不能再用的留在原处，等重新取回的应答写进来时取代它，或者随槽位清扫：查缓存不为它拿写锁；它在
+/// 的时候，这个请求方的查找也不退到一份更宽、更旧的应答上，和快速路径一样（见 `CacheSlot::select`）
 /// One cache lookup: this request's answer in the slot, how many seconds it has been stored,
-/// and what it counts as now
-fn cached_hit(
+/// and what it counts as now, giving only one fresh, or stale and still of use. The cache
+/// clears a slot only once none of its answers is of use any more, and drops those of no
+/// further use from a slot as it writes to it (see `CacheSlot::with`), so the one got here may
+/// be of no use already, and what it counts as now is decided here. One of no further use stays
+/// where it is, until the answer fetched again replaces it or the slot is swept: a lookup takes
+/// no write lock for it, and while it is there this requester's lookups do not fall back to a
+/// wider, older answer, as on the fast path (see `CacheSlot::select`)
+fn usable_hit(
     engine: &Engine,
     context: &CacheLookupContext<'_>,
 ) -> Option<(Arc<CacheEntry>, u64, Age)> {
-    // 槽位里的应答全都不能再用了，缓存才把整个槽位清掉；往槽位里写的时候顺带去掉不能再用的（见 `CacheSlot::with`）。
-    // 所以拿到的这份可能已经不能再用，现在算什么在这里判断
-    // The cache clears a slot only once none of its answers is of use any more, and drops
-    // those of no further use from a slot as it writes to it (see `CacheSlot::with`). So the
-    // one got here may be of no use already, and what it counts as now is decided here
     let now = Instant::now();
     let hit = engine.cache_get(
         context.slot,
@@ -222,30 +215,15 @@ fn cached_hit(
     )?;
     let elapsed_secs = now.saturating_duration_since(hit.inserted_at).as_secs();
     let age = age_of(&hit, elapsed_secs, &context.state.pipeline.settings);
-    Some((hit, elapsed_secs, age))
-}
-
-/// 同 [`cached_hit`]，只给新鲜的、过期还能用的。不能再用的留在原处，等重新取回的应答写进来时取代它，或者随槽位清扫：
-/// 查缓存不为它拿写锁；它在的时候，这个请求方的查找也不退到一份更宽、更旧的应答上，和快速路径一样（见
-/// `CacheSlot::select`）。以前查到就删掉，紧跟着来的请求就拿到了别的子网取来的那份
-/// As [`cached_hit`], giving only one fresh, or stale and still of use. One of no further use
-/// stays where it is, until the answer fetched again replaces it or the slot is swept: a lookup
-/// takes no write lock for it, and while it is there this requester's lookups do not fall back
-/// to a wider, older answer, as on the fast path (see `CacheSlot::select`). It used to be
-/// dropped on being found, and the request right after got the answer another subnet fetched
-fn usable_hit(
-    engine: &Engine,
-    context: &CacheLookupContext<'_>,
-) -> Option<(Arc<CacheEntry>, u64, Age)> {
-    cached_hit(engine, context).filter(|&(_, _, age)| age != Age::Spent)
+    (age != Age::Spent).then_some((hit, elapsed_secs, age))
 }
 
 /// Checks the response cache: a fresh answer goes out with its TTLs aged and may start a
-/// background refresh; an expired one is served stale, waits on its refresh, or is dropped
-/// as serve_stale says.
-/// 查响应缓存：新鲜的应答按停留时间减 TTL 后给出，必要时发起后台刷新；过期的按 serve_stale
-/// 的设置当作 stale 提供、等它的刷新，或者删掉。
-pub(crate) fn check_cache_logged(
+/// background refresh; an expired one still of use is served stale or waits on its refresh as
+/// serve_stale says; one of no further use is a miss, left where it is (see `usable_hit`).
+/// 查响应缓存：新鲜的应答按停留时间减 TTL 后给出，必要时发起后台刷新；过期还能用的按 serve_stale
+/// 的设置当作 stale 提供或者等它的刷新；不能再用的算未命中，留在原处（见 `usable_hit`）。
+pub(crate) fn check_cache(
     engine: &Engine,
     context: &CacheLookupContext<'_>,
     response: &mut ResponseInfo,
@@ -298,6 +276,35 @@ pub(crate) fn check_cache_after_wait(
     Some(serve_stale(engine, context, &hit, &view, kind, response))
 }
 
+/// 上游失败以后（见 `Forwarding::upstream_failed`）再查一次缓存：这期间别人写进同一槽位、也适用于这个请求方的新鲜应答
+/// （同时在问、inflight 键不同的请求拿到的，或者后台刷新拿到的）照常交出；过期还能用的按上游失败时交出的过期应答交出
+/// （RFC 8767）。以前只认过期的，新鲜的放着不用，客户端拿 SERVFAIL
+/// Look in the cache again once the upstream failed (see `Forwarding::upstream_failed`): a fresh
+/// answer someone else wrote into the slot meanwhile that applies to this requester too (got by
+/// a request asking at once under another inflight key, or by a background refresh) goes out as
+/// usual; one stale and still of use goes out as the stale answer of an upstream failure (RFC
+/// 8767). Only a stale one used to count, a fresh one left unused and the client getting
+/// SERVFAIL
+pub(crate) fn check_cache_after_failure(
+    engine: &Engine,
+    context: &CacheLookupContext<'_>,
+    response: &mut ResponseInfo,
+) -> Option<Bytes> {
+    let (hit, elapsed_secs, age) = usable_hit(engine, context)?;
+    if age == Age::Fresh {
+        return Some(serve_fresh(engine, context, &hit, elapsed_secs, response));
+    }
+    let view = context.requester.ecs_view();
+    Some(serve_stale(
+        engine,
+        context,
+        &hit,
+        &view,
+        CacheHitKind::StaleUpstreamFailure,
+        response,
+    ))
+}
+
 /// 交出新鲜的 `hit`：TTL 都减去存了的秒数（RFC 1035 第 5.2 节），快到期的顺带发起后台刷新
 /// Serve the fresh `hit`: every TTL less the seconds it has been stored (RFC 1035 section
 /// 5.2), with a background refresh started when it is due
@@ -338,17 +345,17 @@ fn ttl_to_cache(engine: &Engine, own_ttl: u64, min_ttl: Duration) -> u32 {
     proto_utils::saturating_u64_to_u32(own_ttl.max(min_ttl.as_secs())).min(engine.ttl_cap())
 }
 
-/// 缓存留一份静态应答多久。它是规则据一份上游应答给出的，那份应答在缓存里能留 `answer_ttl` 秒（见 `ttl_to_cache`）：
-/// 过了这么久上游可能答得不一样了，规则也就可能给出别的，所以它留得不比那份应答久。它带的 TTL（`carried`，记录里最小的，
+/// 缓存留一份静态应答多久。它是规则据上游应答给出的，那些应答在缓存里最多都能留 `answer_ttl` 秒（见 `ttl_to_cache`、
+/// `Route::answer_ttl`）：过了这么久上游可能答得不一样了，规则也就可能给出别的，所以它留得不比那些应答久。它带的 TTL（`carried`，记录里最小的，
 /// 见 `least_ttl`）更短时按它带的；不带记录的（deny 的 REFUSED、static_response、问的类型没有记录时的 NODATA）没有自己的
 /// TTL，就留 `answer_ttl`。规则直接给出的、上游失败以后兜底给出的不据哪份应答，`answer_ttl` 是 0，不缓存。请求阶段和响应阶段
 /// 都照这一处算。min_ttl 只抬上游回答的 TTL，不抬规则写的：抬了缓存时间、记录却不抬，缓存里的记录 TTL 先走完，交出去的就是
 /// TTL 为 0 的记录。以前带记录的不看那份应答，写死的 300 秒比来源的 TTL 长时答错；不带记录的按 min_ttl，默认为 0 时不缓存，
 /// 防重绑定的 deny 每次都要再问上游
-/// How long the cache keeps a static answer. The rules gave it by an upstream answer that
-/// may stay in the cache for `answer_ttl` seconds (see `ttl_to_cache`): after that the
-/// upstream may answer otherwise and the rules give something else, so it stays no longer
-/// than that answer. The TTL it carries (`carried`, the least of its records', see
+/// How long the cache keeps a static answer. The rules gave it by upstream answers that may
+/// all stay in the cache for `answer_ttl` seconds (see `ttl_to_cache`, `Route::answer_ttl`):
+/// after that the upstream may answer otherwise and the rules give something else, so it
+/// stays no longer than those answers. The TTL it carries (`carried`, the least of its records', see
 /// `least_ttl`) goes when shorter; one without records (deny's REFUSED, static_response, the
 /// NODATA of a type with no records) has no TTL of its own and stays for `answer_ttl`. One
 /// the rules give outright, or as a fallback after an upstream failure, goes by no answer:
@@ -401,37 +408,6 @@ pub(crate) fn served_from_cache(
     }
     set_id(&mut resp_bytes, tx_id);
     resp_bytes.freeze()
-}
-
-/// RFC 8767: after an upstream failure, check if a stale (expired but still in the cache)
-/// cache entry exists. Returns the stale response bytes with TTL set to serve_stale_ttl,
-/// reported to the observer as served on an upstream failure.
-/// RFC 8767：上游失败以后，检查是否存在过期但仍在缓存中的缓存条目。返回 TTL 设置为
-/// serve_stale_ttl 的过期响应字节，按上游失败时交出的那种上报观察者。
-///
-/// Does not emit the `dns_response` record; only the engine request path logs it.
-/// 不输出 `dns_response` 记录；该记录只由引擎请求路径输出。
-pub(crate) fn check_stale_cache_logged(
-    engine: &Engine,
-    context: &CacheLookupContext<'_>,
-    response: &mut ResponseInfo,
-) -> Option<Bytes> {
-    if !context.state.pipeline.settings.serve_stale {
-        return None;
-    }
-    // 不能再用的留给查缓存去掉 / One of no further use is left for the lookup to drop
-    let (hit, _, age) = cached_hit(engine, context)?;
-    (age == Age::Stale).then(|| {
-        let view = context.requester.ecs_view();
-        serve_stale(
-            engine,
-            context,
-            &hit,
-            &view,
-            CacheHitKind::StaleUpstreamFailure,
-            response,
-        )
-    })
 }
 
 /// 把过期的 `hit` 当作 stale 提供（RFC 8767）：TTL 都设成 serve_stale_ttl；顺带发起后台刷新（刷新失败时
@@ -487,85 +463,44 @@ pub(crate) fn serve_stale(
     resp_bytes
 }
 
-/// Request data required to build and cache a static DNS response.
-pub struct StaticDecisionContext<'a> {
-    pub packet: &'a [u8],
-    pub qname: &'a str,
-    pub qtype: RecordType,
-    pub qclass: DNSClass,
-    pub pipeline_id: &'a Arc<str>,
-    /// Response cache slot / 响应缓存槽位
-    pub slot: u64,
-    /// The query bits the slot was computed with / 算槽位时用的查询位
-    pub flags: proto_utils::QueryFlags,
-    /// Whom the answer applies to: the forwards the request passed before it
-    /// (see `Route::trail`)
-    /// 应答适用于谁：请求在它之前经过的转发（见 `Route::trail`）
-    pub reach: &'a EcsReach,
-    /// 它所依据的那份上游应答在缓存里能留多久（见 `Route::answer_ttl`、`static_ttl`）：取决于上游应答的缓存起来，下次
-    /// 不必再问上游。别的都是 0、不缓存：规则直接给出的，规则下次照样直接给出（快速路径、规则缓存），不用问谁，从响应缓存拿
-    /// 的话查询日志和规则计数就记不到这条规则，它的 log 动作也不执行；上游失败以后兜底给出的只是这一次请求的
-    /// How long the upstream answer it goes by may stay in the cache (see `Route::answer_ttl`,
-    /// `static_ttl`): one depending on an upstream's answer is cached so the upstream need not
-    /// be asked next time. Anything else has 0 and is not cached: one the rules give outright
-    /// they give again outright (the fast path, the rule cache) with nobody to ask, and taken
-    /// from the response cache it would be missing from the query log and rule counts under its
-    /// rule, its log action not run; one given as a fallback after an upstream failure is for
-    /// this request alone
-    pub answer_ttl: u32,
-}
-
-/// 处理静态决定：照请求构造应答；取决于上游应答的（见 `StaticDecisionContext::answer_ttl`）按 `static_ttl` 说的
-/// 时长缓存。槽位把规则分得开的请求方分开（见 `RuntimePipeline::requester`），所以规则按「谁在问」给的应答也和别的应答
-/// 一样缓存。
-/// Handles Decision::Static: builds the answer for the request, and caches one that depends
-/// on an upstream's answer (see `StaticDecisionContext::answer_ttl`) for as long as
-/// `static_ttl` says. The slot keeps apart the requesters the rules tell apart (see
-/// `RuntimePipeline::requester`), so an answer the rules give by who is asking is cached like
-/// any other.
-/// Does not emit the `dns_response` record; only the engine request path logs it.
-/// 不输出 `dns_response` 记录；该记录只由引擎请求路径输出。
-pub fn handle_static_decision(
+/// 处理静态决定：照请求构造应答（见 `response::static_reply`），取决于上游应答的按 `static_ttl` 说的时长缓存在路线的键下
+/// （见 `Route::cache`）。取决于上游应答的才缓存，留多久见 `Route::answer_ttl`：它缓存起来，下次不必再问上游。规则直接
+/// 给出的不缓存，规则下次照样直接给出（快速路径、规则缓存），不用问谁，从响应缓存拿的话查询日志和规则计数就记不到这条规则，
+/// 它的 log 动作也不执行；上游失败以后兜底给出的也不缓存，那只是这一次请求的。槽位把规则分得开的请求方分开（见
+/// `RuntimePipeline::requester`），所以规则按「谁在问」给的应答也和别的应答一样缓存。不输出 `dns_response` 记录，那只由
+/// 引擎的请求路径输出
+/// Handles Decision::Static: builds the answer for the request (see `response::static_reply`),
+/// and caches one that depends on an upstream's answer under the route's keys (see
+/// `Route::cache`) for as long as `static_ttl` says. Only one depending on an upstream's answer
+/// is cached, for as long as `Route::answer_ttl` allows, so the upstream need not be asked next
+/// time. One the rules give outright is not: they give it again outright (the fast path, the
+/// rule cache) with nobody to ask, and taken from the response cache it would be missing from
+/// the query log and rule counts under its rule, its log action not run; nor is one given as a
+/// fallback after an upstream failure, which is for this request alone. The slot keeps apart
+/// the requesters the rules tell apart (see `RuntimePipeline::requester`), so an answer the
+/// rules give by who is asking is cached like any other. Emits no `dns_response` record, which
+/// only the engine request path does
+pub(crate) fn handle_static_decision(
     engine: &Engine,
-    context: &StaticDecisionContext<'_>,
+    request: &Request<'_>,
+    route: &Route,
     rcode: ResponseCode,
-    answers: Vec<Record>,
-) -> anyhow::Result<Bytes> {
-    let StaticDecisionContext {
-        packet,
-        qname,
-        qtype,
-        qclass,
-        pipeline_id: current_pipeline_id,
-        slot,
-        flags,
-        reach,
-        answer_ttl,
-    } = *context;
-    // Need full request for building response / 需要完整请求来构建响应
-    let req = Message::from_bytes(packet).context("parse request for static")?;
-    let ttl = static_ttl(super::response::least_ttl(&answers), answer_ttl);
-    let resp_bytes = build_response(&req, rcode, answers)?;
-
-    if ttl > 0 {
-        engine.insert_dns_cache_entry(
-            slot,
-            CacheEntry::from_response(
-                resp_bytes.clone(),
-                rcode,
-                None, // Static responses have no upstream
-                qname,
-                current_pipeline_id.clone(),
-                u16::from(qtype),
-                u16::from(qclass),
-                flags,
-                ttl,
-            )
-            .with_reach(reach.clone()),
-        );
-    }
-
-    Ok(resp_bytes)
+    answers: &[Record],
+) -> Bytes {
+    let reply = super::response::static_reply(
+        request.packet,
+        request.qname,
+        request.qtype,
+        request.qclass,
+        rcode,
+        answers,
+    );
+    let ttl = static_ttl(
+        super::response::least_ttl(answers),
+        route.answer_ttl.unwrap_or(0),
+    );
+    route.cache(engine, request, &reply, rcode, None, ttl);
+    reply
 }
 
 /// 转发决定自己说的：问哪些上游、怎样问、回答检查做什么。请求本身见 `Request`，它沿着规则走到了哪里见 `Route`
@@ -579,7 +514,7 @@ pub(crate) struct ForwardDecision<'a> {
     pub(crate) response_matchers: &'a [RuntimeResponseMatcherWithOp],
     pub(crate) response_actions_on_match: &'a [Action],
     pub(crate) response_actions_on_miss: &'a [Action],
-    pub(crate) transport: Option<Transport>,
+    pub(crate) transport: Transport,
     /// 发出去之前怎样改写 ECS；响应阶段跳转以后不再改写（见 `Route::jumped`）/ How the ECS is rewritten
     /// before the query goes out; no longer after a response-phase jump (see `Route::jumped`)
     pub(crate) ecs: Option<&'a crate::config::EcsMode>,
@@ -591,7 +526,7 @@ pub(crate) struct ForwardDecision<'a> {
 /// Handles Decision::Forward: joins or registers in the inflight map, forwards upstream,
 /// applies the response rules and caches the answer.
 /// 处理转发决定：合并等待或登记 inflight，转发给上游，执行响应规则，缓存应答。
-pub(crate) async fn handle_forward_decision_logged<'a>(
+pub(crate) async fn handle_forward_decision<'a>(
     engine: &'a Engine,
     request: &'a Request<'a>,
     route: &'a mut Route,
@@ -617,13 +552,26 @@ pub(crate) async fn handle_forward_decision_logged<'a>(
 /// 上游的应答，和给出它的上游 / An upstream's reply, and the upstream that gave it
 type Reply = anyhow::Result<(Bytes, Arc<str>)>;
 
-/// [`Forwarding::weigh`] 掂量过的应答：上游的应答和给出它的上游；几个上游都回了失败应答、回答检查照样放行的那一个，还带着
-/// 解析好的报文，回答阶段拿它当已经检查过的应答，不再解析、检查一遍
-/// A reply [`Forwarding::weigh`] weighed: the upstream's answer and the upstream that gave
-/// it; the failure reply of several upstreams the answer check let through all the same
-/// comes with its parsed message too, which the answer phase takes as an answer checked
-/// already, with no second parse or check
-type Weighed = anyhow::Result<(Bytes, Arc<str>, Option<Message>)>;
+/// [`Forwarding::weigh`] 掂量过的应答（见 [`Answer`]），或者这次转发的失败
+/// A reply [`Forwarding::weigh`] weighed (see [`Answer`]), or this forward's failure
+type Weighed = anyhow::Result<Answer>;
+
+/// 读出来的上游应答（见 [`Forwarding::read`]）：应答本身、给出它的上游、它的 RCODE 和自己的 TTL（见 `ttl_to_cache`），
+/// hickory 读过的还有解析好的报文。`checked` 的是几个上游都回了失败应答、回答检查照样放行的那一个（见
+/// `rules::check_failure_reply`）：回答阶段拿它当已经检查过的应答，不再检查一遍
+/// An upstream reply as read (see [`Forwarding::read`]): the reply itself, the upstream that
+/// gave it, its RCODE and its own TTL (see `ttl_to_cache`), with the parsed message when hickory
+/// read it. A `checked` one is the failure reply of several upstreams the answer check let
+/// through all the same (see `rules::check_failure_reply`): the answer phase takes it as an
+/// answer checked already, with no second check
+struct Answer {
+    raw: Bytes,
+    upstream: Arc<str>,
+    rcode: ResponseCode,
+    ttl: u64,
+    msg: Option<Message>,
+    checked: bool,
+}
 
 /// 进行中的一次转发：请求、它沿着规则走的路线和转发决定，加上这次发出的包、它带的 ECS、它在 inflight 表里登记的条目。
 /// 路线由这次转发接着往下记：它经过的转发（`trail`）、留给后面复用的应答、continue 以后还持有的条目
@@ -860,7 +808,7 @@ impl<'a> Forwarding<'a> {
             &self.packet,
             decision.upstream,
             request.state.pipeline.upstream_timeout(),
-            decision.transport,
+            Some(decision.transport),
             decision.pre_split_upstreams,
             request.observed,
             request.asker(),
@@ -894,11 +842,13 @@ impl<'a> Forwarding<'a> {
         }
         let (request, decision) = (self.request, self.decision);
         // 几个上游都回了失败应答时，规则的回答检查照样看得到最先收到的那个（见
-        // `rules::check_failure_reply`）；放行的那个连同解析好的报文交给回答阶段（见 [`Weighed`]）。刷新随后照旧拒收它
+        // `rules::check_failure_reply`）；放行的那个连同解析好的报文交给回答阶段（见 [`Answer`]）。刷新随后照旧拒收它。
+        // 别的应答先读出来（见 [`Self::read`]），读不了的和上游失败一样记进 trail
         // When several upstreams all replied with a failure, the rule's answer check still sees
         // the first of those replies (see `rules::check_failure_reply`); one let through goes
-        // to the answer phase with its parsed message (see [`Weighed`]). A refresh still
-        // rejects it right after
+        // to the answer phase with its parsed message (see [`Answer`]). A refresh still
+        // rejects it right after. Any other reply is read first (see [`Self::read`]), and one
+        // that cannot be read goes into the trail as the upstream failing does
         let reply = match reply {
             Err(failure) => match rules::check_failure_reply(
                 &failure,
@@ -915,10 +865,17 @@ impl<'a> Forwarding<'a> {
                     )
                 },
             ) {
-                Some((raw, upstream, msg)) => Ok((raw, upstream, Some(msg))),
+                Some((raw, upstream, msg)) => Ok(Answer {
+                    rcode: msg.metadata.response_code,
+                    ttl: extract_ttl(&msg),
+                    raw,
+                    upstream,
+                    msg: Some(msg),
+                    checked: true,
+                }),
                 None => Err(failure),
             },
-            Ok((raw, upstream)) => Ok((raw, upstream, None)),
+            Ok((raw, upstream)) => self.read(raw, upstream),
         };
         // A refresh takes a failure reply as a failed attempt before the response rules
         // see it, as forward_upstream does for a rule with several upstreams: the
@@ -927,17 +884,59 @@ impl<'a> Forwarding<'a> {
         // 刷新在响应规则看到失败应答之前就把它当作一次失败的尝试，和规则有多个上游时
         // forward_upstream 的做法一样：刷新和上游别的失败一样以失败结束（见 `Self::settle`），
         // 也不缓存这个应答（见 reject_failure_reply_on_refresh）。
-        let reply = reply.and_then(|reply| {
-            reject_failure_reply_on_refresh(request.refresh.is_some(), &reply.0).map(|()| reply)
+        let reply = reply.and_then(|answer| {
+            reject_failure_reply_on_refresh(request.refresh.is_some(), &answer.raw).map(|()| answer)
         });
         match &reply {
             // 这里复用的、规则越过的应答：它那次转发已经记在 trail 里 / An answer a rule continued
             // past, reused here: the trail already has its forward
             Ok(_) if reused => {}
-            Ok((raw, ..)) => self.route.trail.record_reply(self.forward_ecs, raw),
+            Ok(answer) => self.route.trail.record_reply(self.forward_ecs, &answer.raw),
             Err(_) => self.route.trail.record_failure(self.forward_ecs),
         }
         reply
+    }
+
+    /// 读 `upstream` 给的应答 `raw`。响应规则要读解析好的报文，所以总用 hickory 的。没有响应规则时，结构经得起检查的应答
+    /// 照快速解析的结果读（见 `well_formed_reply`）；其余的照 hickory 读出的，只有快速解析读得了的照样交出去、不缓存（TTL
+    /// 记 0）。两边都读不了的算这次转发失败（见 [`Self::settle`]）：和上游没回答一样，有过期应答就交出过期应答、没有就回
+    /// SERVFAIL，或者执行 miss 动作，等在这次转发登记的条目上的请求也拿到它
+    /// Read the reply `raw` that `upstream` gave. Response rules read the parsed message, so
+    /// they always take hickory's. Otherwise a reply whose structure holds up is read as the
+    /// quick parse reads it (see `well_formed_reply`); any other as hickory reads it, or, when
+    /// only the quick parse can read it, it goes on as it is and is not cached (a TTL of 0). One
+    /// neither can read fails this forward (see [`Self::settle`]): as when the upstream gives no
+    /// answer, a stale answer goes out if there is one and SERVFAIL if not, or the miss actions
+    /// run, and the requests waiting on the entry this forward registered get it too
+    fn read(&self, raw: Bytes, upstream: Arc<str>) -> anyhow::Result<Answer> {
+        let decision = self.decision;
+        let rules_read_the_reply = !(decision.response_matchers.is_empty()
+            && decision.response_actions_on_match.is_empty()
+            && decision.response_actions_on_miss.is_empty());
+        let quick = (!rules_read_the_reply)
+            .then(|| proto_utils::parse_response_quick(&raw))
+            .flatten();
+        let (rcode, ttl, msg) = match quick {
+            Some(qr) if proto_utils::well_formed_reply(&raw) => {
+                (qr.rcode, u64::from(qr.min_ttl), None)
+            }
+            quick => match (Message::from_bytes(&raw), quick) {
+                (Ok(msg), _) => (msg.metadata.response_code, extract_ttl(&msg), Some(msg)),
+                (Err(_), Some(qr)) => (qr.rcode, 0, None),
+                (Err(error), None) => {
+                    return Err(anyhow::Error::new(error)
+                        .context(format!("the reply from {upstream} cannot be read")));
+                }
+            },
+        };
+        Ok(Answer {
+            raw,
+            upstream,
+            rcode,
+            ttl,
+            msg,
+            checked: false,
+        })
     }
 
     /// 应答或失败之后：上游有应答时按响应匹配器执行 on_match 或 on_miss，上游失败时执行 on_miss；两边接下来的处理只差在
@@ -953,7 +952,7 @@ impl<'a> Forwarding<'a> {
     ) -> anyhow::Result<ForwardResult> {
         let on_miss = self.decision.response_actions_on_miss;
         match reply {
-            Ok((raw, upstream, checked)) => self.answered(raw, upstream, checked, response).await,
+            Ok(answer) => self.answered(answer, response).await,
             // 后台刷新没有客户端，也没在 inflight 里登记：上游失败就到此为止，把失败原样交回（refresh.rs 记下、退避），
             // 缓存条目和别的请求的等待者都不受影响。miss 动作给出的只是兜底，刷新用不着：以前照跑，静态兜底、问备用
             // 上游拿到的都写进缓存，把预取时还新鲜的那条顶掉，刷新还算成功、不退避
@@ -964,11 +963,8 @@ impl<'a> Forwarding<'a> {
             // upstream's answer going into the cache over the entry still fresh at a prefetch,
             // and the refresh counting as a success with no backing off
             Err(e) if self.request.refresh.is_some() => Err(e),
-            Err(e) if on_miss.is_empty() => self.upstream_failed(e, response),
-            Err(e) => match Message::from_bytes(&self.packet) {
-                Ok(req) => self.act(on_miss, None, req, response).await,
-                Err(_) => Err(e),
-            },
+            Err(e) if on_miss.is_empty() => Ok(self.upstream_failed(e, response)),
+            Err(_) => self.act(on_miss, None, response).await,
         }
     }
 
@@ -977,44 +973,20 @@ impl<'a> Forwarding<'a> {
     /// it; with none the answer is the outcome, cached by its TTL
     async fn answered(
         mut self,
-        raw: Bytes,
-        upstream: Arc<str>,
-        checked: Option<Message>,
+        answer: Answer,
         response: &mut ResponseInfo,
     ) -> anyhow::Result<ForwardResult> {
         let (request, decision) = (self.request, self.decision);
+        let Answer {
+            raw,
+            upstream,
+            rcode,
+            ttl,
+            msg,
+            checked,
+        } = answer;
         response.upstream = Some(Source::Upstream(Arc::clone(&upstream)));
-        // Response rules read the parsed message, so they always take hickory's.
-        // Otherwise the quick parse is cached as read for a reply whose structure
-        // holds up (see `well_formed_reply`); any other is cached as hickory reads
-        // it, or, when only the quick parse can read it, not at all and goes on as it
-        // is; a reply neither can read fails the request
-        // 响应规则要读解析好的报文，所以总用 hickory 的。没有响应规则时，结构经得起检查的应答
-        // 照快速解析的结果缓存（见 `well_formed_reply`）；其余的照 hickory 读出的结果缓存，只有
-        // 快速解析读得了的不缓存、照样交出去；两边都读不了的，这次请求出错
-        let rules_read_the_reply = !(decision.response_matchers.is_empty()
-            && decision.response_actions_on_match.is_empty()
-            && decision.response_actions_on_miss.is_empty());
-        let quick = (!rules_read_the_reply)
-            .then(|| proto_utils::parse_response_quick(&raw))
-            .flatten();
-        // 回答检查已经放行的失败应答（见 [`Weighed`]）照它解析好的报文来 / A failure reply the
-        // answer check let through already (see [`Weighed`]) goes by its parsed message
-        let passed = checked.is_some();
-        let (rcode, ttl, msg) = match (checked, quick) {
-            (Some(msg), _) => (msg.metadata.response_code, extract_ttl(&msg), Some(msg)),
-            (None, Some(qr)) if proto_utils::well_formed_reply(&raw) => {
-                (qr.rcode, u64::from(qr.min_ttl), None)
-            }
-            (None, quick) => match (Message::from_bytes(&raw), quick) {
-                (Ok(msg), _) => (msg.metadata.response_code, extract_ttl(&msg), Some(msg)),
-                (Err(_), Some(qr)) => (qr.rcode, 0, None),
-                (Err(error), None) => {
-                    return Err(anyhow::Error::new(error).context("parse upstream response"));
-                }
-            },
-        };
-        let matched = passed
+        let matched = checked
             || rules::response_matches(
                 self.engine,
                 decision.response_matchers,
@@ -1047,86 +1019,57 @@ impl<'a> Forwarding<'a> {
         };
         if actions.is_empty() {
             let ttl = ttl_to_cache(self.engine, ttl, request.state.pipeline.min_ttl());
-            self.cache(&raw, rcode, Some(upstream), ttl);
+            self.route
+                .cache(self.engine, request, &raw, rcode, Some(upstream), ttl);
             self.hand_over(&raw);
             return Ok(ForwardResult::Success(raw));
         }
-        // 有响应规则时应答总经 hickory 解析，解析不了的上面已经让这次请求出错（见 `rules_read_the_reply`）
+        // 有响应规则时应答总经 hickory 解析，解析不了的算这次转发失败（见 `Self::read`）
         // With response rules the reply is always parsed by hickory, and one it cannot parse
-        // has failed the request above (see `rules_read_the_reply`)
+        // fails this forward (see `Self::read`)
         let msg = msg.expect("response rules have the reply parsed by hickory");
-        // 手里有应答时，这几个动作用不着请求本身，不必为它们解析一遍；分流规则常写的就是这几个。要用请求的动作，请求解析
-        // 不了就让这次请求出错，和上游失败以后一样；以前拿一个 TXID 为 0、没有问题的空报文去执行，答出去的客户端认不得。
-        // 用不着请求的动作不读它，给个空报文占位
-        // With an answer in hand these actions have no use for the request itself, and it is
-        // not parsed for them; these are what splitting rules usually write. For actions that
-        // use the request, a request that cannot be parsed fails, as after an upstream failure;
-        // they used to run on an empty message with TXID 0 and no question, answering what no
-        // client recognises. Actions with no use for the request never read it, an empty message
-        // holding its place
-        let needs_request = !actions.iter().all(|action| {
-            matches!(
-                action,
-                Action::Log { .. } | Action::Allow | Action::Continue
-            )
-        });
-        let req = if needs_request {
-            Message::from_bytes(&self.packet).context("parse the request for response actions")?
-        } else {
-            Message::new(
-                0,
-                hickory_proto::op::MessageType::Query,
-                hickory_proto::op::OpCode::Query,
-            )
-        };
         let ctx = ResponseContext { raw, msg, upstream };
-        self.act(actions, Some(ctx), req, response).await
+        self.act(actions, Some(ctx), response).await
     }
 
-    /// 上游失败、规则没有 miss 动作时给客户端的应答：所有上游尝试都耗尽了才这样答（别的错误原样交回），先找过期应答
-    /// （RFC 8767），没有就 SERVFAIL
+    /// 上游失败、规则没有 miss 动作时给客户端的应答：所有上游尝试都耗尽了、或者上游的应答读不了（见 [`Self::read`]）才
+    /// 这样答，先再查一次缓存（见 `check_cache_after_failure`），没有就 SERVFAIL
     /// The answer for the client when the upstream failed and the rule has no miss actions,
-    /// given once every upstream attempt is exhausted (any other error goes back as it is): a
-    /// stale answer (RFC 8767), or else SERVFAIL
-    fn upstream_failed(
-        &mut self,
-        e: anyhow::Error,
-        response: &mut ResponseInfo,
-    ) -> anyhow::Result<ForwardResult> {
-        if e.downcast_ref::<UpstreamFailure>().is_none() {
-            return Err(e);
-        }
+    /// given once every upstream attempt is exhausted or the upstream's reply cannot be read
+    /// (see [`Self::read`]): the cache looked in again (see `check_cache_after_failure`), or else
+    /// SERVFAIL
+    fn upstream_failed(&mut self, e: anyhow::Error, response: &mut ResponseInfo) -> ForwardResult {
         let (request, decision, route) = (self.request, self.decision, &*self.route);
         let withheld = UpstreamFailure::was_withheld(&e);
-        let stale = check_stale_cache_logged(
+        let cached = check_cache_after_failure(
             self.engine,
             &request.lookup(&route.key_pipeline, route.keys.slot),
             response,
         );
-        let answer = match stale {
-            Some(stale) => {
+        let answer = match cached {
+            Some(cached) => {
                 if withheld {
                     debug!(
-                        event = "serve_stale_on_upstream_withheld",
+                        event = "cached_answer_on_upstream_withheld",
                         upstream = %decision.upstream,
                         qname = %request.qname,
                         client_ip = %request.peer.ip(),
                         error = %e,
-                        "RFC 8767: flow control kept the query from the upstream, serving stale cache"
+                        "flow control kept the query from the upstream, answering from the cache"
                     );
                 } else {
                     crate::warn_sparse!(
-                        event = "serve_stale_on_upstream_failure",
+                        event = "cached_answer_on_upstream_failure",
                         upstream = %decision.upstream,
                         qname = %request.qname,
                         qtype = ?request.qtype,
                         client_ip = %request.peer.ip(),
                         pipeline = %route.pipeline,
                         error = %e,
-                        "RFC 8767: upstream failed, serving stale cache"
+                        "upstream failed, answering from the cache"
                     );
                 }
-                stale
+                cached
             }
             None => {
                 if withheld {
@@ -1152,59 +1095,46 @@ impl<'a> Forwarding<'a> {
                        "upstream failed"
                     );
                 }
-                // 问题名的文本总能读回成名字（见 `proto_utils::name_text`）；读不回时交回失败，由监听器自己回 SERVFAIL
-                // The question name's text always reads back as a name (see
-                // `proto_utils::name_text`); when it does not, the failure goes back and the
-                // listener answers SERVFAIL by itself
-                let Ok(servfail) = build_servfail_response_fast(
-                    request.tx_id,
-                    request.qname,
-                    u16::from(request.qtype),
-                    u16::from(request.qclass),
-                    request.flags.recursion_desired(),
-                ) else {
-                    return Err(e);
-                };
-                servfail
+                proto_utils::servfail_reply(request.packet)
             }
         };
         self.hand_over(&answer);
-        Ok(ForwardResult::Success(answer))
+        ForwardResult::Success(answer)
     }
 
     /// 执行 `actions`：带着回答检查看过的上游应答 `ctx`，或者上游失败以后不带，那时给出的结果是兜底（刷新到不了那里，
-    /// 见 [`Self::settle`]）。据应答给出的静态应答、continue 或跳转以后给出的，都不比那份应答在缓存里留得久（见
-    /// `static_ttl`）；兜底的不据哪份应答，不缓存
+    /// 见 [`Self::settle`]）。据应答给出的静态应答、continue 或跳转以后给出的，都不比这一路上回答检查据过的哪份应答在缓存里
+    /// 留得久（见 `Route::answer_ttl`、`static_ttl`）；兜底的不据哪份应答，不缓存，此后给出的也都不缓存
     /// Run `actions`: with the upstream answer `ctx` the answer check read, or without one after
     /// an upstream failure, when what they give is a fallback (a refresh never gets there, see
     /// [`Self::settle`]). A static answer given by the answer, or after a continue or a jump on
-    /// it, stays in the cache no longer than that answer may (see `static_ttl`); a fallback goes
-    /// by no answer and is not cached
+    /// it, stays in the cache no longer than any answer the checks on the way went by may (see
+    /// `Route::answer_ttl`, `static_ttl`); a fallback goes by no answer and is not cached, nor is
+    /// anything given after it
     async fn act(
         mut self,
         actions: &'a [Action],
         ctx: Option<ResponseContext>,
-        req: Message,
         response: &mut ResponseInfo,
     ) -> anyhow::Result<ForwardResult> {
         let request = self.request;
         let min_ttl = request.state.pipeline.min_ttl();
-        let answer_ttl = ctx.as_ref().map_or(0, |ctx| {
+        let answer_ttl = self.route.went_by(ctx.as_ref().map_or(0, |ctx| {
             ttl_to_cache(self.engine, extract_ttl(&ctx.msg), min_ttl)
-        });
+        }));
         let ctx = rules::ApplyResponseActionsContext {
             engine: self.engine,
             request,
             actions,
             ctx_opt: ctx,
-            req: &req,
             packet: &self.packet,
             pipeline_id: &self.route.pipeline,
             rule_name: self.decision.rule_name,
             remaining_jumps: self
                 .route
                 .response_jumps_left(request.state.pipeline.settings.response_jump_limit as usize),
-            trail: Some((&mut self.route.trail, self.forward_ecs)),
+            trail: &mut self.route.trail,
+            rule_ecs: self.forward_ecs,
         };
         // 响应动作和响应跳转的状态单独在堆上分配：不走这两条路的查询就不必为它们预留地方。
         // 以前每个等待中的查询都按最大的那条路（跳转）留着 8 KB，慢上游上挂着三万个查询时，
@@ -1221,7 +1151,9 @@ impl<'a> Forwarding<'a> {
                 // reject_failure_reply_on_refresh)
                 // 响应动作转发拿到的应答（见 reject_failure_reply_on_refresh）
                 reject_failure_reply_on_refresh(request.refresh.is_some(), &ctx.raw)?;
-                self.cache(
+                self.route.cache(
+                    self.engine,
+                    request,
                     &ctx.raw,
                     ctx.msg.metadata.response_code,
                     Some(ctx.upstream.clone()),
@@ -1240,7 +1172,14 @@ impl<'a> Forwarding<'a> {
                 // for this request, not the answer to the question, and is not cached
                 // (`answer_ttl` is 0): the cache is shared by every requester, and cached it
                 // would go on serving after the upstream recovered, until the entry expired
-                self.cache(&bytes, rcode, None, static_ttl(ttl, answer_ttl));
+                self.route.cache(
+                    self.engine,
+                    request,
+                    &bytes,
+                    rcode,
+                    None,
+                    static_ttl(ttl, answer_ttl),
+                );
                 self.hand_over(&bytes);
                 response.upstream = Some(Source::Static);
                 Ok(ForwardResult::Success(bytes))
@@ -1254,7 +1193,6 @@ impl<'a> Forwarding<'a> {
                     pipeline,
                     packet: Bytes::copy_from_slice(&self.packet),
                     carried: self.forward_ecs,
-                    answer_ttl,
                 })
             }
             ResponseActionResult::Continue { ctx } => {
@@ -1270,38 +1208,9 @@ impl<'a> Forwarding<'a> {
                 // 那一条的等待者自己转发。以前上游失败以后在这里 defuse 守卫，条目留在表里却
                 // 没人持有，下一条转发会一直等它到监听器超时。
                 self.keep_for_request();
-                Ok(ForwardResult::Continue {
-                    ctx: Box::new(ctx),
-                    answer_ttl,
-                })
+                Ok(ForwardResult::Continue { ctx: Box::new(ctx) })
             }
         }
-    }
-
-    /// 在这次转发的问题下写一条缓存，留 `ttl` 秒，适用于 trail 接受的请求方；`ttl` 为 0 时不写（见 `ttl_to_cache`、
-    /// `static_ttl`）
-    /// Cache an answer under this forward's question for `ttl` seconds, for the requesters
-    /// the trail admits; with `ttl` 0 nothing is cached (see `ttl_to_cache`, `static_ttl`)
-    fn cache(&self, bytes: &Bytes, rcode: ResponseCode, upstream: Option<Arc<str>>, ttl: u32) {
-        if ttl == 0 {
-            return;
-        }
-        let (request, route) = (self.request, &*self.route);
-        self.engine.insert_dns_cache_entry(
-            route.keys.slot,
-            CacheEntry::from_response(
-                bytes.clone(),
-                rcode,
-                upstream,
-                Arc::clone(request.qname),
-                Arc::clone(&route.key_pipeline),
-                u16::from(request.qtype),
-                u16::from(request.qclass),
-                route.keys.flags,
-                ttl,
-            )
-            .with_reach(route.trail.clone()),
-        );
     }
 
     /// 把最终应答交给等在这次转发登记的条目上的请求 / Hand the final answer to the requests
