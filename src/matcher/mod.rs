@@ -1015,6 +1015,13 @@ pub(crate) fn parse_rcode(rcode: &str) -> Option<ResponseCode> {
     }
 }
 
+/// `static_ip_response` 的地址：逗号分隔的 IPv4/IPv6 地址，有一个读不出来就是 None
+/// The addresses of a `static_ip_response`: comma-separated IPv4/IPv6 addresses;
+/// None when any of them cannot be read
+pub(crate) fn static_ips(ips: &str) -> Option<Vec<IpAddr>> {
+    ips.split(',').map(|ip| ip.trim().parse().ok()).collect()
+}
+
 /// `qtype`、`response_type` 写的类型：hickory 认得的名字（HTTPS、SVCB、CAA、ANY……），或者 RFC 3597 的 `TYPEnnn`。以前只认
 /// 十种，「HTTPS 查询回 NODATA」这样的规则写不出来，整份配置被拒
 /// The type a `qtype` or `response_type` writes: a name hickory knows (HTTPS, SVCB, CAA, ANY…),

@@ -92,7 +92,7 @@ pub struct RuntimeResponseMatcherWithOp {
 /// `canonical_net`). A path (DoH) and parameters (`?sni=`) are not read
 #[inline]
 fn try_parse_upstream_ip(upstream: &str) -> Option<IpAddr> {
-    let address = crate::engine::upstream::answered_address(upstream);
+    let address = config::answered_address(upstream);
     let host = address.split(['/', '?']).next().unwrap_or(address);
     host.parse::<SocketAddr>()
         .ok()
@@ -106,9 +106,7 @@ impl RuntimeResponseMatcher {
         Ok(match m {
             config::ResponseMatcher::UpstreamEquals { value } => {
                 RuntimeResponseMatcher::UpstreamEquals {
-                    addresses: crate::engine::upstream::addresses(&value)
-                        .map(Box::from)
-                        .collect(),
+                    addresses: config::upstream_addresses(&value).map(Box::from).collect(),
                     value: Arc::from(value),
                 }
             }
@@ -228,7 +226,7 @@ impl RuntimeResponseMatcher {
         match self {
             RuntimeResponseMatcher::UpstreamEquals { value, addresses } => {
                 upstream == value.as_ref() || {
-                    let answered = crate::engine::upstream::answered_address(upstream);
+                    let answered = config::answered_address(upstream);
                     addresses.iter().any(|address| **address == *answered)
                 }
             }

@@ -116,6 +116,6 @@ pub use types::{EngineInner, FastPathResponse};
 
 pub use response::extract_ttl;
 pub(crate) use response::{
-    make_static_cname_answer, make_static_ip_answer, make_static_txt_answer, static_ips,
+    make_static_cname_answer, make_static_ip_answer, make_static_txt_answer,
 };
 pub use rules::Decision;

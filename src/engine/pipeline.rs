@@ -6,6 +6,7 @@ use hickory_proto::rr::{DNSClass, RecordType};
 use smallvec::SmallVec;
 
 use crate::config::{Action, Transport};
+use crate::matcher::advanced_rule::PrecomputedAction;
 use crate::matcher::{
     GeoManagers, RequestFacts, Requester, RuntimePipeline, RuntimePipelineConfig, eval_match_chain,
     parse_rcode,
@@ -459,6 +460,42 @@ impl Engine {
 
         None
     }
+}
+
+/// 快速路径上，`pipeline` 里第一条命中请求 `facts` 的规则当场作出的决定（见 `RuntimeRule::precomputed`），和规则名。
+/// 候选和判断都和完整路径一样（见 `Engine::evaluate_rules`），只求值到最后一条能当场决定的规则为止（见
+/// `RuntimePipeline::last_precomputed`）。第一条命中的规则当场决定不了（转发、先记日志的）时为 None，连同规则顺序一起留给
+/// 完整路径：「domain_regex → forward」不会被后面的「domain_suffix → static_ip」越过
+/// What the first rule of `pipeline` matching request `facts` decides on the spot on the fast
+/// path (see `RuntimeRule::precomputed`), with the rule's name. Candidates and judgement are
+/// those of the full path (see `Engine::evaluate_rules`), evaluated only up to the last rule
+/// that decides on the spot (see `RuntimePipeline::last_precomputed`). None when the first
+/// rule matching does not decide on the spot (a forward, one logging first), left to the full
+/// path with the rule order: a "domain_regex → forward" is not passed over for a later
+/// "domain_suffix → static_ip"
+pub(crate) fn fast_static_match<'a>(
+    pipeline: &'a RuntimePipeline,
+    facts: &RequestFacts<'_>,
+    geo: GeoManagers<'_>,
+) -> Option<(&'a PrecomputedAction, &'a str)> {
+    let last = pipeline.last_precomputed?;
+    let candidates = pipeline.index.get_candidates(facts.qname, facts.qtype);
+    // 候选按规则顺序排好（见 `RuleIndex::get_candidates`）/ Candidates come in rule order (see
+    // `RuleIndex::get_candidates`)
+    let idx = candidates
+        .into_iter()
+        .take_while(|&idx| idx <= last)
+        .find(|&idx| {
+            eval_match_chain(
+                &pipeline.rules[idx].matchers,
+                |m| m.operator,
+                |m| m.matcher.matches(facts, geo),
+            )
+        })?;
+    let rule = &pipeline.rules[idx];
+    rule.precomputed
+        .as_ref()
+        .map(|action| (action, &*rule.name))
 }
 
 #[cfg(test)]
