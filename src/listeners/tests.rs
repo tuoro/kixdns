@@ -2979,8 +2979,29 @@ fn slow_and_fast_engine(upstream: SocketAddr) -> Engine {
 
 /// `name` 的 A 查询，ID 为 `id`，带长度前缀 / An A query for `name` with ID `id`, length-prefixed
 fn tcp_frame(name: &str, id: u16) -> Vec<u8> {
-    let packet = query(name, id);
-    [&(packet.len() as u16).to_be_bytes()[..], &packet].concat()
+    framed(&query(name, id))
+}
+
+/// `packet` 带上长度前缀 / `packet` with its length prefix
+fn framed(packet: &[u8]) -> Vec<u8> {
+    [&(packet.len() as u16).to_be_bytes()[..], packet].concat()
+}
+
+/// 不带 OPT 的 `packet` 补上一条只有填充选项的 OPT，正好 `len` 字节，照样当场答得上
+/// `packet`, carrying no OPT, with one holding a padding option alone added, exactly `len`
+/// bytes long and answered on the spot all the same
+fn padded_to(mut packet: Vec<u8>, len: usize) -> Vec<u8> {
+    // OPT 的名字、类型、载荷、TTL 和 RDLENGTH 共 11 字节，填充选项的代码和长度 4 字节
+    // The OPT's name, type, payload, TTL and RDLENGTH take 11 bytes, the padding option's code
+    // and length 4
+    let pad = (len - packet.len() - 15) as u16;
+    packet[11] = 1;
+    packet.extend_from_slice(&[0, 0, 41, 0x04, 0xD0, 0, 0, 0, 0]);
+    packet.extend_from_slice(&(4 + pad).to_be_bytes());
+    packet.extend_from_slice(&[0, 12]);
+    packet.extend_from_slice(&pad.to_be_bytes());
+    packet.resize(len, 0);
+    packet
 }
 
 /// 从连接上读一个回答，返回它的 ID / Reads one answer off the connection and returns its ID
@@ -3068,12 +3089,7 @@ async fn a_message_longer_than_one_read_is_read_whole() {
     let mut long = query("long.example.", 1);
     long.resize(crate::proto_utils::MAX_QUERY_LEN, 0);
     assert!(2 + long.len() > TCP_READ_CHUNK);
-    let frames = [
-        &(long.len() as u16).to_be_bytes()[..],
-        &long,
-        &tcp_frame("after.example.", 2),
-    ]
-    .concat();
+    let frames = [framed(&long), tcp_frame("after.example.", 2)].concat();
     client.write_all(&frames).await.unwrap();
     // 多出来的字节让完整解析出错：回 SERVFAIL 或不回都行，后面那个一定要答
     // The extra bytes make the full parse fail: a SERVFAIL or no answer is fine, the one after must be answered
@@ -3158,27 +3174,46 @@ async fn a_connection_waiting_on_an_answer_keeps_reading() {
     server.await.expect("connection handler");
 }
 
-/// 声明的长度超过 MAX_QUERY_LEN 的消息不等它发完，连接当场关掉，之前的查询照样答。以前按长度前缀先留出 64 KiB，
-/// 再等正文等一个读超时：几千条这样的连接就占满路由器的内存
-/// A message declaring more than MAX_QUERY_LEN is not waited for: the connection closes there
-/// and then, the queries before it still answered. A length prefix used to set aside 64 KiB
-/// and wait a read timeout for the body: a few thousand such connections filled a router's memory
+/// 声明的长度超过 MAX_QUERY_LEN 的消息不答：不等它发完，连接当场关掉，之前的查询照样答；之前最长的查询把读缓冲撑大、它整个
+/// 一次读进来时也一样。只发一个长度前缀的连接于是占不住 64 KiB 的读缓冲和一个读超时，几千条那样的连接占不满路由器的内存
+/// A message declaring more than MAX_QUERY_LEN goes unanswered: it is not waited for, the
+/// connection closing there and then with the queries before it still answered, and so too
+/// when the longest query before it has grown the read buffer and it comes in whole in one
+/// read. A connection sending a length prefix alone thus holds neither 64 KiB of read buffer
+/// nor a read timeout, and a few thousand such connections cannot fill a router's memory
 #[tokio::test]
 async fn a_message_longer_than_any_query_closes_the_connection() {
-    let (mut client, server) = tcp_connection_timing_out(static_engine()).await;
-    let mut sent = tcp_frame("before.example.", 7);
-    sent.extend_from_slice(&u16::MAX.to_be_bytes());
-    let started = std::time::Instant::now();
-    client.write_all(&sent).await.unwrap();
-    assert_eq!(read_answer_id(&mut client).await, 7);
-    let mut rest = [0u8; 1];
-    assert_eq!(client.read(&mut rest).await.unwrap(), 0, "closed");
-    assert!(
-        started.elapsed() < SHORT_READ_TIMEOUT,
-        "{:?}",
-        started.elapsed()
-    );
-    server.await.expect("connection handler");
+    const { assert!(2 + MAX_QUERY_LEN > TCP_READ_CHUNK) };
+    let too_long = framed(&padded_to(query("too-long.example.", 9), MAX_QUERY_LEN + 1));
+    // 先只发它的长度前缀；再在最长的查询之后整个发：最长的查询一次读不完，读缓冲为它涨过
+    // First its length prefix alone; then the whole of it after the longest query, which takes
+    // more than one read and grows the read buffer
+    let before = [
+        (tcp_frame("before.example.", 7), &too_long[..2]),
+        (
+            framed(&padded_to(query("before.example.", 7), MAX_QUERY_LEN)),
+            &too_long[..],
+        ),
+    ];
+    for (before, sent) in before {
+        let (mut client, server) = tcp_connection_timing_out(static_engine()).await;
+        client.write_all(&before).await.unwrap();
+        assert_eq!(read_answer_id(&mut client).await, 7);
+        let started = std::time::Instant::now();
+        client.write_all(sent).await.unwrap();
+        let mut rest = [0u8; 1];
+        assert_eq!(
+            client.read(&mut rest).await.unwrap(),
+            0,
+            "closed, unanswered"
+        );
+        assert!(
+            started.elapsed() < SHORT_READ_TIMEOUT,
+            "{:?}",
+            started.elapsed()
+        );
+        server.await.expect("connection handler");
+    }
 }
 
 /// 半截消息一点点地发也不能一直挂着：正文从开始等起总共一个读超时，中途到的字节不重新计时
@@ -3825,10 +3860,7 @@ async fn udp_exchange(client: &UdpSocket, server: SocketAddr, query: &[u8]) -> (
 /// it took
 async fn tcp_exchange(client: &mut TcpStream, query: &[u8]) -> (Message, Duration) {
     let start = std::time::Instant::now();
-    client
-        .write_all(&[&(query.len() as u16).to_be_bytes()[..], query].concat())
-        .await
-        .unwrap();
+    client.write_all(&framed(query)).await.unwrap();
     let answer = read_tcp_answer(client).await;
     (Message::from_bytes(&answer).unwrap(), start.elapsed())
 }

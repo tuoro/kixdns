@@ -211,6 +211,10 @@ async fn queries_riding_a_connection_whose_0rtt_is_rejected_are_sent_again() {
 
     let client = doq_test_client(format!("doq://{second}?sni=localhost"), client_tls, true);
     let (a, b) = (udp_test_query("a.example"), udp_test_query("b.example"));
+    // 上一次完整握手连上的是第二台，它后来换了票据的密钥，不认先前的票据：0-RTT 发往它，被拒
+    // The last full handshake reached the second, which has since changed its ticket keys and
+    // knows no earlier ticket: 0-RTT goes to it and is rejected
+    *client.zero_rtt.reached.lock() = Some(second);
     let (made_it, rode_it) = tokio::join!(
         client.send(&a, Duration::from_secs(2)),
         client.send(&b, Duration::from_secs(2)),
@@ -218,7 +222,7 @@ async fn queries_riding_a_connection_whose_0rtt_is_rejected_are_sent_again() {
     made_it.expect("the query that made the connection is sent again");
     rode_it.expect("so is the one riding it");
     assert!(
-        client.zero_rtt_rejected.load(Ordering::Relaxed),
+        client.zero_rtt.rejected.load(Ordering::Relaxed),
         "0-RTT is off for this upstream from then on"
     );
     // 两个查询的重发都在池里这一条连接上答完：没有各建一条 / Both resends were answered on
@@ -350,7 +354,7 @@ fn doq_test_client(upstream: String, client_tls: ClientConfig, enable_0rtt: bool
     DoqMuxClient::new(
         Arc::from(upstream),
         doq_test_runtime(client_tls, enable_0rtt),
-        Arc::new(AtomicBool::new(false)),
+        Arc::default(),
     )
 }
 
@@ -644,7 +648,7 @@ async fn a_doq_timeout_without_0rtt_leaves_0rtt_on() {
         .await;
     assert!(result.is_err(), "the upstream never answers `slow`");
     assert!(
-        !client.zero_rtt_rejected.load(Ordering::Relaxed),
+        !client.zero_rtt.rejected.load(Ordering::Relaxed),
         "a timeout on a connection that did not use 0-RTT says nothing about 0-RTT"
     );
 }
@@ -835,42 +839,165 @@ async fn loopback_names() -> (crate::engine::test_support::Upstream, Arc<Bootstr
     (server, bootstrap)
 }
 
+/// 一个端口上只有 ::1 有 DoQ 上游，127.0.0.1 上同一个端口的 UDP 收下握手却从不读；`early_data` 时上游收早期数据、
+/// 客户端发早期数据。给出端口、客户端的 TLS 设置和那个不回应的 socket；IPv6 环回不可用时是 None
+/// A port with a DoQ upstream on ::1 alone, UDP on the same port of 127.0.0.1 taking the
+/// handshakes and never reading them; with `early_data` the upstream takes early data and the
+/// client sends it. Gives the port, the client's TLS settings and the socket that never answers;
+/// None with IPv6 loopback unavailable
+fn answering_on_ipv6_alone(early_data: bool) -> Option<(u16, ClientConfig, std::net::UdpSocket)> {
+    let answer = |_: usize, _: &str| DoqReply::Answer(Duration::ZERO);
+    for _ in 0..20 {
+        let (mut server, mut client_tls) = localhost_tls(&[b"doq"]);
+        if early_data {
+            server.max_early_data_size = u32::MAX;
+            client_tls.enable_early_data = true;
+        }
+        let v6 = spawn_doq_upstream_on(
+            "[::1]:0".parse().unwrap(),
+            server,
+            Duration::ZERO,
+            answer,
+            None,
+        )?;
+        if let Ok(silent) = std::net::UdpSocket::bind(("127.0.0.1", v6.port())) {
+            return Some((v6.port(), client_tls, silent));
+        }
+    }
+    panic!("no port free on both loopbacks in 20 tries");
+}
+
 /// DoQ 也一样：127.0.0.1 上同一个端口的 UDP 从不回应，过 [`ATTEMPT_DELAY`] 就在 ::1 上握手。以前只连 IPv4 的那一个
 /// DoQ alike: with UDP on the same port of 127.0.0.1 never answering, the handshake goes to ::1
 /// after [`ATTEMPT_DELAY`]. The IPv4 address used to be the only one tried
 #[tokio::test]
 async fn a_doq_connect_moves_on_from_an_address_that_does_not_answer() {
     let (_server, bootstrap) = loopback_names().await;
-    let answer = |_: usize, _: &str| DoqReply::Answer(Duration::ZERO);
-    let mut tries = 0;
-    let (port, client_tls, _silent) = loop {
-        tries += 1;
-        assert!(tries <= 20, "no port free on both loopbacks in 20 tries");
-        let (server, client_tls) = localhost_tls(&[b"doq"]);
-        let Some(v6) = spawn_doq_upstream_on(
-            "[::1]:0".parse().unwrap(),
-            server,
-            Duration::ZERO,
-            answer,
-            None,
-        ) else {
-            eprintln!("skipped: IPv6 loopback unavailable on this host");
-            return;
-        };
-        // 收下发来的握手却从不读 / Takes the handshakes sent to it but never reads them
-        if let Ok(silent) = std::net::UdpSocket::bind(("127.0.0.1", v6.port())) {
-            break (v6.port(), client_tls, silent);
-        }
+    let Some((port, client_tls, _silent)) = answering_on_ipv6_alone(false) else {
+        eprintln!("skipped: IPv6 loopback unavailable on this host");
+        return;
     };
     let client = DoqMuxClient::new(
-        Arc::from(format!("doq://upstream.test:{port}?sni=localhost")),
+        Arc::from(format!("upstream.test:{port}?sni=localhost")),
         doq_test_runtime_through(client_tls, false, bootstrap),
-        Arc::new(AtomicBool::new(false)),
+        Arc::default(),
     );
     client
         .send(&udp_test_query("named.example"), Duration::from_secs(2))
         .await
         .expect("the second address answers");
+}
+
+/// 恢复会话的 0-RTT 只发往上一次完整握手连上的地址：127.0.0.1 不回应、::1 上的上游答了第一个查询，重连时 0-RTT
+/// 发往 ::1，当场答上。以前 0-RTT 的连接当场就算连上，IPv4 排在前，0-RTT 就发往不回应的 127.0.0.1，查询等满时限，
+/// 0-RTT 也被关掉
+/// A resumed session's 0-RTT goes only to the address the last full handshake reached: with
+/// 127.0.0.1 not answering and the upstream on ::1 having answered the first query, the
+/// reconnect sends 0-RTT to ::1 and is answered at once. A 0-RTT connection used to count as
+/// made at once, IPv4 coming first, so 0-RTT went to the silent 127.0.0.1, the query sat out its
+/// limit and 0-RTT was switched off
+#[tokio::test]
+async fn zero_rtt_goes_to_the_address_the_last_handshake_reached() {
+    let (_server, bootstrap) = loopback_names().await;
+    let Some((port, client_tls, _silent)) = answering_on_ipv6_alone(true) else {
+        eprintln!("skipped: IPv6 loopback unavailable on this host");
+        return;
+    };
+    let client = DoqMuxClient::new(
+        Arc::from(format!("upstream.test:{port}?sni=localhost")),
+        doq_test_runtime_through(client_tls, true, bootstrap),
+        Arc::default(),
+    );
+    client
+        .send(&udp_test_query("first.example"), Duration::from_secs(2))
+        .await
+        .expect("the full handshake reaches ::1");
+    // 等会话票据到 / The session ticket arrives
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    client.pooled.store(None);
+    let started = tokio::time::Instant::now();
+    client
+        .send(&udp_test_query("second.example"), Duration::from_secs(1))
+        .await
+        .expect("0-RTT to ::1 is answered");
+    assert!(started.elapsed() < Duration::from_millis(200), "at once");
+    let pooled = client.pooled.load_full().expect("a pooled connection");
+    assert!(pooled.used_0rtt, "the reconnect used 0-RTT");
+    assert!(pooled.conn.remote_address().is_ipv6(), "to ::1");
+}
+
+/// 0-RTT 的连接上超时，而上游连握手都没回：是这个地址不通，0-RTT 照用。下一次建连不在它上面盲发 0-RTT，照常完整
+/// 握手；那次连上以后，再重连又用 0-RTT。以前这样的超时也把 0-RTT 关到重启
+/// A timeout on a 0-RTT connection whose handshake the upstream never answered: the address is
+/// down, and 0-RTT stays on. The next connect sends no 0-RTT blindly to it but shakes hands in
+/// full; once that one is through, reconnecting uses 0-RTT again. Such a timeout used to switch
+/// 0-RTT off until a restart too
+#[tokio::test]
+async fn a_0rtt_handshake_never_answered_leaves_0rtt_on() {
+    let (mut server, mut client_tls) = localhost_tls(&[b"doq"]);
+    server.max_early_data_size = u32::MAX;
+    client_tls.enable_early_data = true;
+    let crypto =
+        quinn::crypto::rustls::QuicServerConfig::try_from(server).expect("quic server crypto");
+    let endpoint = QuicEndpoint::server(
+        quinn::ServerConfig::with_crypto(Arc::new(crypto)),
+        "127.0.0.1:0".parse().unwrap(),
+    )
+    .expect("bind the DoQ test upstream");
+    let addr = endpoint.local_addr().unwrap();
+    // 关着时新来的握手一概不回，就像这个地址不通 / While off, every new handshake goes unanswered,
+    // as for an address that is down
+    let answering = Arc::new(AtomicBool::new(true));
+    tokio::spawn({
+        let answering = Arc::clone(&answering);
+        async move {
+            while let Some(incoming) = endpoint.accept().await {
+                if !answering.load(Ordering::SeqCst) {
+                    incoming.ignore();
+                    continue;
+                }
+                tokio::spawn(async move {
+                    let Ok(conn) = incoming.await else { return };
+                    while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                        let Ok(mut frame) = recv.read_to_end(MAX_DNS_MESSAGE_SIZE + 2).await else {
+                            continue;
+                        };
+                        frame[4] |= 0x80;
+                        let _ = send.write_all(&frame).await;
+                        let _ = send.finish();
+                    }
+                });
+            }
+        }
+    });
+    let client = doq_test_client(format!("{addr}?sni=localhost"), client_tls, true);
+    let target = parse_doq_target(&client.upstream).expect("doq target");
+    client
+        .send(&udp_test_query("first.example"), Duration::from_secs(2))
+        .await
+        .expect("a full handshake");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    answering.store(false, Ordering::SeqCst);
+    client.pooled.store(None);
+    client
+        .send(
+            &udp_test_query("unanswered.example"),
+            Duration::from_millis(300),
+        )
+        .await
+        .expect_err("the handshake goes unanswered");
+    answering.store(true, Ordering::SeqCst);
+    let full = client.get_or_connect(&target).await.expect("connect");
+    assert!(
+        !full.used_0rtt,
+        "no 0-RTT sent blindly to that address again"
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    client.pooled.store(None);
+    let resumed = client.get_or_connect(&target).await.expect("connect");
+    assert!(resumed.used_0rtt, "0-RTT stays on");
 }
 
 /// 写成主机名的 TCP、DoT、DoQ 上游经 Bootstrap 解析：`upstream.test` 只有本机的 bootstrap 服务器认得，
@@ -911,7 +1038,7 @@ async fn named_tcp_dot_and_doq_upstreams_are_resolved_through_bootstrap() {
             bootstrap,
             ..runtime
         }),
-        Arc::new(AtomicBool::new(false)),
+        Arc::default(),
     )
     .send(&query, budget)
     .await
@@ -954,7 +1081,7 @@ async fn doq_pool_shares_what_one_connection_learned_about_0rtt() {
 
     pool.clients[0].disable_zero_rtt();
     assert!(
-        pool.clients[1].zero_rtt_rejected.load(Ordering::Relaxed),
+        pool.clients[1].zero_rtt.rejected.load(Ordering::Relaxed),
         "what one connection learned about 0-RTT holds for the whole upstream"
     );
 }
@@ -1024,7 +1151,7 @@ async fn an_unused_doq_connection_closes_once_idle_despite_its_keepalive() {
     let client = DoqMuxClient::new(
         Arc::from(format!("{addr}?sni=localhost")),
         doq_runtime_aging(client_tls, false, Bootstrap::system(), 50, aging),
-        Arc::new(AtomicBool::new(false)),
+        Arc::default(),
     );
     client
         .send(&udp_test_query("a.example"), Duration::from_millis(100))

@@ -496,9 +496,9 @@ async fn run_response_actions(
                 // fails this forward as the upstream failing does
                 let forwarded = crate::engine::upstream::forward_upstream(
                     ctx.engine,
+                    &request.state.pipeline.settings,
                     packet,
                     &upstream_addr,
-                    request.state.pipeline.upstream_timeout(),
                     use_transport,
                     pre_split_upstreams.as_ref(),
                     request.observed,
