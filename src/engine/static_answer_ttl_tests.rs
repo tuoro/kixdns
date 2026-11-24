@@ -110,14 +110,15 @@ fn cached_record_ttls(engine: &Engine) -> Vec<Vec<u32>> {
 }
 
 /// 带 TTL 120 的静态 CNAME、带 TTL 300 的静态地址、不带记录的 deny，依据不同 TTL 的上游回答、在不同的设置下缓存多久：
-/// 回答检查的动作给出的、回答检查 continue 或跳转以后的规则给出的都一样。带记录的取自己的 TTL 和那份回答在缓存里能留的
+/// 回答检查的动作给出的、回答检查 continue 或跳转以后的规则给出的（continue 之后再跳过去的也算）都一样。带记录的取自己的
+/// TTL 和那份回答在缓存里能留的
 /// 时间中短的那个，交出去的记录也是这个 TTL；不带记录的就按那份回答的；那份回答不进缓存（TTL 为 0）时据它给的也不缓存，
 /// 记录的 TTL 交出去也是 0。以前不看那份回答：静态地址写死的 300 秒比回答的 60 秒长，规则早该给别的了还在用；deny 按
 /// min_ttl，默认为 0 时不缓存，防重绑定的 deny 每次都要再问一遍上游。后来条目照那份回答缓存了，记录却照原样交出 300 秒
 /// How long a static CNAME with TTL 120, a static address with TTL 300 and a deny with no
 /// records are cached, going by upstream answers of various TTLs under various settings:
 /// given by an answer check's actions, or by the rules after an answer check continued or
-/// jumped, alike. One with records takes the shorter of its own TTL and how long that answer
+/// jumped (a jump after a continue included), alike. One with records takes the shorter of its own TTL and how long that answer
 /// may stay in the cache, its records going out with that TTL too; one without takes that
 /// answer's; with that answer kept out of the cache (TTL 0) nothing given by it is cached
 /// either, its records going out with a TTL of 0. It used to ignore that answer: the static
@@ -164,6 +165,16 @@ async fn a_static_answer_on_an_upstream_answer_is_cached_no_longer_than_that_ans
                         &upstream,
                         json!([{ "type": "jump_to_pipeline", "pipeline": "static" }]),
                     )]},
+                    { "id": "static", "rules": [rule("static", any(), json!([action]))] },
+                ]),
+            ),
+            (
+                "after a continue and a request-phase jump",
+                json!([
+                    { "id": "main", "rules": [
+                        checked(&upstream, json!([{ "type": "continue" }])),
+                        rule("jump", any(), json!([{ "type": "jump_to_pipeline", "pipeline": "static" }])),
+                    ]},
                     { "id": "static", "rules": [rule("static", any(), json!([action]))] },
                 ]),
             ),
@@ -657,17 +668,18 @@ async fn a_fallback_after_an_upstream_failure_stays_uncached_past_a_later_check(
 }
 
 /// 规则直接给出的静态应答不进响应缓存：快速路径、规则缓存下次照样直接给出，记在这条规则名下。请求阶段跳过去以后直接给出的也
-/// 一样，哪怕跳之前越过了一份应答：那是目标 pipeline 直接给的，直接进它的请求也照样直接拿到。以前开着 min_ttl 时按它缓存，
-/// 之后的请求从响应缓存拿到它，查询日志和规则计数里就没有这条规则
+/// 一样：那是目标 pipeline 直接给的，直接进它的请求也照样直接拿到（据过上游的回答以后再跳过去的不是直接给出的，见
+/// `a_static_answer_on_an_upstream_answer_is_cached_no_longer_than_that_answer`）。以前开着 min_ttl 时按它缓存，之后的请求
+/// 从响应缓存拿到它，查询日志和规则计数里就没有这条规则
 /// A static answer the rules give outright stays out of the response cache: the fast path
 /// and the rule cache give it again outright, under its rule. So does one given outright
-/// after a request-phase jump, even with an answer passed over before the jump: the target
-/// pipeline gives it outright, to the requests entering it directly too. With min_ttl on it
-/// used to be cached for min_ttl, later requests taking it from the response cache, absent
-/// from the query log and rule counts under the rule
+/// after a request-phase jump: the target pipeline gives it outright, to the requests entering
+/// it directly too (one reached by a jump after an upstream's answer has been gone by is not
+/// given outright, see `a_static_answer_on_an_upstream_answer_is_cached_no_longer_than_that_answer`).
+/// With min_ttl on it used to be cached for min_ttl, later requests taking it from the response
+/// cache, absent from the query log and rule counts under the rule
 #[tokio::test]
 async fn a_static_answer_the_rules_give_outright_is_not_cached() {
-    let upstream = answering_upstream(UPSTREAM_ANSWER, 600).await.address;
     for action in [
         json!({ "type": "static_ip_response", "ip": STATIC.to_string() }),
         json!({ "type": "deny" }),
@@ -681,7 +693,6 @@ async fn a_static_answer_the_rules_give_outright_is_not_cached() {
                 "after a request-phase jump",
                 json!([
                     { "id": "main", "rules": [
-                        checked(&upstream, json!([{ "type": "continue" }])),
                         rule("jump", any(), json!([{ "type": "jump_to_pipeline", "pipeline": "static" }])),
                     ]},
                     { "id": "static", "rules": [rule("static", any(), json!([action]))] },

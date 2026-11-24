@@ -423,8 +423,9 @@ pub(crate) fn build_cache_namespaces(cfg: &RuntimePipelineConfig) -> FxHashMap<A
             // processing, so they are part of every pipeline namespace.
             hash_global_settings_semantics(&cfg.settings, &mut hasher);
             hash_pipeline_semantics(pipeline, &mut hasher);
-            // 回答检查跳过去拿到的应答也缓存在这个 pipeline 的键下 / The answers an answer check's jump gets
-            // are cached under this pipeline's key too
+            // 据过上游的回答以后跳过去拿到的应答也缓存在这个 pipeline 的键下（见 `RuntimePipeline::answered_through`）
+            // The answers jumps get once an upstream's answer has been gone by are cached under this
+            // pipeline's key too (see `RuntimePipeline::answered_through`)
             for &reached in &pipeline.answered_through {
                 hash_pipeline_semantics(&cfg.pipelines[reached], &mut hasher);
             }
@@ -750,6 +751,51 @@ mod tests {
 
         assert_ne!(before.get("first"), after.get("first"));
         assert_eq!(before.get("second"), after.get("second"));
+    }
+
+    /// 回答检查 continue 之后规则跳到的 pipeline 算进入口的命名空间：跳过去拿到的应答缓存在入口的键下（见
+    /// `Route::enter`），它一改，那些应答就不再用。直接跳过去的 pipeline 不算，那里的应答缓存在它自己的键下。以前只算回答检查
+    /// 的跳转，目标改了，入口键下按旧配置得出的应答照用到过期
+    /// A pipeline the rules jump to after an answer check continued goes into the entry's
+    /// namespace: what is got over there is cached under the entry's key (see `Route::enter`),
+    /// and once it changes those answers are used no more. One jumped to outright does not, its
+    /// answers cached under its own key. Only answer checks' jumps used to count, the answers
+    /// under the entry's key from the old configuration served on after the target changed,
+    /// until they expired
+    #[test]
+    fn a_jump_target_after_a_continue_goes_into_the_namespace() {
+        let namespaces = |target_upstream: &str| {
+            let jump = serde_json::json!({
+                "name": "jump",
+                "matchers": [{ "type": "any" }],
+                "actions": [{ "type": "jump_to_pipeline", "pipeline": "target" }]
+            });
+            let config: PipelineConfig = serde_json::from_value(serde_json::json!({
+                "settings": { "default_upstream": "1.1.1.1:53" },
+                "pipelines": [
+                    { "id": "continued", "rules": [
+                        {
+                            "name": "check",
+                            "matchers": [{ "type": "any" }],
+                            "actions": [{ "type": "forward", "upstream": "8.8.8.8:53" }],
+                            "response_actions_on_match": [{ "type": "continue" }]
+                        },
+                        jump
+                    ]},
+                    { "id": "outright", "rules": [jump] },
+                    { "id": "target", "rules": [{
+                        "name": "forward",
+                        "matchers": [{ "type": "any" }],
+                        "actions": [{ "type": "forward", "upstream": target_upstream }]
+                    }]}
+                ]
+            }))
+            .expect("parse config");
+            build_cache_namespaces(&RuntimePipelineConfig::from_config(config).expect("build"))
+        };
+        let (before, after) = (namespaces("9.9.9.9:53"), namespaces("9.9.9.10:53"));
+        assert_ne!(before.get("continued"), after.get("continued"));
+        assert_eq!(before.get("outright"), after.get("outright"));
     }
 
     #[test]
