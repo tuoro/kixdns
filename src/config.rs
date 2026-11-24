@@ -1228,28 +1228,31 @@ pub struct ValidationReport {
 /// 一份配置编译成运行时配置，热重载、面板的校验和试用都走这里，拒掉的和启动时会让内核起不来的一样：会悄悄做成
 /// 别的事的写法（见 [`problems`]，一条不落地放在错误 [`Problems`] 里）、编译不了的匹配器和正则，以及监听地址和 DoH 的
 /// 前提（见 [`GlobalSettings::listeners`]）。以前热重载不查监听地址，`bind_udp` 写错了照样重载成功，等到重启内核才起不来。
-/// 启动不走这里：那时 [`problems`] 记成错误、照旧加载
+/// 错误开头就写着是哪个设置或匹配器（`settings.bind_udp: …`、`pipelines[0].rules[2].matchers[1]: …`），不另加前缀，
+/// 和启动时起不来的错误一样。启动不走这里：那时 [`problems`] 记成错误、照样加载
 /// A configuration compiled into its runtime form, which hot reload and the panel's validation
 /// and trial all go through, refusing what would stop the kernel at startup: what silently does
 /// something else (see [`problems`], every one of them in the error, a [`Problems`]), matchers
 /// and regexes that do not compile, and the listener addresses and DoH prerequisites (see
 /// [`GlobalSettings::listeners`]). Hot reload used not to check the listeners, so a mistyped
-/// `bind_udp` reloaded fine and the kernel then failed to start at the next restart. Startup does
-/// not come here: there [`problems`] are logged as errors and loaded as before
+/// `bind_udp` reloaded fine and the kernel then failed to start at the next restart. An error
+/// starts with the setting or matcher it is about (`settings.bind_udp: …`,
+/// `pipelines[0].rules[2].matchers[1]: …`) with no prefix added, as one stopping startup does.
+/// Startup does not come here: there [`problems`] are logged as errors and loaded all the same
 pub fn compile(cfg: PipelineConfig) -> Result<RuntimePipelineConfig> {
     refuse_problems(&cfg)?;
-    let runtime = RuntimePipelineConfig::from_config(cfg).context("compile configuration")?;
-    runtime.settings.listeners().context("validate listeners")?;
+    let runtime = RuntimePipelineConfig::from_config(cfg)?;
+    runtime.settings.listeners()?;
     Ok(runtime)
 }
 
-/// 按热重载的方式校验配置文本（见 [`compile`]）：JSON 解析、配置问题（见 [`problems`]，启动时只记错误、照旧加载，
+/// 按热重载的方式校验配置文本（见 [`compile`]）：JSON 解析、配置问题（见 [`problems`]，启动时只记错误、照样加载，
 /// 这里和重载一样拒绝）、运行时编译（匹配器、正则、网段、超时）以及监听地址和 DoH 的前提（见
 /// [`GlobalSettings::listeners`]：写了证书和私钥的路径）。不读证书、不绑端口：证书读不了、端口绑不上，到启动时才
 /// 知道，那时 DNS 照常答，入站 DoH 不开，控制通道 `config` 结果的 `doh_error` 写着原因。错误带完整原因链；JSON 语法
 /// 错误包含行列位置
 /// Validate configuration text as a hot reload takes it (see [`compile`]): JSON parsing, the
-/// configuration problems (see [`problems`], which startup only logs and loads as before, refused
+/// configuration problems (see [`problems`], which startup only logs and loads all the same, refused
 /// here as on a reload), runtime compilation (matchers, regexes, CIDRs, timeouts) and the
 /// listener addresses and DoH prerequisites (see [`GlobalSettings::listeners`]: paths written
 /// for the certificate and key). No certificate is read and no port bound: one that cannot be
@@ -1273,8 +1276,8 @@ pub fn validate(raw: &str) -> Result<ValidationReport> {
 /// `AnyMatcher::written_empty`）、几个 pipeline 写了同一个 id、不是 IP 的静态 ECS 地址。以前这些都照常加载：
 /// 上游一直失败、rcode 变成 NXDOMAIN、静态应答变成 SERVFAIL、空后缀什么都匹配。
 ///
-/// 启动时记成错误、照旧加载，已经在用的配置升级以后行为不变；热重载和面板的校验（见 [`validate`]）
-/// 拒绝它们，下一次改配置时就得改掉。
+/// 启动时记成错误、照样加载（超过上限的设置按上限用），已经在用的配置升级以后照样起得来；热重载和面板的校验
+/// （见 [`validate`]）拒绝它们，下一次改配置时就得改掉。
 ///
 /// Ways of writing a configuration that silently do something else: an upstream
 /// address nothing can read, a misspelt rcode, an invalid static IP or CNAME target,
@@ -1284,9 +1287,9 @@ pub fn validate(raw: &str) -> Result<ValidationReport> {
 /// usual: the upstream kept failing, the rcode became NXDOMAIN, the static answer
 /// became SERVFAIL, the empty suffix matched everything.
 ///
-/// Startup only logs them and loads as before, so a configuration in use keeps its
-/// behaviour across an upgrade; a reload and the panel's validation (see
-/// [`validate`]) refuse them, so the next change has to fix them.
+/// Startup only logs them and loads all the same (a setting over its limit held to it), so a
+/// configuration in use still starts after an upgrade; a reload and the panel's validation
+/// (see [`validate`]) refuse them, so the next change has to fix them.
 pub fn problems(cfg: &PipelineConfig) -> Vec<String> {
     let pipelines: rustc_hash::FxHashSet<&str> =
         cfg.pipelines.iter().map(|p| p.id.as_str()).collect();
@@ -3037,11 +3040,15 @@ mod validation_tests {
     }
 
     /// 设置本身说不通时，错误是一行英文，开头写着设置和它的值，和配置问题的写法一样：监听地址、DoH 的前提、取值范围和
-    /// 相互关系都是，看得出是哪个设置、写的什么；没有换行，journald 不会拆成两条
+    /// 相互关系都是，看得出是哪个设置、写的什么；没有换行，journald 不会拆成两条。前面不另加前缀，和启动时起不来的错误
+    /// 一样：以前重载和校验时前面多了 `validate listeners: ` 或 `compile configuration: `，启动时监听地址那条没有
     /// Settings that make no sense on their own are refused with a line in English starting with
     /// the setting and its value, as configuration problems are written: the listener addresses,
     /// the DoH prerequisites, the ranges and how settings relate alike, so that which setting it
-    /// is and what it says can be seen; with no line break, journald keeps it one entry
+    /// is and what it says can be seen; with no line break, journald keeps it one entry. No prefix
+    /// goes before it, as none goes before the error stopping startup: on a reload and in
+    /// validation `validate listeners: ` or `compile configuration: ` used to go first, while at
+    /// startup the listener one had none
     #[test]
     fn settings_errors_start_with_the_setting_and_its_value() {
         let doh = |more: serde_json::Value| {
@@ -3106,7 +3113,7 @@ mod validation_tests {
             let refused = super::compile(super::parse_config(&config.to_string()).expect("parses"))
                 .expect_err("refused");
             let refused = format!("{refused:#}");
-            assert!(refused.ends_with(error), "{refused}");
+            assert_eq!(refused, error);
             assert!(!refused.contains('\n'), "{refused}");
         }
     }
