@@ -115,15 +115,15 @@ async fn wait_for_new_namespace(
 
 /// GeoSite 的 `ads` 里有没有 `name` / Whether GeoSite's `ads` has `name`
 fn listed(name: &'static str, expected: bool) -> impl Fn(&Engine) -> bool {
-    move |engine| engine.geosite_manager.read().matches("ads", name) == expected
+    move |engine| engine.geo().geosite.matches("ads", name) == expected
 }
 
 /// GeoIP 的 TESTNET 里有没有 `address` / Whether GeoIP's TESTNET has `address`
 fn in_testnet(address: &'static str) -> impl Fn(&Engine) -> bool {
     move |engine| {
         engine
-            .geoip_manager
-            .read()
+            .geo()
+            .geoip
             .matches_any_tag(address.parse().unwrap(), &[std::sync::Arc::from("TESTNET")])
     }
 }
@@ -248,7 +248,7 @@ async fn a_geoip_update_drops_cached_answers_judged_by_the_old_networks() {
 /// 只有读到换了的那个标签的 Pipeline 换命名空间：自己的规则读的，或者回答检查跳过去的 Pipeline 读的（那里拿到的应答缓存
 /// 在它的键下）。请求阶段跳过去的不算：应答缓存在目标的键下，跳转前的 Pipeline 只存跳转这个决定。GeoSite 的 ads 换了不动
 /// 读别的 GeoSite 标签的、只用 GeoIP 的和什么都不用的 Pipeline，GeoIP 的标签换了也只动读它的；只按客户端地址判断 GeoIP
-/// 国家的 Pipeline 也不动（见下一个测试）。直接给出代数看命名空间，不经文件监视：macOS 的 FSEvents 在开始监视后不久会补报
+/// 国家的 Pipeline 也不动（见下一个测试）。直接给出数据看命名空间，不经文件监视：macOS 的 FSEvents 在开始监视后不久会补报
 /// 此前新建文件的事件，等文件更新的那段时间里两份数据都会重读
 /// Only the pipelines reading the very tag that changed move to a new namespace: through their
 /// own rules, or through a pipeline their answer checks jump to (the answers got there are
@@ -256,14 +256,17 @@ async fn a_geoip_update_drops_cached_answers_judged_by_the_old_networks() {
 /// the target's key, and the pipeline jumped from keeps only the decision to jump. GeoSite's
 /// ads changing leaves pipelines reading other GeoSite tags, only GeoIP or nothing alone, and a
 /// GeoIP tag changing moves only the pipelines reading it; a pipeline judging only the client
-/// address's GeoIP country is left alone too (see the next test). The generations are given
-/// directly, not through the file watch: macOS FSEvents reports the creation of files made
-/// just before the watch began shortly after it begins, and both kinds of data are read again
-/// while a file update is waited for
+/// address's GeoIP country is left alone too (see the next test). The data is given directly,
+/// not through the file watch: macOS FSEvents reports the creation of files made just before
+/// the watch began shortly after it begins, and both kinds of data are read again while a file
+/// update is waited for
 #[test]
 fn only_pipelines_reading_the_changed_tag_change_namespace() {
-    use crate::engine::geo::GeoGeneration;
     use crate::engine::types::EngineInner;
+    use crate::matcher::GeoManagers;
+    use crate::matcher::geoip::GeoIpManager;
+    use crate::matcher::geosite::GeoSiteManager;
+    use std::sync::Arc;
     let answer = json!([{ "type": "static_ip_response", "ip": OTHER.to_string() }]);
     let forward = json!([{ "type": "forward", "upstream": "127.0.0.1:9" }]);
     let answer_ip = |tag: &str| {
@@ -325,30 +328,49 @@ fn only_pipelines_reading_the_changed_tag_change_namespace() {
         "plain",
         "client",
     ];
-    // 从没有数据换到 `geo` 这一代，换了命名空间的 pipeline / The pipelines whose namespace changes
-    // from no data to the generations `geo`
-    let moved = |geo: GeoGeneration| {
+    // 从没有数据换到 `geo` 这份数据，换了命名空间的 pipeline / The pipelines whose namespace changes
+    // from no data to the data `geo`
+    let moved = |geo: GeoManagers| {
         let after = state.at_geo(geo);
         names
             .into_iter()
             .filter(|&pipeline| state.cache_namespace(pipeline) != after.cache_namespace(pipeline))
             .collect::<Vec<_>>()
     };
+    // 只有标签 `tag` 有数据的 GeoSite、GeoIP / GeoSite and GeoIP with data for tag `tag` alone
+    let site = |tag: &str| {
+        let mut site = GeoSiteManager::default();
+        site.load_from_v2ray_string(&format!(
+            r#"{{"entries":[{{"tag":"{tag}","domains":["domain:example"]}}]}}"#
+        ))
+        .unwrap();
+        GeoManagers {
+            geosite: Arc::new(site),
+            ..GeoManagers::default()
+        }
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let ip = |tag: &str| {
+        let path = dir.path().join("geoip.json");
+        std::fs::write(
+            &path,
+            format!(r#"{{"entries":[{{"country_code":"{tag}","ips":["192.0.2.0/24"]}}]}}"#),
+        )
+        .unwrap();
+        let mut ip = GeoIpManager::default();
+        ip.load_from_v2ray_file(&path).unwrap();
+        GeoManagers {
+            geoip: Arc::new(ip),
+            ..GeoManagers::default()
+        }
+    };
     assert_eq!(
-        moved(GeoGeneration::of_tags(&[("ads", 1)], &[])),
+        moved(site("ads")),
         ["site", "answer_jumps", "answer_site"],
         "a GeoSite update of ads"
     );
-    assert_eq!(
-        moved(GeoGeneration::of_tags(&[("cn", 1)], &[])),
-        ["other_site"],
-        "a GeoSite update of cn"
-    );
-    assert_eq!(
-        moved(GeoGeneration::of_tags(&[], &[("TESTNET", 1)])),
-        ["ip"],
-        "a GeoIP update of TESTNET"
-    );
+    assert_eq!(moved(site("cn")), ["other_site"], "a GeoSite update of cn");
+    assert_eq!(moved(ip("TESTNET")), ["ip"], "a GeoIP update of TESTNET");
 }
 
 /// 热重载只多用了一个标签（加了一个读 ads 的 pipeline）：读 cn 的 main 读的还是同一份数据，不换命名空间，上游给它的应答
@@ -416,7 +438,7 @@ async fn a_reload_using_one_tag_more_leaves_pipelines_reading_other_tags_alone()
 
     replace(&data, &lists("www.example", "tracker.example"));
     wait_for_new_namespace(&engine, "main", main, |engine| {
-        engine.geosite_manager.read().matches("cn", "www.example")
+        engine.geo().geosite.matches("cn", "www.example")
     })
     .await;
     assert_eq!(both_paths(&engine, "www.example").await, [Some(MATCHED); 2]);
@@ -551,20 +573,17 @@ async fn a_geoip_file_renamed_by_a_reload_leaves_pipelines_reading_no_geo_data_a
     assert_eq!(up.queries(), 2, "the upstream's answer stayed in the cache");
 }
 
-/// Geo 数据换成别的、又换回先前的样子（面板按内容给文件起名，更新以后又退回先前那一份）：换的时候还在路上的请求拿着先前的
-/// 命名空间、按换上的数据判断，得出的应答缓存在先前的命名空间下。换回来是新的一代，命名空间不回到先前那个，那份应答不再
-/// 拿出来，查询按换回来的数据重新判断。以前命名空间按数据的指纹算，数据一换回来就回到先前的命名空间，交出按另一份数据得出
-/// 的应答
+/// Geo 数据换成别的、又换回先前的样子（面板按内容给文件起名，更新以后又退回先前那一份）：换的时候还在路上的请求从头到尾
+/// 按它开始时的那份数据判断，得出的应答缓存在那份数据的命名空间下。换回来就回到先前的命名空间，里面的应答正是按换回来的
+/// 这份数据判断的，照样拿出来用，不必再问上游
 /// Geo data changing to other data and back to what it was (the panel naming files by their
 /// content, an update rolled back to the earlier file): a request still on its way at the
-/// change holds the earlier namespace and judges by the data swapped in, and the answer it
-/// reaches is cached under the earlier namespace. Changing back is a new generation, the
-/// namespace does not return to the earlier one, that answer is no longer handed out, and
-/// the query is judged anew by the data back in place. The namespace used to be worked out
-/// from the data's fingerprints, returning to the earlier one as soon as the data changed
-/// back and handing out the answer the other data gave
+/// change judges by the data it started with from start to end, and the answer it reaches is
+/// cached under that data's namespace. Changing back brings back the earlier namespace, whose
+/// answers were judged by the very data back in place, so they are handed out as they are,
+/// with no need to ask the upstream again
 #[tokio::test]
-async fn data_changing_back_does_not_bring_back_answers_judged_in_between() {
+async fn data_changing_back_brings_back_only_answers_judged_by_that_data() {
     let dir = tempfile::tempdir().unwrap();
     let (first, second) = (
         dir.path().join("geoip-1.json"),
@@ -602,19 +621,130 @@ async fn data_changing_back_does_not_bring_back_answers_judged_in_between() {
         engine.reload(config(&second));
         held.release();
     });
-    assert_eq!(first_a(&answer), Some(MATCHED), "judged by the second file");
-
-    engine.reload(config(&first));
+    assert_eq!(first_a(&answer), Some(UPSTREAM), "judged by the first file");
     assert_ne!(
         namespace(&engine, "main"),
         earlier,
-        "the first file back is a new generation"
+        "the second file moved it"
+    );
+
+    engine.reload(config(&first));
+    assert_eq!(
+        namespace(&engine, "main"),
+        earlier,
+        "the first file is back"
     );
     assert_eq!(
         both_paths(&engine, "cdn.example").await,
         [Some(UPSTREAM); 2]
     );
-    assert_eq!(up.queries(), 2, "asked again and judged by the first file");
+    assert_eq!(
+        up.queries(),
+        1,
+        "the answer judged by the first file stayed in use"
+    );
+}
+
+/// 按客户端地址判断 GeoIP 国家、回答检查 continue 以后才求值的规则：请求在路上时 TESTNET 换了网段，规则照旧按请求开始时
+/// 的那份数据判断，和算它的键用的是同一份，缓存在「在 TESTNET」键下的应答就是给 TESTNET 的，新进 TESTNET 的客户端拿到的
+/// 也是它；换数据以后来的请求按新网段判断。`watch` 时由文件监视换数据，不然由热重载换
+/// A rule judging the client address's GeoIP country, evaluated only once an answer check
+/// continues: with TESTNET moving to other networks while a request is on its way, the rule
+/// still judges by the data the request started with, the very data its key was worked out
+/// from, so the answer cached under the key "in TESTNET" is the one for TESTNET, and the
+/// clients newly in TESTNET get that one too; requests after the change judge by the new
+/// networks. With `watch` the file watch swaps the data, a hot reload otherwise
+async fn a_request_on_its_way_judges_the_client_country_by_the_data_it_started_with(watch: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let (first, second) = (
+        dir.path().join("geoip-1.json"),
+        dir.path().join("geoip-2.json"),
+    );
+    let networks =
+        |net: &str| format!(r#"{{"entries":[{{"country_code":"TESTNET","ips":["{net}"]}}]}}"#);
+    std::fs::write(&first, networks("203.0.113.0/24")).unwrap();
+    std::fs::write(&second, networks("198.51.100.0/24")).unwrap();
+    let (up, held) = answering_upstream_held(UPSTREAM, 3600).await;
+    let config = |ip: &Path| {
+        runtime(json!({
+            "settings": settings(json!({ "geoip_dat_path": ip.to_str().unwrap() })),
+            "pipelines": [{ "id": "main", "rules": [
+                {
+                    "name": "checked",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "forward", "upstream": up.address }],
+                    "response_matchers": [{ "type": "response_rcode", "value": "NOERROR" }],
+                    "response_actions_on_match": [{ "type": "continue" }]
+                },
+                {
+                    "name": "client",
+                    "matchers": [{ "type": "geoip_country", "country_codes": ["TESTNET"] }],
+                    "actions": [{ "type": "static_ip_response", "ip": MATCHED.to_string() }]
+                },
+                {
+                    "name": "rest",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "static_ip_response", "ip": OTHER.to_string() }]
+                }
+            ]}]
+        }))
+    };
+    let engine = Engine::new(config(&first), "test".to_string()).expect("engine");
+    // 203.0.113.9 在第一份的 TESTNET 里，198.51.100.7 在第二份的里 / 203.0.113.9 is in the first
+    // file's TESTNET, 198.51.100.7 in the second's
+    let (leaving, joining): (SocketAddr, SocketAddr) = (
+        "203.0.113.9:53000".parse().unwrap(),
+        "198.51.100.7:53000".parse().unwrap(),
+    );
+    let packet = query("cdn.example");
+    let (answer, ()) = tokio::join!(ask(&engine, &packet, leaving), async {
+        wait_for("the query must reach the upstream", || up.queries() == 1).await;
+        if watch {
+            replace(&first, networks("198.51.100.0/24").as_bytes());
+            wait_for("the watch must read the new networks", || {
+                in_testnet("198.51.100.7")(&engine)
+            })
+            .await;
+        } else {
+            engine.reload(config(&second));
+        }
+        held.release();
+    });
+    assert_eq!(
+        first_a(&answer),
+        Some(MATCHED),
+        "judged by the networks the request started with"
+    );
+
+    let joined = query("cdn.example");
+    assert_eq!(
+        [
+            first_a(&ask(&engine, &joined, joining).await),
+            first_a(&ask_like_a_listener(&engine, &joined, joining).await),
+        ],
+        [Some(MATCHED); 2],
+        "a client newly in TESTNET"
+    );
+    assert_eq!(
+        up.queries(),
+        1,
+        "the answer cached under the key in TESTNET was the one for TESTNET"
+    );
+    assert_eq!(
+        first_a(&ask(&engine, &query("cdn.example"), leaving).await),
+        Some(OTHER),
+        "the client no longer in TESTNET"
+    );
+}
+
+#[tokio::test]
+async fn a_request_on_its_way_keeps_its_data_through_a_hot_reload() {
+    a_request_on_its_way_judges_the_client_country_by_the_data_it_started_with(false).await;
+}
+
+#[tokio::test]
+async fn a_request_on_its_way_keeps_its_data_through_a_watched_change() {
+    a_request_on_its_way_judges_the_client_country_by_the_data_it_started_with(true).await;
 }
 
 /// 按客户端地址判断 GeoIP 国家的规则不靠换命名空间：缓存的键带着客户端那次判断的结果，网段一换，判断结果跟着变，
@@ -656,10 +786,7 @@ async fn rules_judging_the_client_country_follow_new_networks_without_a_namespac
     replace(&data, networks("203.0.113.0/24").as_bytes());
     let tags = [std::sync::Arc::<str>::from("TESTNET")];
     wait_for("the watch must read the new networks", || {
-        engine
-            .geoip_manager
-            .read()
-            .matches_any_tag(peer().ip(), &tags)
+        engine.geo().geoip.matches_any_tag(peer().ip(), &tags)
     })
     .await;
     assert_eq!(both_paths(&engine, "a.example").await, [Some(MATCHED); 2]);

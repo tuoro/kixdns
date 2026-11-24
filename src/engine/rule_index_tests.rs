@@ -162,7 +162,7 @@ async fn the_compiled_index_misses_no_rule_that_matches() {
                 if eval_match_chain(
                     &rule.matchers,
                     |m| m.operator,
-                    |m| m.matcher.matches(&facts, geo),
+                    |m| m.matcher.matches(&facts, &geo),
                 ) {
                     matched += 1;
                     assert!(

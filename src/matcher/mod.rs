@@ -305,13 +305,16 @@ pub struct RuntimePipeline {
 /// 规则读的 Geo 数据：两种数据各读哪些标签（编译好的写法，排好序、不重复），由匹配器读的 Geo 数据（见 [`GeoTags`]）得出
 ///
 /// 按客户端地址的 GeoIP 国家判断的规则不算：缓存的键带着客户端那次判断的结果（见 [`RequesterScope`]），数据换了，
-/// 判断结果跟着变，查到的就是另一个条目。
+/// 判断结果跟着变，查到的就是另一个条目。键和请求后面的规则按同一份数据判断（见 [`GeoManagers`]），条目里的应答
+/// 正是键里那个判断结果得出的。
 /// The Geo data rules read: the tags of either kind they read (as compiled, sorted, each
 /// once), from the Geo data their matchers read (see [`GeoTags`])
 ///
 /// Rules judging the client address's GeoIP country do not count: cache keys carry the
 /// result of that judgement for the client (see [`RequesterScope`]), so when the data
-/// changes the result changes with it and the lookup finds another entry.
+/// changes the result changes with it and the lookup finds another entry. The key and the
+/// request's later rules judge by the same data (see [`GeoManagers`]), so an entry's answer
+/// is what the very judgement in its key gives.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GeoData {
     /// GeoSite 名单：请求域名在不在里面 / GeoSite lists: whether the request's name is in them
@@ -818,14 +821,14 @@ impl RuntimeMatcher {
         })
     }
 
-    /// 请求 `facts` 合不合这个匹配器。规则、pipeline_select 和快速路径都走这里，Geo 数据只在要用时拿读锁（见
-    /// [`GeoManagers`]）：没有那个 GeoSite 标签的数据时 geo_site 不命中、geo_site_not 命中，没有 GeoIP 数据时
-    /// geoip_country 不命中
-    /// Whether request `facts` meets this matcher. Rules, pipeline_select and the fast path all
-    /// come here, the Geo data read-locked only when used (see [`GeoManagers`]): without data for
+    /// 请求 `facts` 合不合这个匹配器，按 Geo 数据 `geo` 判断（见 [`GeoManagers`]）。规则、pipeline_select 和快速路径
+    /// 都走这里：没有那个 GeoSite 标签的数据时 geo_site 不命中、geo_site_not 命中，没有 GeoIP 数据时 geoip_country
+    /// 不命中
+    /// Whether request `facts` meets this matcher, judged by the Geo data `geo` (see
+    /// [`GeoManagers`]). Rules, pipeline_select and the fast path all come here: without data for
     /// the GeoSite tag geo_site does not match and geo_site_not does, and without GeoIP data
     /// geoip_country does not match
-    pub fn matches(&self, facts: &RequestFacts<'_>, geo: GeoManagers<'_>) -> bool {
+    pub fn matches(&self, facts: &RequestFacts<'_>, geo: &GeoManagers) -> bool {
         let RequestFacts {
             qname,
             qtype,
@@ -843,15 +846,15 @@ impl RuntimeMatcher {
             RuntimeMatcher::ClientIp { net } => net.contains(&client_ip),
             RuntimeMatcher::DomainRegex { regex } => regex.is_match(qname),
             RuntimeMatcher::GeoipCountry { country_codes } => {
-                geo.geoip.read().matches_any_tag(client_ip, country_codes)
+                geo.geoip.matches_any_tag(client_ip, country_codes)
             }
             RuntimeMatcher::GeoipPrivate { expect } => {
                 crate::matcher::geoip::is_private_ip(client_ip) == *expect
             }
             RuntimeMatcher::Qclass { value } => qclass == *value,
             RuntimeMatcher::EdnsPresent { expect } => *expect == edns_present,
-            RuntimeMatcher::GeoSite { tag } => geo.geosite.read().matches(tag, qname),
-            RuntimeMatcher::GeoSiteNot { tag } => !geo.geosite.read().matches(tag, qname),
+            RuntimeMatcher::GeoSite { tag } => geo.geosite.matches(tag, qname),
+            RuntimeMatcher::GeoSiteNot { tag } => !geo.geosite.matches(tag, qname),
             RuntimeMatcher::Qtype { value } => *value == qtype,
         }
     }
@@ -898,34 +901,53 @@ impl<'a> RequestFacts<'a> {
     }
 }
 
-/// 匹配器判断时能读的 Geo 数据。每个匹配器要用时才拿读锁，用完就放：不读 Geo 数据的匹配器不碰锁，每个查询不必为
-/// 它们去改所有核共用的锁计数
-/// The Geo data matchers may read as they judge. Each matcher read-locks it when it uses it and
-/// lets go once done: matchers reading no Geo data leave the locks alone, so no query writes the
-/// lock count all cores share for them
-#[derive(Clone, Copy)]
-pub struct GeoManagers<'a> {
-    pub geoip: &'a parking_lot::RwLock<geoip::GeoIpManager>,
-    pub geosite: &'a parking_lot::RwLock<geosite::GeoSiteManager>,
+/// 匹配器判断时读的 Geo 数据：引擎状态里的那一份（见 `EngineInner::geo`），建好以后只读，换数据时整份换成新的。
+/// 一个请求只 load 一次状态，选 pipeline、算键、求值规则、检查回答都按这同一份判断，换数据时还在路上的请求照旧按它
+/// 开始时的那份，和它的缓存命名空间算的是同一份数据；匹配时不拿锁
+/// The Geo data matchers read as they judge: the copy in the engine state (see
+/// `EngineInner::geo`), read-only once built and replaced whole when the data changes. A
+/// request loads the state once, and choosing the pipeline, working out the keys, evaluating
+/// rules and checking answers all judge by this one copy: a request still on its way when the
+/// data changes goes on with the copy it started with, the very data its cache namespace was
+/// worked out from. Matching takes no lock
+#[derive(Clone, Default)]
+pub struct GeoManagers {
+    pub geoip: Arc<geoip::GeoIpManager>,
+    pub geosite: Arc<geosite::GeoSiteManager>,
 }
 
-impl<'a> GeoManagers<'a> {
-    pub fn new(
-        geoip: &'a parking_lot::RwLock<geoip::GeoIpManager>,
-        geosite: &'a parking_lot::RwLock<geosite::GeoSiteManager>,
-    ) -> Self {
-        Self { geoip, geosite }
+impl GeoManagers {
+    /// 是不是和 `other` 同一份数据（同一对管理器）/ Whether this is the very data of `other` (the
+    /// same pair of managers)
+    pub fn is(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.geoip, &other.geoip) && Arc::ptr_eq(&self.geosite, &other.geosite)
+    }
+
+    /// `uses` 里每个标签的数据的指纹写进 `hasher`，没有数据的写 None（见 `GeoSiteManager::fingerprint`、
+    /// `GeoIpManager::fingerprint`）。缓存命名空间算上 pipeline 读的标签的（见 `EngineInner::at_geo`）：数据换了样子，
+    /// 读它的 pipeline 换命名空间；换回先前的样子，就回到先前的命名空间，那里的条目都是按这份数据判断出来的（见上）
+    /// Writes the fingerprint of the data of each tag of `uses` into `hasher`, None for a tag
+    /// without data (see `GeoSiteManager::fingerprint` and `GeoIpManager::fingerprint`). Cache
+    /// namespaces take in those of the tags a pipeline reads (see `EngineInner::at_geo`): once
+    /// the data changes the pipelines reading it move namespace, and data changing back to what
+    /// it was brings back the namespace of before, whose entries were all judged by that very
+    /// data (see above)
+    pub fn hash_data(&self, uses: &GeoData, hasher: &mut impl Hasher) {
+        for tag in &uses.site {
+            self.geosite.fingerprint(tag).hash(hasher);
+        }
+        for tag in &uses.ip {
+            self.geoip.fingerprint(tag).hash(hasher);
+        }
     }
 }
 
 #[cfg(test)]
-impl GeoManagers<'static> {
-    /// 测试用：两份都还没有数据 / For tests: neither holding any data yet
-    pub(crate) fn empty() -> Self {
-        type Empty<T> = std::sync::LazyLock<parking_lot::RwLock<T>>;
-        static GEOIP: Empty<geoip::GeoIpManager> = std::sync::LazyLock::new(Default::default);
-        static GEOSITE: Empty<geosite::GeoSiteManager> = std::sync::LazyLock::new(Default::default);
-        Self::new(&GEOIP, &GEOSITE)
+impl GeoManagers {
+    /// 测试用：两份都没有数据 / For tests: neither holding any data
+    pub(crate) fn empty() -> &'static Self {
+        static EMPTY: std::sync::LazyLock<GeoManagers> = std::sync::LazyLock::new(Default::default);
+        &EMPTY
     }
 }
 
@@ -956,7 +978,7 @@ impl RuntimePipelineSelectorMatcher {
         &self,
         listener_label: &str,
         facts: &RequestFacts<'_>,
-        geo: GeoManagers<'_>,
+        geo: &GeoManagers,
     ) -> bool {
         match self {
             Self::ListenerLabel { value } => value.eq_ignore_ascii_case(listener_label),
@@ -2054,7 +2076,6 @@ mod tests {
 
         let mut manager = geoip::GeoIpManager::default();
         manager.load_from_v2ray_file(&path).unwrap();
-        let manager = Arc::new(parking_lot::RwLock::new(manager));
         let ip: IpAddr = "104.16.0.1".parse().unwrap();
         let tags = vec![Arc::from("CLOUDFLARE")];
 
@@ -2065,7 +2086,10 @@ mod tests {
             client_ip: ip,
             edns_present: false,
         };
-        let geo = GeoManagers::new(&manager, GeoManagers::empty().geosite);
+        let geo = &GeoManagers {
+            geoip: Arc::new(manager),
+            ..GeoManagers::default()
+        };
         let request = RuntimeMatcher::GeoipCountry {
             country_codes: tags.clone(),
         };
@@ -2317,8 +2341,10 @@ mod tests {
         .unwrap();
         let mut geoip = geoip::GeoIpManager::default();
         geoip.load_from_v2ray_file(&path).unwrap();
-        let geoip = parking_lot::RwLock::new(geoip);
-        let geo = GeoManagers::new(&geoip, GeoManagers::empty().geosite);
+        let geo = &GeoManagers {
+            geoip: Arc::new(geoip),
+            ..GeoManagers::default()
+        };
 
         let matcher = |config: serde_json::Value| {
             RuntimeResponseMatcher::from_config(serde_json::from_value(config).unwrap()).unwrap()
