@@ -2,36 +2,25 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::net::IpAddr;
-#[cfg(unix)]
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-#[cfg(unix)]
 use anyhow::Context;
 use arc_swap::ArcSwap;
-#[cfg(unix)]
 use bytes::Bytes;
 use dashmap::DashMap;
-#[cfg(unix)]
 use http_body_util::{BodyExt, Full, Limited};
-#[cfg(unix)]
 use hyper::body::Incoming;
-#[cfg(unix)]
 use hyper::header::{CACHE_CONTROL, CONTENT_TYPE, HeaderValue};
-#[cfg(unix)]
 use hyper::service::service_fn;
-#[cfg(unix)]
 use hyper::{Method, Request, Response, StatusCode};
-#[cfg(unix)]
 use hyper_util::rt::TokioIo;
 use parking_lot::{Mutex, MutexGuard, RwLock};
 use rustc_hash::{FxHashMap, FxHashSet};
-#[cfg(unix)]
 use serde::Deserialize;
-#[cfg(unix)]
 use serde_json::json;
 
 use crate::engine::Engine;
@@ -45,15 +34,12 @@ use crate::panel_querylog::{self, OwnLines, QueryLog, WallClock};
 use crate::panel_trace;
 use sha2::{Digest, Sha256};
 
-#[cfg(unix)]
 const PROTOCOL_VERSION: u8 = 1;
 const MAX_ERROR_LENGTH: usize = 2_048;
 const MAX_METRIC_SERIES_PER_MAP: usize = 1_024;
 const MAX_METRIC_KEY_BYTES: usize = 512;
 
-#[cfg(unix)]
 const MAX_CONFIG_BODY: usize = 4 * 1024 * 1024;
-#[cfg(unix)]
 const MAX_DIAGNOSTIC_BODY: usize = 2 * 1024;
 /// 控制通道上请求头、请求正文各自最多等这么久，长连接上等下一个请求也算在请求头里。面板在同一台
 /// 机器上，每个请求一下子就发完；以前只发了一半就不动的连接会一直占着一个任务和一个句柄。
@@ -61,7 +47,6 @@ const MAX_DIAGNOSTIC_BODY: usize = 2 * 1024;
 /// body; on a keep-alive connection the wait for the next request counts as the
 /// head. The panel runs on the same host and sends each request at once; a
 /// connection that stopped half way used to hold a task and a descriptor for good.
-#[cfg(unix)]
 const REQUEST_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const QUERY_STATS_BUCKET_SECONDS: u64 = 3_600;
 const QUERY_STATS_BUCKETS: usize = 24;
@@ -261,7 +246,6 @@ impl QueryStatsBucket {
         }
     }
 
-    #[cfg_attr(not(unix), allow(dead_code))]
     fn clear(&self) {
         self.reset(self.rotate_lock.lock(), 0);
     }
@@ -312,14 +296,12 @@ impl Default for QueryStats {
     }
 }
 
-#[cfg_attr(not(unix), allow(dead_code))]
 struct TopStat {
     name: String,
     count: u64,
 }
 
 /// 把一格里 `counts` 的每一项加进 `totals` / Adds each entry of one bucket's `counts` into `totals`
-#[cfg_attr(not(unix), allow(dead_code))]
 fn add_counts<K: Clone + Eq + std::hash::Hash>(
     totals: &mut HashMap<K, u64>,
     counts: &HashMap<K, u64>,
@@ -335,7 +317,6 @@ fn add_counts<K: Clone + Eq + std::hash::Hash>(
 /// The top `limit` entries of `totals`: those are picked by count first and only they get their names
 /// spelled out. A day's window used to turn some hundreds of thousands of entries into strings and sort
 /// them all, keeping a few tens in the end
-#[cfg_attr(not(unix), allow(dead_code))]
 fn top<K: std::fmt::Display + Ord>(totals: HashMap<K, u64>, limit: usize) -> Vec<TopStat> {
     let mut picked = totals.into_iter().collect::<Vec<_>>();
     if picked.len() > limit {
@@ -357,7 +338,6 @@ fn top<K: std::fmt::Display + Ord>(totals: HashMap<K, u64>, limit: usize) -> Vec
     rows
 }
 
-#[cfg_attr(not(unix), allow(dead_code))]
 struct QueryStatsSnapshot {
     requests_observed: u64,
     dropped_updates: u64,
@@ -366,7 +346,6 @@ struct QueryStatsSnapshot {
 }
 
 impl QueryStats {
-    #[cfg_attr(not(unix), allow(dead_code))]
     fn clear(&self) {
         for bucket in &self.buckets {
             bucket.clear();
@@ -386,7 +365,6 @@ impl QueryStats {
         bucket.record(domain, client);
     }
 
-    #[cfg_attr(not(unix), allow(dead_code))]
     fn snapshot(&self, now: u64, window_seconds: u64, limit: usize) -> QueryStatsSnapshot {
         let oldest = now.saturating_sub(window_seconds);
         let mut requests_observed = 0u64;
@@ -421,7 +399,6 @@ impl QueryStats {
     }
 }
 
-#[cfg_attr(not(unix), allow(dead_code))]
 fn sort_and_truncate(rows: &mut Vec<TopStat>, limit: usize) {
     rows.sort_unstable_by(|left, right| {
         right
@@ -714,9 +691,7 @@ impl LookupsCounted {
 }
 
 pub struct PanelMetrics {
-    #[cfg_attr(not(unix), allow(dead_code))]
     started_at_unix: u64,
-    #[cfg_attr(not(unix), allow(dead_code))]
     started_at: Instant,
     requests_total: ThreadCount,
     requests_inflight: AtomicUsize,
@@ -821,7 +796,6 @@ impl PanelMetrics {
         }
     }
 
-    #[cfg_attr(not(unix), allow(dead_code))]
     #[inline]
     fn uptime_seconds(&self) -> u64 {
         self.started_at.elapsed().as_secs()
@@ -1066,7 +1040,6 @@ impl PanelMetrics {
         self.reload_sequence.fetch_add(1, Ordering::Release);
     }
 
-    #[cfg(unix)]
     fn config_json(&self) -> serde_json::Value {
         // 重载序号和配置状态在同一把锁里读：重载在写锁里改状态、加序号，此前序号在锁外读，可能
         // 拿到新序号配旧状态，而面板正是按序号判断保存是否已经生效的
@@ -1114,7 +1087,6 @@ impl PanelMetrics {
         self.active_config.write().doh_error = Some(error);
     }
 
-    #[cfg(unix)]
     fn health_json(&self) -> serde_json::Value {
         let active = self.active_config.read();
         json!({
@@ -1150,7 +1122,6 @@ impl PanelMetrics {
         })
     }
 
-    #[cfg(unix)]
     fn stats_json(&self, window_seconds: u64, limit: usize) -> serde_json::Value {
         let now = unix_timestamp();
         let snapshot = self.query_stats.snapshot(now, window_seconds, limit);
@@ -1175,12 +1146,10 @@ impl PanelMetrics {
         })
     }
 
-    #[cfg(unix)]
     fn clear_stats(&self) {
         self.query_stats.clear();
     }
 
-    #[cfg(unix)]
     fn render_prometheus(&self, engine: &Engine) -> String {
         let mut output = String::with_capacity(8_192);
         // In the unit of `cache_capacity`, not slots: one question can hold answers for several
@@ -1380,7 +1349,6 @@ impl PanelMetrics {
 /// (as read within the last minute: 2 or more is enough, under 1 none left; no line without such a
 /// reading), and the devices refused most, each
 /// with how often and how many seconds ago it last was
-#[cfg(unix)]
 fn render_flow_control(output: &mut String, engine: &Engine) {
     let manager = &engine.permit_manager;
     metric(
@@ -1860,7 +1828,6 @@ impl EngineObserver for PanelMetrics {
     }
 }
 
-#[cfg(unix)]
 pub async fn serve_admin(
     path: PathBuf,
     engine: Engine,
@@ -1918,21 +1885,6 @@ pub async fn serve_admin(
     }
 }
 
-#[cfg(not(unix))]
-pub async fn trial_from_stdio() -> anyhow::Result<()> {
-    anyhow::bail!("当前平台暂不支持草稿试跑")
-}
-
-#[cfg(not(unix))]
-pub async fn serve_admin(
-    _path: PathBuf,
-    _engine: Engine,
-    _metrics: Arc<PanelMetrics>,
-) -> anyhow::Result<()> {
-    anyhow::bail!("当前平台暂不支持 Unix Socket 管理接口")
-}
-
-#[cfg(unix)]
 async fn handle_request(
     request: Request<Incoming>,
     engine: Engine,
@@ -1989,7 +1941,6 @@ async fn handle_request(
     Ok(response)
 }
 
-#[cfg(unix)]
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DiagnosticRequest {
@@ -2001,7 +1952,6 @@ struct DiagnosticRequest {
 }
 
 /// 草稿试跑的请求：同样的查询字段，加上一份候选配置 / A draft trial: the same query fields plus a candidate config
-#[cfg(unix)]
 #[derive(Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct CandidateTraceRequest {
@@ -2013,7 +1963,6 @@ struct CandidateTraceRequest {
 }
 
 /// 交给试跑子进程的输入：请求本身，加上当前引擎的监听器标签 / Input for the trial child: the request plus the live engine's listener label
-#[cfg(unix)]
 #[derive(Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct TrialInput {
@@ -2022,7 +1971,6 @@ struct TrialInput {
 }
 
 /// 试跑子进程写回的结果：状态码和响应体 / What the trial child writes back: a status code and a body
-#[cfg(unix)]
 #[derive(Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct TrialOutput {
@@ -2033,20 +1981,15 @@ struct TrialOutput {
 /// 草稿试跑的总时限：排队等前面的试跑、子进程启动、加载 Geo 数据、建引擎，再加查询自己的 6 秒
 /// The draft trial's overall limit: the wait behind earlier trials, child start-up, Geo data loading and engine
 /// construction, plus the query's own 6 seconds
-#[cfg(unix)]
 const TRIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
 /// 试跑的请求体：一份配置（与校验同上限）加上查询字段 / A trial body: one config (the validation limit) plus the query fields
-#[cfg(unix)]
 const MAX_TRIAL_BODY: usize = MAX_CONFIG_BODY + 4 * 1024;
 /// 试跑子进程的输出上限：轨迹最多 128 步，远小于这个数 / The trial child's output limit; a trace of at most 128 steps stays far below it
-#[cfg(unix)]
 const MAX_TRIAL_OUTPUT: usize = 1024 * 1024;
 
-#[cfg(unix)]
 type Rejection = (StatusCode, serde_json::Value);
 
 /// 检查域名和记录类型，编出一个 DNS 查询包 / Check the domain and record type and encode a DNS query packet
-#[cfg(unix)]
 fn diagnostic_packet(domain: &str, record_type: &str) -> Result<(Vec<u8>, String), Rejection> {
     use hickory_proto::op::{Message, MessageType, OpCode, Query};
     use hickory_proto::rr::RecordType;
@@ -2116,7 +2059,6 @@ fn diagnostic_packet(domain: &str, record_type: &str) -> Result<(Vec<u8>, String
 }
 
 /// 在诊断作用域里让引擎处理一次查询，整理成诊断响应 / Run one query through an engine inside a diagnostic scope and shape the response
-#[cfg(unix)]
 async fn run_diagnostic(
     engine: &Engine,
     packet: &[u8],
@@ -2177,7 +2119,6 @@ async fn run_diagnostic(
 /// How an endpoint reads its request body: at most how many bytes, the error code of the
 /// answer when it cannot, and what that answer says for a body too large and for one that
 /// cannot be read
-#[cfg(unix)]
 struct BodyRules {
     limit: usize,
     code: &'static str,
@@ -2185,7 +2126,6 @@ struct BodyRules {
     unreadable: &'static str,
 }
 
-#[cfg(unix)]
 const CONFIG_BODY: BodyRules = BodyRules {
     limit: MAX_CONFIG_BODY,
     code: "config_body_invalid",
@@ -2193,7 +2133,6 @@ const CONFIG_BODY: BodyRules = BodyRules {
     unreadable: "读取配置请求失败",
 };
 
-#[cfg(unix)]
 const DIAGNOSTIC_BODY: BodyRules = BodyRules {
     limit: MAX_DIAGNOSTIC_BODY,
     code: "diagnostic_body_invalid",
@@ -2201,7 +2140,6 @@ const DIAGNOSTIC_BODY: BodyRules = BodyRules {
     unreadable: "读取诊断请求失败",
 };
 
-#[cfg(unix)]
 const TRIAL_BODY: BodyRules = BodyRules {
     limit: MAX_TRIAL_BODY,
     code: "diagnostic_body_invalid",
@@ -2215,7 +2153,6 @@ const TRIAL_BODY: BodyRules = BodyRules {
 /// it is refused: 413 for a body too large, 400 for one broken and unreadable, 408 for one not
 /// sent in time. An unreadable body used to get a 413 too, the diagnostic and the trial calling
 /// it too large
-#[cfg(unix)]
 async fn collect_body(request: Request<Incoming>, rules: &BodyRules) -> Result<Bytes, Rejection> {
     let body = Limited::new(request.into_body(), rules.limit).collect();
     let (status, code, message) = match tokio::time::timeout(REQUEST_READ_TIMEOUT, body).await {
@@ -2234,14 +2171,12 @@ async fn collect_body(request: Request<Incoming>, rules: &BodyRules) -> Result<B
 }
 
 /// 把一个拒绝写成回答 / A rejection written out as the answer
-#[cfg(unix)]
 fn respond((status, body): Rejection) -> Response<Full<Bytes>> {
     json_response(status, body)
 }
 
 /// 请求正文不是要的 JSON：400，「{what}无效：{error}」
 /// A request body that is not the JSON asked for: 400, "{what}无效：{error}"
-#[cfg(unix)]
 fn request_invalid(what: &str, error: impl std::fmt::Display) -> Rejection {
     (
         StatusCode::BAD_REQUEST,
@@ -2255,7 +2190,6 @@ fn request_invalid(what: &str, error: impl std::fmt::Display) -> Rejection {
 /// 配置用不了：422，错误连同原因链，截到 [`MAX_ERROR_LENGTH`]
 /// A configuration that cannot be used: 422, the error with its cause chain, cut to
 /// [`MAX_ERROR_LENGTH`]
-#[cfg(unix)]
 fn config_invalid(error: &anyhow::Error) -> Rejection {
     (
         StatusCode::UNPROCESSABLE_ENTITY,
@@ -2266,7 +2200,6 @@ fn config_invalid(error: &anyhow::Error) -> Rejection {
     )
 }
 
-#[cfg(unix)]
 async fn diagnostic_trace(request: Request<Incoming>, engine: Engine) -> Response<Full<Bytes>> {
     let body = match collect_body(request, &DIAGNOSTIC_BODY).await {
         Ok(body) => body,
@@ -2292,7 +2225,6 @@ async fn diagnostic_trace(request: Request<Incoming>, engine: Engine) -> Respons
 }
 
 /// 同一时间只跑一个草稿试跑：每次都要起一个子进程、加载 Geo 数据 / One draft trial at a time: each starts a child process and loads Geo data
-#[cfg(unix)]
 static TRIAL_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// 拿一份候选配置试跑一次查询，不碰正在用的配置、缓存和统计。
@@ -2307,7 +2239,6 @@ static TRIAL_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// building an engine opens a whole pool of UDP sockets and starts a watcher thread per GeoSite
 /// file, all of which end with the process, whereas a temporary engine inside this process would
 /// leave them behind. The child binds no listening port.
-#[cfg(unix)]
 async fn diagnostic_trace_candidate(
     request: Request<Incoming>,
     engine: Engine,
@@ -2348,7 +2279,6 @@ async fn diagnostic_trace_candidate(
 /// Runs the trial in a child once its turn comes, the wait for the turn counting towards
 /// [`TRIAL_TIMEOUT`]: the limit used to start only with the turn, so with several trials queued
 /// ahead the panel waited several times 12 seconds for an answer
-#[cfg(unix)]
 async fn trial_in_turn(input: Vec<u8>) -> (StatusCode, serde_json::Value) {
     let trial = async {
         let _turn = TRIAL_GATE.lock().await;
@@ -2375,7 +2305,6 @@ async fn trial_in_turn(input: Vec<u8>) -> (StatusCode, serde_json::Value) {
 }
 
 /// 起子进程、喂请求、读结果 / Start the child, feed it the request, read its result
-#[cfg(unix)]
 async fn run_trial_child(input: Vec<u8>) -> anyhow::Result<TrialOutput> {
     use std::process::Stdio;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2438,7 +2367,6 @@ async fn run_trial_child(input: Vec<u8>) -> anyhow::Result<TrialOutput> {
 
 /// `kixdns panel-trial` 的入口：从标准输入读一份试跑请求，往标准输出写一份结果，不绑定任何端口。
 /// Entry of `kixdns panel-trial`: read one trial request from stdin, write one result to stdout, bind no port.
-#[cfg(unix)]
 pub async fn trial_from_stdio() -> anyhow::Result<()> {
     use std::io::{Read, Write};
 
@@ -2466,7 +2394,6 @@ pub async fn trial_from_stdio() -> anyhow::Result<()> {
 /// 观察者是一份独立的统计，跟着子进程一起丢掉。
 /// Build an engine from the candidate config and run one query. Validation follows `/v1/config/validate`;
 /// the trial turns background refresh off, and its observer is a separate set of statistics discarded with the child.
-#[cfg(unix)]
 async fn run_trial(input: TrialInput) -> (StatusCode, serde_json::Value) {
     let TrialInput {
         request,
@@ -2507,7 +2434,6 @@ async fn run_trial(input: TrialInput) -> (StatusCode, serde_json::Value) {
     (status, body)
 }
 
-#[cfg(unix)]
 fn parse_stats_query(query: Option<&str>) -> Result<(u64, usize), &'static str> {
     let mut window_seconds = 86_400;
     let mut limit = 20usize;
@@ -2542,7 +2468,6 @@ fn parse_stats_query(query: Option<&str>) -> Result<(u64, usize), &'static str> 
 /// Hands over a page of the query log: with `wait_ms` it first waits (see
 /// `QueryLog::wait_for_page`), then builds the JSON on a blocking thread, as thousands of records
 /// take milliseconds that must not hold up a thread answering DNS
-#[cfg(unix)]
 async fn querylog_response(
     metrics: &Arc<PanelMetrics>,
     query: Option<&str>,
@@ -2588,7 +2513,6 @@ async fn querylog_response(
 }
 
 /// 面板来取一页查询日志 / One take of the query log by the panel
-#[cfg(unix)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct QueryLogTake {
     /// 面板已经取到的最后一个序号，从没取过是 0 / The last sequence number the panel has taken, 0 before the first
@@ -2611,7 +2535,6 @@ struct QueryLogTake {
 /// 一页查询日志交成什么样：JSON（`querylog_v1`），或者编好的记录原样交出（`querylog_records_v1`）
 /// How a page of the query log is handed over: as JSON (`querylog_v1`), or as the encoded records
 /// themselves (`querylog_records_v1`)
-#[cfg(unix)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum QueryLogFormat {
     Json,
@@ -2621,7 +2544,6 @@ enum QueryLogFormat {
 /// 查询日志的游标：`after`、`limit`、`until`、`instance`、`stored`、`wait_ms`，含义见 [`QueryLogTake`]
 /// The query log cursor: `after`, `limit`, `until`, `instance`, `stored` and `wait_ms`, as described at
 /// [`QueryLogTake`], and `format` (`json` or `records1`)
-#[cfg(unix)]
 fn parse_querylog_query(query: Option<&str>) -> Result<QueryLogTake, &'static str> {
     let mut take = QueryLogTake {
         after: 0,
@@ -2670,7 +2592,6 @@ fn parse_querylog_query(query: Option<&str>) -> Result<QueryLogTake, &'static st
     Ok(take)
 }
 
-#[cfg(unix)]
 async fn validate_config(request: Request<Incoming>) -> Response<Full<Bytes>> {
     match collect_body(request, &CONFIG_BODY).await {
         Ok(body) => validate_body(body).await,
@@ -2684,7 +2605,6 @@ async fn validate_config(request: Request<Incoming>) -> Response<Full<Bytes>> {
 /// them out line by line, tens of thousands of lines with many series, so it runs on the
 /// blocking thread pool and, as the rankings do, holds no thread that serves DNS; it used to be
 /// written on the thread that took the request
-#[cfg(unix)]
 async fn metrics_response(metrics: &Arc<PanelMetrics>, engine: Engine) -> Response<Full<Bytes>> {
     let rendering = Arc::clone(metrics);
     match tokio::task::spawn_blocking(move || rendering.render_prometheus(&engine)).await {
@@ -2705,7 +2625,6 @@ async fn metrics_response(metrics: &Arc<PanelMetrics>, engine: Engine) -> Respon
 /// The answer with the rankings. Working them out merges every entry of every hour in the
 /// window and sorts them (up to two hundred thousand entries for a 24-hour window), so it runs on
 /// the blocking thread pool and holds no thread that serves DNS
-#[cfg(unix)]
 async fn stats_response(
     metrics: &Arc<PanelMetrics>,
     window_seconds: u64,
@@ -2730,7 +2649,6 @@ async fn stats_response(
 /// milliseconds for a configuration with many rules, during which the DNS queries queued on a
 /// thread serving requests would wait. A body that is not UTF-8 gets a 400: it used to be
 /// validated as an empty string, answered with the parse error of an empty configuration
-#[cfg(unix)]
 async fn validate_body(body: Bytes) -> Response<Full<Bytes>> {
     let validated = tokio::task::spawn_blocking(move || match std::str::from_utf8(&body) {
         Ok(text) => crate::config::validate(text).map_err(|error| config_invalid(&error)),
@@ -2759,12 +2677,10 @@ async fn validate_body(body: Bytes) -> Response<Full<Bytes>> {
     }
 }
 
-#[cfg(unix)]
 fn json_response(status: StatusCode, value: serde_json::Value) -> Response<Full<Bytes>> {
     text_response(status, "application/json; charset=utf-8", value.to_string())
 }
 
-#[cfg(unix)]
 fn text_response(
     status: StatusCode,
     content_type: &'static str,
@@ -2773,7 +2689,6 @@ fn text_response(
     bytes_response(status, content_type, body.into_bytes())
 }
 
-#[cfg(unix)]
 fn bytes_response(
     status: StatusCode,
     content_type: &'static str,
@@ -2794,7 +2709,6 @@ fn bytes_response(
     response
 }
 
-#[cfg(unix)]
 fn error_json(code: &str, message: &str) -> serde_json::Value {
     json!({ "protocol_version": PROTOCOL_VERSION, "error": { "code": code, "message": message } })
 }
@@ -3816,7 +3730,6 @@ mod tests {
     /// the thread that took the request, tens to hundreds of milliseconds for a configuration
     /// with many rules, with the queries queued on that thread waiting; on a single-core device,
     /// every query
-    #[cfg(unix)]
     #[tokio::test]
     async fn validating_a_configuration_leaves_the_runtime_free() {
         let rules: Vec<serde_json::Value> = (0..1000)
@@ -3860,7 +3773,6 @@ mod tests {
     /// Working out the rankings holds no thread that serves DNS either: it goes to a blocking thread, and
     /// while waiting for the result the runtime goes on with other work. The test runs on a single-thread
     /// runtime, where ranking inline would leave the other task not a single turn
-    #[cfg(unix)]
     #[tokio::test]
     async fn working_out_the_rankings_leaves_the_runtime_free() {
         let metrics = std::sync::Arc::new(PanelMetrics::default());
@@ -4669,7 +4581,6 @@ mod tests {
     /// 诊断只接受九种记录类型，大小写和两边的空白不论，编出的查询问的就是那种类型；别的类型一律拒绝
     /// A diagnostic takes nine record types only, whatever their case and surrounding
     /// blanks, and the query it encodes asks for that type; any other type is refused
-    #[cfg(unix)]
     #[test]
     fn a_diagnostic_asks_one_of_nine_record_types() {
         use hickory_proto::rr::RecordType;
@@ -4717,7 +4628,6 @@ mod tests {
     /// 排行接口照旧带着 enabled 和 anonymized_clients，写的是一直开着、不脱敏；清空后从零开始
     /// The rankings endpoint still carries enabled and anonymized_clients, saying always
     /// on and not anonymized; after a clear it starts from zero
-    #[cfg(unix)]
     #[test]
     fn stats_json_says_always_on_with_whole_addresses_and_clears() {
         let metrics = PanelMetrics::default();
@@ -4741,7 +4651,7 @@ mod tests {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod diagnostic_tests {
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::Arc;
@@ -5241,7 +5151,6 @@ mod diagnostic_tests {
     /// validation answer lists a draft's, and the control channel's config the current
     /// configuration's, replaced by the new one's on a reload. They used to be logged as a warn
     /// only, out of sight at the default log level, and validation said nothing of them
-    #[cfg(unix)]
     #[tokio::test]
     async fn validation_and_config_list_what_loads_yet_is_worth_knowing() {
         let raw = serde_json::json!({
@@ -5514,7 +5423,6 @@ mod diagnostic_tests {
     /// A trial refuses a candidate as validation does: one that parses but has a
     /// configuration problem (an upstream nothing can read), or whose listener settings
     /// are wrong, gets 422 config_invalid
-    #[cfg(unix)]
     #[tokio::test]
     async fn a_trial_refuses_a_candidate_validation_would_refuse() {
         let configs = [

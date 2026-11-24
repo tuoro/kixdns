@@ -21,7 +21,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, UdpSocket};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 /// 绑定好、还没开始答的 UDP socket，每个 worker 一个 / UDP sockets bound and not answering yet, one per worker
 struct BoundUdp {
@@ -252,7 +252,7 @@ fn bind_udp_socket(addr: SocketAddr) -> anyhow::Result<UdpSocket> {
     if addr.ip().is_unspecified() {
         use std::os::fd::AsRawFd;
         if let Err(error) = udp_local::receive_local_addresses(socket.as_raw_fd(), addr.is_ipv6()) {
-            warn!(%error, "cannot learn which address UDP queries are sent to; replies leave from the address the system picks");
+            tracing::warn!(%error, "cannot learn which address UDP queries are sent to; replies leave from the address the system picks");
         }
     }
 
