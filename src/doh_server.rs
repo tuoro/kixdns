@@ -13,7 +13,7 @@
 //! certificate or key file changes (an ACME renewal, say), the old certificate kept on failure.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -128,6 +128,7 @@ impl DohCertificate {
     pub fn load(cert_path: &str, key_path: &str) -> anyhow::Result<Arc<Self>> {
         let pending =
             watcher::PendingWatch::new(&[PathBuf::from(cert_path), PathBuf::from(key_path)]);
+        let mut read = stamps(cert_path, key_path);
         let current = Arc::new(ArcSwap::from_pointee(build_tls_acceptor(
             cert_path, key_path,
         )?));
@@ -136,7 +137,9 @@ impl DohCertificate {
                 let reloaded = Arc::clone(&current);
                 let (cert, key) = (cert_path.to_owned(), key_path.to_owned());
                 pending
-                    .start("doh-cert-watcher", move |_| reload(&reloaded, &cert, &key))
+                    .start("doh-cert-watcher", move |_| {
+                        reload(&reloaded, &cert, &key, &mut read);
+                    })
                     .map_err(notify::Error::io)
             })
             .inspect_err(|err| error!(cert = cert_path, key = key_path, error = %err, "cannot watch the DoH certificate, a renewed one is not used until restart"))
@@ -148,10 +151,27 @@ impl DohCertificate {
     }
 }
 
-/// 证书文件改了：换上重新读出来的证书，读不了就留着在用的
+/// 证书和私钥读之前什么样（见 `watcher::FileStamp`），不存在的是 None / What the certificate and the
+/// key looked like before they were read (see `watcher::FileStamp`), None for one not there
+type Stamps = [Option<watcher::FileStamp>; 2];
+
+fn stamps(cert: &str, key: &str) -> Stamps {
+    [cert, key].map(|path| watcher::FileStamp::of(Path::new(path)).ok())
+}
+
+/// 证书文件改了：换上重新读出来的证书，读不了就留着在用的。两个文件和上次读之前（`read`）一样就不再读：监视给一阵改动
+/// 里改了的每个文件各回调一次，续期时证书和私钥一起换，头一次回调已经把两个都读了
 /// The certificate files changed: the certificate read again goes in, or the one in use stays
-/// when it cannot be read
-fn reload(current: &ArcSwap<TlsAcceptor>, cert: &str, key: &str) {
+/// when it cannot be read. With both files as they were before the last read (`read`) they are
+/// not read again: the watch calls back once for each file a burst of changes changed, and a
+/// renewal replaces the certificate and the key together, both read by the first callback
+fn reload(current: &ArcSwap<TlsAcceptor>, cert: &str, key: &str, read: &mut Stamps) {
+    let now = stamps(cert, key);
+    if now == *read {
+        debug!(cert, key, "DoH TLS certificate unchanged, not read again");
+        return;
+    }
+    *read = now;
     match build_tls_acceptor(cert, key) {
         Ok(acceptor) => {
             current.store(Arc::new(acceptor));
