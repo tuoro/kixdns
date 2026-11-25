@@ -17,7 +17,7 @@ use std::time::Duration;
 use anyhow::Context;
 use futures::FutureExt;
 use futures::future::{BoxFuture, Shared};
-use hickory_proto::op::{Message, MessageType, OpCode, Query};
+use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, RecordType};
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
@@ -107,7 +107,7 @@ impl Known {
         for (family, ipv6) in asked.into_iter().zip([false, true]) {
             match family {
                 Ok(given) => {
-                    for (address, record) in given {
+                    for &(address, record) in given.records() {
                         addresses.push(address);
                         ttl = ttl.min(Duration::from_secs(u64::from(record)));
                     }
@@ -142,12 +142,46 @@ impl Known {
     }
 }
 
-/// 一族地址这次问到的样子：地址和各自的 TTL（空的是没有这一族的记录）；Err 是没问到：每个服务器都出了错、答了失败应答
-/// （见 `upstream::is_failure_reply`）、到时没答上或者查询发不出去
-/// What one family of addresses came to this time: the addresses with their TTLs (none being no
-/// record of the family); Err when not given: every server failing, answering with a failure
-/// reply (see `upstream::is_failure_reply`), not answering in time or never sent the query
-type Family = anyhow::Result<Vec<(IpAddr, u32)>>;
+/// 一族地址这次问到的样子（见 [`Answered`]）；Err 是没问到：每个服务器都出了错、答了失败应答（见
+/// `upstream::is_failure_reply`）、到时没答上或者查询发不出去
+/// What one family of addresses came to this time (see [`Answered`]); Err when not given: every
+/// server failing, answering with a failure reply (see `upstream::is_failure_reply`), not
+/// answering in time or never sent the query
+type Family = anyhow::Result<Answered>;
+
+/// 服务器对一族地址的回答 / A server's answer for one family of addresses
+enum Answered {
+    /// 有这个名字：这一族的地址和各自的 TTL，空的是没有这一族的记录 / The name is there: the
+    /// family's addresses with their TTLs, none being no record of the family
+    Records(Vec<(IpAddr, u32)>),
+    /// NXDOMAIN：DNS 里没有这个名字，哪种记录都没有（RFC 8020）/ NXDOMAIN: DNS has no such name,
+    /// and so no record of any type (RFC 8020)
+    NoSuchName,
+}
+
+impl Answered {
+    /// 这一族的地址和各自的 TTL，NXDOMAIN 时没有 / The family's addresses with their TTLs, none
+    /// for NXDOMAIN
+    fn records(&self) -> &[(IpAddr, u32)] {
+        match self {
+            Self::Records(records) => records,
+            Self::NoSuchName => &[],
+        }
+    }
+}
+
+/// 这次问到的两族（`asked`）是不是说 DNS 里没有这个名字的地址：一族答了 NXDOMAIN（另一族也就没有，见 [`Answered`]），
+/// 或者两族都答了没有记录。没问到的那一族什么也不说
+/// Whether what this asking gave of the two families (`asked`) says DNS has no address for the
+/// name: one family answered NXDOMAIN (the other then having none either, see [`Answered`]), or
+/// both answered with no record. A family not given says nothing
+fn not_in_dns(asked: &[Family; 2]) -> bool {
+    match asked {
+        [Ok(Answered::NoSuchName), _] | [_, Ok(Answered::NoSuchName)] => true,
+        [Ok(a), Ok(aaaa)] => a.records().is_empty() && aaaa.records().is_empty(),
+        _ => false,
+    }
+}
 
 /// 问一次的结果，等着它的各拿一份 / One asking's outcome, a copy for each that waits on it
 type Asking = Shared<BoxFuture<'static, Result<Arc<[IpAddr]>, NoAddress>>>;
@@ -157,8 +191,8 @@ type Asking = Shared<BoxFuture<'static, Result<Arc<[IpAddr]>, NoAddress>>>;
 #[derive(Clone, Debug)]
 struct NoAddress {
     why: Arc<str>,
-    /// 两族都答了、都没有记录（比如 NXDOMAIN），而不是没问到（见 [`Family`]）/ Both families answered with no
-    /// record (NXDOMAIN, say), rather than not given (see [`Family`])
+    /// 问到的说 DNS 里没有它的地址（见 [`not_in_dns`]），而不是没问到 / What was given says DNS has
+    /// no address for it (see [`not_in_dns`]), rather than it not being given
     not_in_dns: bool,
 }
 
@@ -171,14 +205,12 @@ impl std::fmt::Display for NoAddress {
 impl std::error::Error for NoAddress {}
 
 impl Bootstrap {
-    /// `servers` 是 `bootstrap` 的写法：逗号分隔的 `IP:端口`，空的就交给系统的解析器
-    /// `servers` as `bootstrap` writes them: comma-separated `IP:port`, none leaving it to the
-    /// system resolver
+    /// `servers` 是 `bootstrap` 的写法：逗号分隔的 `IP:端口`，照配置检查那样拆（见 `config::split_upstreams`），
+    /// 空的就交给系统的解析器
+    /// `servers` as `bootstrap` writes them: comma-separated `IP:port`, split as the configuration
+    /// check splits them (see `config::split_upstreams`), none leaving it to the system resolver
     pub(crate) fn new(servers: &str, udp: Arc<UdpClient>) -> Arc<Self> {
-        let servers: Box<[Box<str>]> = servers
-            .split(',')
-            .map(str::trim)
-            .filter(|server| !server.is_empty())
+        let servers: Box<[Box<str>]> = crate::config::split_upstreams(servers)
             .map(Box::from)
             .collect();
         Arc::new(Self {
@@ -263,8 +295,7 @@ impl Through {
         let (through, host) = (Arc::clone(self), Box::<str>::from(host));
         let asking: Asking = async move {
             let asked = through.ask_servers(&host).await;
-            let not_in_dns =
-                matches!(&asked, Ok([Ok(a), Ok(aaaa)]) if a.is_empty() && aaaa.is_empty());
+            let not_in_dns = asked.as_ref().is_ok_and(not_in_dns);
             let mut hosts = through.hosts.lock();
             let entry = hosts.entry(host.clone()).or_default();
             entry.asking = None;
@@ -318,7 +349,7 @@ impl Through {
     /// `query` asked of every server at once, the answer of the first to answer (see
     /// [`Self::records`], [`ASK_BUDGET`] at most each). With none answering, why each did not is
     /// listed, in the order they failed
-    async fn first_answer(&self, query: &[u8]) -> anyhow::Result<Vec<(IpAddr, u32)>> {
+    async fn first_answer(&self, query: &[u8]) -> anyhow::Result<Answered> {
         use futures::StreamExt;
         let mut asked: futures::stream::FuturesUnordered<_> = self
             .servers
@@ -335,17 +366,17 @@ impl Through {
         anyhow::bail!("{}", failed.join(", "))
     }
 
-    /// `server` 对 `query` 答的地址和各自的 TTL；答了失败应答（见 `upstream::is_failure_reply`）是 Err，和答了没有这种
-    /// 记录（空的）分开。一份查询过了这次问的时限（[`ASK_BUDGET`]）的三分之一还没有回答就再发一份，和还没答过的上游一样
-    /// （见 `upstream::hedge_timeout`）；前面发的照样等着，谁的回答先到用谁的（见 [`UdpExchange`]）：丢了一个包的查询
-    /// 不用等满整个时限。一份发不出去也不让这次问失败，记下来，到了再发的时候照样再发，直到时限。UDP 转发（见
+    /// `server` 对 `query` 的回答（见 [`Answered`]）；答了失败应答（见 `upstream::is_failure_reply`）是 Err，和答了
+    /// NXDOMAIN、答了没有这种记录（空的）分开。一份查询过了这次问的时限（[`ASK_BUDGET`]）的三分之一还没有回答就再发一份，
+    /// 和还没答过的上游一样（见 `upstream::hedge_timeout`）；前面发的照样等着，谁的回答先到用谁的（见 [`UdpExchange`]）：
+    /// 丢了一个包的查询不用等满整个时限。一份发不出去也不让这次问失败，记下来，到了再发的时候照样再发，直到时限。UDP 转发（见
     /// `upstream::forward_udp_smart`）不一样：它一共只发两份，第一份发不出去就马上发第二份；这里一直按间隔再发，发不出去
     /// 时马上再发只会空转。到了时限还没有回答：发出去过的报 `no answer in 2000ms`，一份也没发出去的报最后一次为什么没发出去
     /// （`query not sent: …`），比如没有到这个服务器的路由
-    /// The addresses `server` answers `query` with, and their TTLs; Err for a failure reply (see
-    /// `upstream::is_failure_reply`), told apart from an answer with no such record (none). A copy
-    /// left unanswered for a third of the asking's time limit ([`ASK_BUDGET`]) has another sent,
-    /// as for an upstream yet to answer (see `upstream::hedge_timeout`); the earlier ones are
+    /// `server`'s answer to `query` (see [`Answered`]); Err for a failure reply (see
+    /// `upstream::is_failure_reply`), told apart from NXDOMAIN and an answer with no such record
+    /// (none). A copy left unanswered for a third of the asking's time limit ([`ASK_BUDGET`]) has
+    /// another sent, as for an upstream yet to answer (see `upstream::hedge_timeout`); the earlier ones are
     /// still waited for, the first reply to come being used (see [`UdpExchange`]): a query with a
     /// packet lost does not wait out the whole limit. Nor does a copy that cannot be sent fail the
     /// asking: it is logged, and another goes when the time to send again comes, up to the time
@@ -354,7 +385,7 @@ impl Through {
     /// interval, and sending again at once while sending fails would only spin. With no answer by
     /// the time limit, one with a copy sent reports `no answer in 2000ms`, and one with none sent
     /// why the latest could not go (`query not sent: …`), no route to the server, say
-    async fn records(&self, server: &str, query: &[u8]) -> anyhow::Result<Vec<(IpAddr, u32)>> {
+    async fn records(&self, server: &str, query: &[u8]) -> anyhow::Result<Answered> {
         let deadline = Instant::now() + ASK_BUDGET;
         let resend_after = super::upstream::hedge_timeout(ASK_BUDGET);
         let mut exchange = UdpExchange::new(&self.udp, query, server);
@@ -391,18 +422,23 @@ impl Through {
             "{server} answered {}",
             crate::observe::rcode_name(rcode.into())
         );
-        Ok(reply
-            .answers
-            .into_iter()
-            .filter_map(|record| {
-                let address = match record.data {
-                    RData::A(address) => IpAddr::V4(address.0),
-                    RData::AAAA(address) => IpAddr::V6(address.0),
-                    _ => return None,
-                };
-                Some((address, crate::proto_utils::received_ttl(record.ttl)))
-            })
-            .collect())
+        if rcode == ResponseCode::NXDomain {
+            return Ok(Answered::NoSuchName);
+        }
+        Ok(Answered::Records(
+            reply
+                .answers
+                .into_iter()
+                .filter_map(|record| {
+                    let address = match record.data {
+                        RData::A(address) => IpAddr::V4(address.0),
+                        RData::AAAA(address) => IpAddr::V6(address.0),
+                        _ => return None,
+                    };
+                    Some((address, crate::proto_utils::received_ttl(record.ttl)))
+                })
+                .collect(),
+        ))
     }
 }
 
@@ -586,6 +622,37 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// bootstrap 丢掉一族的查询、另一族答了 NXDOMAIN：没有这个名字，哪种记录都没有（RFC 8020），代理照样交给系统的解析器，
+    /// 不因没问到的那一族失败
+    /// With bootstrap dropping the queries of one family and the other answered NXDOMAIN: there is
+    /// no such name and so no record of any type (RFC 8020), and the proxy goes to the system
+    /// resolver all the same, not failing for the family not given
+    #[tokio::test]
+    async fn a_proxy_answered_nxdomain_by_one_family_is_left_to_the_system_resolver() {
+        use reqwest::dns::Resolve;
+        let cases = [RecordType::A, RecordType::AAAA].map(|nxdomain| async move {
+            let server = upstream(move |query| {
+                if query.queries[0].query_type() == nxdomain {
+                    no_records(query, ResponseCode::NXDomain)
+                } else {
+                    Vec::new()
+                }
+            })
+            .await;
+            let resolver = Resolver::new(through(&server.address), vec![Box::from("localhost")]);
+            let addresses: Vec<SocketAddr> = resolver
+                .resolve("localhost".parse().unwrap())
+                .await
+                .unwrap_or_else(|error| panic!("{nxdomain} NXDOMAIN: {error}"))
+                .collect();
+            assert!(
+                !addresses.is_empty() && addresses.iter().all(|address| address.ip().is_loopback()),
+                "{nxdomain} NXDOMAIN: {addresses:?}"
+            );
+        });
+        futures::future::join_all(cases).await;
     }
 
     /// 问到的地址 IPv4 在前，TTL 没过就不再问。写成 IP 的不用问
