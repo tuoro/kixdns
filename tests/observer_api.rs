@@ -2764,7 +2764,7 @@ async fn a_config_change_made_before_the_watch_starts_is_reloaded() {
     let v1 = static_config("192.0.2.1");
     std::fs::write(&path, &v1).unwrap();
 
-    let watch = kixdns::watcher::ConfigWatch::new(&path).expect("watch");
+    let watch = kixdns::watcher::ConfigWatch::new(&path);
     let (config, source) = kixdns::config::load_config_with_source(&path).expect("load");
     let v2 = static_config("192.0.2.2");
     atomically_replace(&path, &v2);
@@ -2817,7 +2817,7 @@ fn watch_started_after(
 ) -> (Engine, Arc<Recorder>, kixdns::watcher::FileWatch) {
     std::fs::write(path, read).unwrap();
     let modified = std::fs::metadata(path).unwrap().modified().unwrap();
-    let watch = kixdns::watcher::ConfigWatch::new(path).expect("watch");
+    let watch = kixdns::watcher::ConfigWatch::new(path);
     let (config, source) = kixdns::config::load_config_with_source(path).expect("load");
     write(modified);
     let recorder = Arc::new(Recorder::default());
@@ -2854,10 +2854,11 @@ async fn a_change_reported_to_the_config_as_read_at_startup_is_not_reloaded() {
     assert_eq!(engine.config_generation(), 1, "{:#?}", recorder.events());
 }
 
-/// 启动以后一字不差地再存一次，这是开始以后的头一次改动，照样重载：这样存是让重载重读 MMDB、监视不了的 Geo 文件
+/// 启动以后一字不差地再存一次，这是开始以后的头一次改动，照样重载：存过以后文件就不是读之前的样子了，跳过的只是还是那个
+/// 样子的（见 `watcher::ConfigWatch::start_reporting`）
 /// Saved again word for word after startup, the first change since the start, it is reloaded
-/// all the same: saving so is how a reload is made to read the MMDB or Geo files that cannot be
-/// watched again
+/// all the same: once saved the file no longer looks as it did before the read, and only one
+/// still looking so is skipped (see `watcher::ConfigWatch::start_reporting`)
 #[tokio::test]
 async fn the_config_saved_again_word_for_word_after_startup_is_reloaded() {
     let dir = tempfile::tempdir().unwrap();
@@ -2982,7 +2983,6 @@ async fn hot_reload_reports_success_and_failure() {
     );
 
     let _watch = kixdns::watcher::ConfigWatch::new(&path)
-        .expect("watch")
         .start(engine.clone(), v1.clone())
         .expect("start");
 

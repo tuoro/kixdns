@@ -1213,6 +1213,35 @@ async fn a_geoip_file_partly_watched_at_startup_is_read_by_the_check() {
     .await;
 }
 
+/// notify 的监视建不起来（像 inotify 的 max_user_instances 用完了）：数据文件监视不上，状态里和别的监视不上的文件一样
+/// 说一句、带着为什么；文件换了，不用热重载，监视的核对读进来。以前整个监视装不上，换了的文件要等下一次热重载才读
+/// notify's watcher cannot be made (as when inotify's max_user_instances have run out): the
+/// data file cannot be watched, and the status says so, with why, as for any other file that
+/// cannot be; once the file is replaced, the watch's check reads it in with no hot reload. The
+/// whole watch used to go uninstalled, a replaced file read only at the next hot reload
+#[tokio::test]
+async fn without_notify_the_check_reads_a_replaced_data_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let site = dir.path().join("geosite.dat");
+    std::fs::write(&site, geosite_dat(&[("ads", "old.test")])).unwrap();
+    let _check = crate::watcher::check_every(CHECKED);
+    let _notify = crate::watcher::without_notify();
+    let engine = engine(geosite_config(&[&site], "ads"));
+    let warnings = engine.geo_data_warnings();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0].starts_with(&partly_watched("GeoSite data file", &site)),
+        "{warnings:?}"
+    );
+
+    replace(&site, &geosite_dat(&[("ads", "renewed.test")]));
+    wait_for("the check reads the new file in", || {
+        engine.geo().geosite.matches("ads", "x.renewed.test")
+    })
+    .await;
+    assert_eq!(ask(&engine, "x.renewed.test").await, Some(MATCHED));
+}
+
 /// 运行中数据文件经符号链接改指到还不存在的目录里：监视报它有位置监视不上，那个目录建好、文件写进去以后，核对读进来
 /// A data file pointed while running, through a symlink, into a directory not there yet: the
 /// watch reports it has places that cannot be watched, and once that directory is made and the
