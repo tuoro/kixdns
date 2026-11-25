@@ -1194,6 +1194,9 @@ impl PanelMetrics {
                 "diagnostics_trace_candidate_v1",
                 "config_static_cname_response_v1",
                 "config_panel_block_v1",
+                "config_bootstrap_v1",
+                "config_qtype_names_v1",
+                "config_serve_stale_ttl_reset_v2",
                 "metrics_upstream_precision_v1",
                 "metrics_upstream_response_latency_v1",
                 "querylog_v1",
@@ -5898,11 +5901,18 @@ mod diagnostic_tests {
     }
 
     /// 包里 `panel/capabilities.json` 声明的配置能力，health 都声明：面板按前者判断还没起来的内核包，按后者判断运行中的
-    /// 内核，同一个内核两边说的得一样。顶层留给面板的块（`config_panel_block_v1`，见 `config::PANEL_BLOCK`）在其中
+    /// 内核，同一个内核两边说的得一样。其中有顶层留给面板的块（`config_panel_block_v1`，见 `config::PANEL_BLOCK`），
+    /// `settings.bootstrap`（`config_bootstrap_v1`），`qtype` 和 `response_type` 写 hickory 认得的任一类型名或
+    /// `TYPEnnn`（`config_qtype_names_v1`），默认关、后台刷新失败以后才重新计时的 `serve_stale_ttl_reset`
+    /// （`config_serve_stale_ttl_reset_v2`）
     /// Health declares every config capability `panel/capabilities.json` declares in the package:
     /// the panel judges a package not yet running by the former and a running kernel by the
-    /// latter, and the two have to say the same of one kernel. The top-level block kept for the
-    /// panel (`config_panel_block_v1`, see `config::PANEL_BLOCK`) is among them
+    /// latter, and the two have to say the same of one kernel. Among them are the top-level block
+    /// kept for the panel (`config_panel_block_v1`, see `config::PANEL_BLOCK`),
+    /// `settings.bootstrap` (`config_bootstrap_v1`), `qtype` and `response_type` writing any type
+    /// name hickory knows or `TYPEnnn` (`config_qtype_names_v1`), and `serve_stale_ttl_reset`,
+    /// off by default and restarting the clock only once a background refresh fails
+    /// (`config_serve_stale_ttl_reset_v2`)
     #[test]
     fn health_declares_the_config_capabilities_of_the_package() {
         let package: serde_json::Value =
@@ -5913,7 +5923,14 @@ mod diagnostic_tests {
             .iter()
             .filter_map(serde_json::Value::as_str)
             .collect();
-        assert!(declared.contains(&"config_panel_block_v1"), "{declared:?}");
+        for capability in [
+            "config_panel_block_v1",
+            "config_bootstrap_v1",
+            "config_qtype_names_v1",
+            "config_serve_stale_ttl_reset_v2",
+        ] {
+            assert!(declared.contains(&capability), "{capability}");
+        }
         let capabilities = capabilities();
         for capability in declared {
             assert!(
