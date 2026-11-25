@@ -11,16 +11,17 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::Path;
-use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use hickory_proto::op::{Message, MessageType, OpCode, Query};
 use hickory_proto::rr::{Name, RecordType};
 
 mod common;
-use common::{Kernel, free_port};
+use common::{Kernel, free_port, run_logging};
 
-/// 跑真的程序，日志写进 `dir` 里的 kixdns.log / Runs the real binary, logging into kixdns.log in `dir`
+/// 把 `settings` 写进 `dir` 里的配置，跑真的程序（见 [`run_logging`]），日志按默认级别写进 `dir` 里的 kixdns.log
+/// Writes `settings` into a configuration in `dir` and runs the real binary on it (see
+/// [`run_logging`]), logging at the default level into kixdns.log in `dir`
 fn start(dir: &Path, settings: serde_json::Value) -> Kernel {
     let config = dir.join("config.json");
     let mut full = serde_json::json!({
@@ -41,15 +42,7 @@ fn start(dir: &Path, settings: serde_json::Value) -> Kernel {
         }],
     });
     std::fs::write(&config, config_text.to_string()).unwrap();
-    let output = std::fs::File::create(dir.join("kixdns.log")).unwrap();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_kixdns"));
-    command
-        .args(["run", "--config"])
-        .arg(&config)
-        .stdout(output.try_clone().unwrap())
-        .stderr(output)
-        .stdin(Stdio::null());
-    Kernel(command.spawn().unwrap())
+    run_logging(&config, &dir.join("kixdns.log"), None)
 }
 
 fn log_of(dir: &Path) -> String {
