@@ -208,7 +208,7 @@ struct Mmdb {
 }
 
 impl Mmdb {
-    fn open(path: &str, file: FileStamp) -> Result<Self, maxminddb::MaxMindDbError> {
+    fn open(path: &Path, file: FileStamp) -> Result<Self, maxminddb::MaxMindDbError> {
         let content = std::fs::read(path)?;
         let mut hasher = DefaultHasher::new();
         content.hash(&mut hasher);
@@ -217,7 +217,7 @@ impl Mmdb {
         let mut countries = FxHashMap::default();
         if let Err(e) = Self::index(&reader, &mut countries) {
             // 没解到的记录查询时当场解，结果不变 / Records left out are decoded when asked about, with the same result
-            tracing::warn!(geoip_db = %path, error = %e, "could not index every GeoIP database record, the rest are decoded per query");
+            tracing::warn!(geoip_db = %path.display(), error = %e, "could not index every GeoIP database record, the rest are decoded per query");
         }
         Ok(Self {
             reader,
@@ -285,21 +285,21 @@ fn record_country<'a>(found: &maxminddb::LookupResult<'a, Vec<u8>>) -> Option<&'
 }
 
 impl GeoIpManager {
-    /// 用 `path` 的 MMDB。`current` 在用的正是这个文件、文件也没变（路径、长度、修改时间都一样）时共用它那份，不再
+    /// 用 `path` 的 MMDB。`current` 在用的正是这个文件、文件也没变（见 `watcher::FileStamp`）时共用它那份，不再
     /// 读一遍：以前只改了规则用的标签也要把整个库（约 10 MB）再读一遍、每个网段再走一遍，旧库还占着内存。读不了
-    /// （不存在、正被替换、写坏了）时，`current` 用的是同一个路径就留着它那份，返回读不了的原因；文件换了样子以后的
-    /// 热重载再读它（见 `engine::geo` 的 `Loaded`）。以前换进去的是没有 MMDB 的管理器，文件又在，之后国家代码就一直
-    /// 不按 MMDB 判断，直到重启
+    /// （不存在、正被替换、写坏了）时，`current` 用的是同一个路径就留着它那份，返回读不了的原因；文件再改动时监视再读它
+    /// （见 `engine::geo` 的 `reload_mmdb`）。以前换进去的是没有 MMDB 的管理器，文件又在，之后国家代码就一直不按 MMDB
+    /// 判断，直到重启
     /// Uses the MMDB at `path`. When `current` uses that very file and the file is unchanged
-    /// (same path, length and modification time) its data is shared rather than read again: a
-    /// change to nothing but the tags rules use used to read the whole database (some 10 MB) and
-    /// walk every network again while the old one still held memory. When it cannot be read
-    /// (missing, being replaced, broken) the data `current` has from the same path stays, and
-    /// it gives why; the hot reload after the file looks otherwise reads it again (see
-    /// `Loaded` in `engine::geo`). A manager with no MMDB used to be swapped in, and with the
-    /// file still there country codes were no longer judged by the MMDB until a restart
-    pub fn use_mmdb(&mut self, path: &str, current: &Self) -> anyhow::Result<()> {
-        let file = FileStamp::of(Path::new(path));
+    /// (see `watcher::FileStamp`) its data is shared rather than read again: a change to nothing
+    /// but the tags rules use used to read the whole database (some 10 MB) and walk every network
+    /// again while the old one still held memory. When it cannot be read (missing, being
+    /// replaced, broken) the data `current` has from the same path stays, and it gives why; the
+    /// watch reads it again on the file's next change (see `reload_mmdb` in `engine::geo`). A
+    /// manager with no MMDB used to be swapped in, and with the file still there country codes
+    /// were no longer judged by the MMDB until a restart
+    pub fn use_mmdb(&mut self, path: &Path, current: &Self) -> anyhow::Result<()> {
+        let file = FileStamp::of(path);
         let in_use = current.mmdb.as_ref();
         if let (Ok(file), Some(in_use)) = (&file, in_use)
             && *file == in_use.file
@@ -312,17 +312,35 @@ impl GeoIpManager {
             .and_then(|file| Mmdb::open(path, file).map_err(anyhow::Error::new));
         match opened {
             Ok(mmdb) => {
-                tracing::info!(geoip_db = %path, records = mmdb.countries.len(), "GeoIP database loaded successfully");
+                tracing::info!(geoip_db = %path.display(), records = mmdb.countries.len(), "GeoIP database loaded successfully");
                 self.mmdb = Some(Arc::new(mmdb));
                 Ok(())
             }
             Err(e) => {
-                self.mmdb = in_use
-                    .filter(|in_use| in_use.file.path() == Path::new(path))
-                    .cloned();
+                self.mmdb = in_use.filter(|in_use| in_use.file.path() == path).cloned();
                 Err(e)
             }
         }
+    }
+
+    /// 和这个管理器用同样的标签、MMDB 换成 `path` 重新读的那份的管理器（见 [`Self::use_mmdb`]）：监视到 MMDB 变了时建
+    /// 它，再把它整个换进去（见 `engine::geo` 的 `reload_mmdb`）。文件和在用的那份一样、共用它时是 None；读不了时给出
+    /// 原因
+    /// A manager with this one's tags and the MMDB at `path` read again (see
+    /// [`Self::use_mmdb`]): built when the watch sees the MMDB change, and swapped in whole (see
+    /// `reload_mmdb` in `engine::geo`). None when the file is the one in use, shared; why it
+    /// cannot be read when it cannot
+    pub fn with_mmdb(&self, path: &Path) -> anyhow::Result<Option<Self>> {
+        let mut fresh = Self {
+            mmdb: None,
+            tag_indexes: self.tag_indexes.clone(),
+        };
+        fresh.use_mmdb(path, self)?;
+        let shared = match (&fresh.mmdb, &self.mmdb) {
+            (Some(fresh), Some(in_use)) => Arc::ptr_eq(fresh, in_use),
+            _ => false,
+        };
+        Ok((!shared).then_some(fresh))
     }
 
     /// 和这个管理器用同一份 MMDB、还没有标签的管理器：监视到数据文件变了时，新的标签装进它，再把它整个换进去（见
@@ -1002,8 +1020,7 @@ mod tests {
         assert_eq!(stats.countries_count, 1);
 
         let mut mgr = GeoIpManager::default();
-        mgr.use_mmdb(&mmdb.to_string_lossy(), &GeoIpManager::default())
-            .unwrap();
+        mgr.use_mmdb(&mmdb, &GeoIpManager::default()).unwrap();
         assert!(mgr.matches_tag("198.51.100.7".parse().unwrap(), "CN"));
         assert!(!mgr.matches_tag("203.0.113.7".parse().unwrap(), "JP"));
     }
@@ -1018,7 +1035,7 @@ mod tests {
     fn a_reload_shares_an_unchanged_mmdb_and_keeps_it_when_the_file_breaks() {
         let dir = tempfile::tempdir().unwrap();
         let mmdb = dir.path().join("geoip.mmdb");
-        let path = mmdb.to_string_lossy().into_owned();
+        let path = mmdb.clone();
         let convert = |json: &str| {
             let source = dir.path().join("geoip.json");
             std::fs::write(&source, json).unwrap();
@@ -1369,8 +1386,7 @@ mod tests {
             .unwrap();
 
         let mut mgr = GeoIpManager::default();
-        mgr.use_mmdb(&mmdb_path.to_string_lossy(), &GeoIpManager::default())
-            .unwrap();
+        mgr.use_mmdb(&mmdb_path, &GeoIpManager::default()).unwrap();
         mgr.load_from_dat_file(&dat_path).unwrap();
 
         let ip: IpAddr = "2001:db8::1".parse().unwrap();
@@ -1617,11 +1633,7 @@ mod tests {
         crate::matcher::geoip_converter::convert_dat_to_mmdb(&source_path, &mmdb_path, None)
             .unwrap();
 
-        let mmdb = Mmdb::open(
-            mmdb_path.to_str().unwrap(),
-            FileStamp::of(&mmdb_path).unwrap(),
-        )
-        .unwrap();
+        let mmdb = Mmdb::open(&mmdb_path, FileStamp::of(&mmdb_path).unwrap()).unwrap();
         for (ip, want) in [
             ("10.1.2.3", Some("CN")),
             ("20.1.2.3", Some("US")),

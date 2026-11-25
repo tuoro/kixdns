@@ -114,20 +114,20 @@ pub struct DohCertificate {
 
 impl DohCertificate {
     /// 读 `cert_path` 和 `key_path`，读之前先装好监视（见 `watcher::PendingWatch`）：读的时候证书续期了，这次改动排着队，
-    /// 照样换上。以前先读后监视，中间续期的证书要等下一次改动才用上。监视不了只记错误，证书照用；有位置监视不上的文件，
-    /// 记的错误说那里续期的证书要重启才用上（见 `watcher::PendingWatch::new` 的 `unseen`）
+    /// 照样换上。监视不了（装不上、起不了线程）只记错误，证书照用，续期的要重启才用上；有位置监视不上的文件，那里续期的
+    /// 10 秒以内察觉（见 `watcher::Targets::check`），开始监视时记一条错误。证书读不了时监视不开始，什么都不记，只有读不了
+    /// 的那个错误
     /// Reads `cert_path` and `key_path`, watching them before they are read (see
     /// `watcher::PendingWatch`): a renewal made while they are read waits in line and is brought
-    /// in all the same. They used to be read before being watched, and a renewal in between was
-    /// used only after the next change. When they cannot be watched an error is logged and the
-    /// certificate used as read; for a file with places that cannot be watched, the error logged
-    /// says a renewal there is not used until restart (see `unseen` of
-    /// `watcher::PendingWatch::new`)
+    /// in all the same. When they cannot be watched (the watch not installed, its thread not
+    /// started) an error is logged and the certificate used as read, a renewal waiting for a
+    /// restart; for a file with places that cannot be watched, a renewal there is noticed
+    /// within 10 s (see `watcher::Targets::check`), an error logged as the watch starts. With the
+    /// certificate unreadable the watch does not start and logs nothing, the error being why it
+    /// cannot be read alone
     pub fn load(cert_path: &str, key_path: &str) -> anyhow::Result<Arc<Self>> {
-        let pending = watcher::PendingWatch::new(
-            &[PathBuf::from(cert_path), PathBuf::from(key_path)],
-            "a renewal there is not used until restart",
-        );
+        let pending =
+            watcher::PendingWatch::new(&[PathBuf::from(cert_path), PathBuf::from(key_path)]);
         let current = Arc::new(ArcSwap::from_pointee(build_tls_acceptor(
             cert_path, key_path,
         )?));
@@ -1439,17 +1439,17 @@ mod tests {
     }
 
     /// 证书的文件有位置监视不上（这里是进得去、列不出的目录，像 inotify 的监视数用完时那样装不上监视）：证书照样用上，
-    /// 日志里每个这样的文件只记一条错误，说那里续期的证书要重启才用上。以前只有整个监视装不上时才这么说，有位置监视不上
-    /// 时只有一条不提后果的。root 列得出这样的目录，也监视得上，没有要看的
+    /// 开始监视时每个这样的文件记一条错误，说那里的改动 10 秒以内察觉，日志里只有这两条；之后那里续期了，核对看出来，换上
+    /// 新证书。root 列得出这样的目录，也监视得上，没有要看的
     /// The certificate's files have places that cannot be watched (here a directory that can
     /// be entered, not listed, refusing a watch as when inotify's watches run out): the
-    /// certificate is used all the same, and one error alone is logged for each such file,
-    /// saying a renewal there is not used until restart. Only a watch failing as a whole used to say so,
-    /// places that could not be watched getting a line that named no consequence. root lists
-    /// such a directory and watches it, with nothing to see
+    /// certificate is used all the same, and as the watch starts one error is logged for each
+    /// such file, saying changes there are noticed within 10 s, those two being all the log has;
+    /// a renewal there afterwards is told by the check and the new certificate goes in. root
+    /// lists such a directory and watches it, with nothing to see
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_certificate_that_cannot_be_watched_says_a_renewal_waits_for_a_restart() {
+    fn a_renewal_where_the_watch_cannot_see_is_used_after_the_check() {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().unwrap();
         let (cert, key) = crate::engine::test_support::write_certificate(dir.path());
@@ -1461,12 +1461,25 @@ mod tests {
             mode(0o700);
             return;
         }
+        let _check = crate::watcher::check_every(Duration::from_millis(100));
         let (warnings, guard) = crate::engine::test_support::Warnings::capture();
         let certificate = DohCertificate::load(&cert, &key);
         drop(guard);
+        let renewed = certificate.as_ref().ok().map(|certificate| {
+            let read = certificate.current.load_full();
+            crate::engine::test_support::write_certificate(dir.path());
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while Arc::ptr_eq(&certificate.current.load_full(), &read)
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            !Arc::ptr_eq(&certificate.current.load_full(), &read)
+        });
         mode(0o700);
         assert!(certificate.is_ok(), "the certificate is used as read");
         let lines = warnings.lines();
+        assert_eq!(lines.len(), 2, "{lines:#?}");
         for file in [&cert, &key] {
             let said: Vec<&String> = lines
                 .iter()
@@ -1474,10 +1487,59 @@ mod tests {
                 .collect();
             assert_eq!(said.len(), 1, "one error for {file}: {lines:#?}");
             assert!(
-                said[0].contains("a renewal there is not used until restart"),
+                said[0].contains(crate::watcher::SEEN_WITHIN),
                 "{file}: {lines:#?}"
             );
         }
+        assert_eq!(renewed, Some(true), "the renewal is told by the check");
+    }
+
+    /// 证书读不了（证书目录还不存在：还没跑 certbot、目录名写错）时监视不开始，日志里不说续期怎样，只有读不了的那个错误
+    /// （由调用的一方记）
+    /// With the certificate unreadable (its directory not there yet: certbot not run, the
+    /// directory misspelled) the watch does not start, and the log says nothing of renewals, the
+    /// error being why it cannot be read alone (logged by the caller)
+    #[test]
+    fn an_unreadable_certificate_logs_nothing_of_its_watch() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("live/example.org");
+        let (cert, key) = (missing.join("cert.pem"), missing.join("key.pem"));
+        let (warnings, guard) = crate::engine::test_support::Warnings::capture();
+        let certificate = DohCertificate::load(cert.to_str().unwrap(), key.to_str().unwrap());
+        drop(guard);
+        assert!(certificate.is_err());
+        assert_eq!(warnings.lines(), Vec::<String>::new());
+    }
+
+    /// 证书和私钥在 A/tls 里，A 改名换掉（换发布目录那样，`mv A A.old; mv A.new A`）：只有 A/tls 在监视，事件一个都没有，
+    /// inotify 的监视跟着 A.old/tls 走；核对看出来，换上新目录里的证书
+    /// The certificate and key in A/tls, A swapped by renames (as a release directory is,
+    /// `mv A A.old; mv A.new A`): A/tls alone is watched, no event comes, and inotify's watch
+    /// follows A.old/tls; the check tells, and the certificate in the new directory goes in
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_certificate_directory_swapped_above_is_used_after_the_check() {
+        let root = tempfile::tempdir().unwrap();
+        let real = std::fs::canonicalize(root.path()).unwrap();
+        for at in ["A/tls", "A.new/tls"] {
+            std::fs::create_dir_all(real.join(at)).unwrap();
+            crate::engine::test_support::write_certificate(&real.join(at));
+        }
+        let (cert, key) = (real.join("A/tls/cert.pem"), real.join("A/tls/key.pem"));
+        let _check = crate::watcher::check_every(Duration::from_millis(100));
+        let certificate =
+            DohCertificate::load(cert.to_str().unwrap(), key.to_str().unwrap()).unwrap();
+        let read = certificate.current.load_full();
+
+        std::fs::rename(real.join("A"), real.join("A.old")).unwrap();
+        std::fs::rename(real.join("A.new"), real.join("A")).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while Arc::ptr_eq(&certificate.current.load_full(), &read) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the certificate in the new directory is used");
     }
 
     /// 最后一个监听口停下时证书的监视也停下：监视线程结束，放下它手里的证书。以前这个线程谁也停不了，进程活着它就一直在

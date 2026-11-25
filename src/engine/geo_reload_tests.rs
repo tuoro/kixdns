@@ -17,6 +17,7 @@ use serde_json::{Value, json};
 use crate::engine::Engine;
 use crate::engine::test_support::first_a;
 use crate::matcher::RuntimePipelineConfig;
+use crate::watcher::SEEN_WITHIN;
 
 /// 规则命中时的应答 / The answer when the rule matches
 const MATCHED: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 50);
@@ -216,20 +217,25 @@ async fn geoip_first_used_after_a_reload_is_loaded() {
     assert_eq!(ask_from(&engine, "b.test", client).await, Some(MATCHED));
 }
 
-/// 配置里写了、启动时连所在的目录都不存在的文件监视不了：状态里除了说它不存在，也和别的有位置监视不上的文件一样说它
-/// 监视不上、改动由下一次热重载读；出现以后再热重载一次就读进来，这两句跟着去掉（目录在的见
-/// `a_missing_geosite_file_is_read_once_it_appears`）。以前状态只说它不存在，看不出它没在监视
+/// 测试里监视多久核对一次（见 `watcher::check_every`）/ How often a test's watch checks itself (see
+/// `watcher::check_every`)
+const CHECKED: Duration = Duration::from_millis(100);
+
+/// 配置里写了、启动时连所在的目录都不存在的文件监视不上：状态里除了说它不存在，也和别的有位置监视不上的文件一样说它
+/// 监视不上、那里的改动由监视的核对接上；目录建好、文件写进去以后，不用热重载，核对就读进来，这两句跟着去掉（目录在的见
+/// `a_missing_geosite_file_is_read_once_it_appears`）
 /// A configured file that did not exist at startup, its directory neither, cannot be watched:
 /// besides saying it is not there, the status says, as for any other file with places that
-/// cannot be watched, that it is not watched, changes being read by the next hot reload; once
-/// it appears a hot reload reads it in and both sentences go (for one whose directory is there
-/// see `a_missing_geosite_file_is_read_once_it_appears`). The status used to say only that it
-/// was not there, with nothing to tell it was not watched
+/// cannot be watched, that it is not watched, changes there being caught by the watch's checks;
+/// once the directory is made and the file written, a check reads it in with no hot reload and
+/// both sentences go (for one whose directory is there see
+/// `a_missing_geosite_file_is_read_once_it_appears`)
 #[tokio::test]
-async fn a_data_file_that_appears_later_is_loaded_by_the_next_reload() {
+async fn a_data_file_whose_directory_appears_later_is_read_by_the_check() {
     let dir = tempfile::tempdir().unwrap();
     let dat = dir.path().join("later").join("geosite.dat");
 
+    let _check = crate::watcher::check_every(CHECKED);
     let engine = engine(geosite_config(&[&dat], "ads"));
     assert_eq!(ask(&engine, "www.ads.test").await, Some(OTHER));
     let warnings = engine.geo_data_warnings();
@@ -245,9 +251,15 @@ async fn a_data_file_that_appears_later_is_loaded_by_the_next_reload() {
 
     std::fs::create_dir(dat.parent().unwrap()).unwrap();
     std::fs::write(&dat, geosite_dat(&[("ads", "ads.test")])).unwrap();
-    engine.reload(geosite_config(&[&dat], "ads"));
-    assert_eq!(ask(&engine, "x.ads.test").await, Some(MATCHED));
-    assert_eq!(engine.geo_data_warnings(), Vec::<String>::new());
+    wait_for("the check reads the file in", || {
+        engine.geo().geosite.matches("ads", "x.ads.test")
+    })
+    .await;
+    wait_for(
+        "the status says nothing once it is read and watched",
+        || engine.geo_data_warnings().is_empty(),
+    )
+    .await;
 }
 
 /// 热重载换了路径以后，监视的是新文件：新文件变了会读进来，旧文件再变也不会写进新数据
@@ -450,63 +462,54 @@ async fn the_mmdb_answers_country_codes_and_the_data_file_named_tags() {
     assert_eq!(ask_from(&engine, "c.test", testnet).await, Some(MATCHED));
 }
 
-/// MMDB 不被监视：原地换成新的以后，配置不变的热重载也重读它，新库马上用上。以前配置里的 GeoIP 设置没变就不重读，新库要等
-/// 重启
-/// The MMDB is not watched: once replaced in place, a hot reload with the configuration unchanged
-/// reads it again and the new database is used at once. It used not to be read again while the
-/// configuration's GeoIP settings stayed the same, the new database waiting for a restart
+/// MMDB 和数据文件一样被监视：换成新的以后（geoipupdate 那样写好再改名盖过去），不用热重载，监视读进来，新库马上用上
+/// The MMDB is watched as the data files are: once replaced (written aside and renamed over it,
+/// as geoipupdate does), the watch reads it in with no hot reload, and the new database is used
+/// at once
 #[tokio::test]
-async fn a_hot_reload_reads_an_mmdb_replaced_in_place() {
+async fn the_watch_reads_a_replaced_mmdb() {
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("mmdb-source.json");
-    let mmdb = dir.path().join("country.mmdb");
+    let (mmdb, aside) = (
+        dir.path().join("country.mmdb"),
+        dir.path().join("country.new"),
+    );
     let convert = |country: &str| {
         let entries =
             format!(r#"{{"entries":[{{"country_code":"{country}","ips":["198.51.100.0/24"]}}]}}"#);
         std::fs::write(&source, entries).unwrap();
-        crate::matcher::geoip_converter::convert_dat_to_mmdb(&source, &mmdb, None).unwrap();
+        crate::matcher::geoip_converter::convert_dat_to_mmdb(&source, &aside, None).unwrap();
+        std::fs::rename(&aside, &mmdb).unwrap();
     };
     convert("US");
-    let cfg = || {
-        config(
-            json!({ "geoip_db_path": mmdb.to_str().unwrap() }),
-            json!({ "type": "geoip_country", "country_codes": ["JP"] }),
-        )
-    };
     let client: SocketAddr = "198.51.100.7:53000".parse().unwrap();
-    let engine = engine(cfg());
+    let engine = engine(config(
+        json!({ "geoip_db_path": mmdb.to_str().unwrap() }),
+        json!({ "type": "geoip_country", "country_codes": ["JP"] }),
+    ));
     assert_ne!(
         ask_from(&engine, "before.test", client).await,
         Some(MATCHED)
     );
 
-    // 一样长的库，写明晚一秒，像隔了一阵才换上的那样 / A database as long, set a second later, as
-    // for one replaced a while on
     convert("JP");
-    let later = std::fs::metadata(&mmdb).unwrap().modified().unwrap() + Duration::from_secs(1);
-    std::fs::File::options()
-        .write(true)
-        .open(&mmdb)
-        .unwrap()
-        .set_modified(later)
-        .unwrap();
-    engine.reload(cfg());
+    let jp = [Arc::<str>::from("JP")];
+    wait_for("the watch reads the new database", || {
+        engine.geo().geoip.matches_any_tag(client.ip(), &jp)
+    })
+    .await;
     assert_eq!(ask_from(&engine, "after.test", client).await, Some(MATCHED));
 }
 
-/// 存在却读不了的 MMDB，文件不换就不再读：别的配置改了的热重载不动 GeoIP 数据，用到它的 pipeline 留着缓存；换成读得
-/// 了的，下一次热重载就读进来。在用的库被换成读不了的，那一次热重载读它、留着在用的，之后也不再读。以前读不了的和不存在的
-/// 一样记成缺着的，文件又在，每次热重载都重读一遍、换一代，等于清掉这些 pipeline 的缓存
-/// An MMDB that is there yet cannot be read is not read again until the file changes: a hot
-/// reload changing other parts of the configuration leaves the GeoIP data, and the caches of
-/// the pipelines using it, alone; once it is replaced by a readable one, the next
-/// hot reload reads it in. When the database in use is replaced by an unreadable one, that one
-/// hot reload reads it and keeps the database in use, and later ones do not read it again. An
-/// unreadable file used to count as missing, as a file not there does, and being there it was
-/// read again, and the data moved to a new generation, on every hot reload, clearing those
-/// pipelines' caches
+/// 存在却读不了的 MMDB 不再读：别的配置改了的热重载不动 GeoIP 数据，用到它的 pipeline 留着缓存；换成读得了的，监视
+/// 读进来，那句读不了的话跟着去掉。在用的库换成读不了的，监视读它、留着在用的，状态里说它读不了
+/// An MMDB that is there yet cannot be read is not read again: a hot reload changing other
+/// parts of the configuration leaves the GeoIP data, and the caches of the pipelines using it,
+/// alone; once it is replaced by a readable one, the watch reads it in and the sentence saying
+/// it cannot be read goes. When the database in use is replaced by an unreadable one, the
+/// watch reads it, keeps the database in use, and the status says it cannot be read
 #[tokio::test]
-async fn an_unreadable_mmdb_is_read_again_only_once_it_changes() {
+async fn an_unreadable_mmdb_is_read_again_once_it_changes() {
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("mmdb-source.json");
     let mmdb = dir.path().join("country.mmdb");
@@ -531,30 +534,38 @@ async fn an_unreadable_mmdb_is_read_again_only_once_it_changes() {
             "an unrelated reload"
         );
     }
+    let said = format!("GeoIP database {} cannot be read: ", mmdb.display());
+    let says_unreadable = |engine: &Engine| {
+        engine
+            .geo_data_warnings()
+            .iter()
+            .any(|sentence| sentence.starts_with(&said))
+    };
+    assert!(says_unreadable(&engine), "{:?}", engine.geo_data_warnings());
 
     let entries = r#"{"entries":[{"country_code":"JP","ips":["198.51.100.0/24"]}]}"#;
     std::fs::write(&source, entries).unwrap();
-    crate::matcher::geoip_converter::convert_dat_to_mmdb(&source, &mmdb, None).unwrap();
-    engine.reload(cfg("127.0.0.1:9"));
-    assert!(
-        !Arc::ptr_eq(&geoip(&engine), &unreadable),
-        "a readable database"
-    );
+    let readable = dir.path().join("country.mmdb.new");
+    crate::matcher::geoip_converter::convert_dat_to_mmdb(&source, &readable, None).unwrap();
+    std::fs::rename(&readable, &mmdb).unwrap();
+    wait_for("the watch reads the readable database", || {
+        engine.geo().geoip.has_mmdb()
+    })
+    .await;
     assert_eq!(ask_from(&engine, "a.test", client).await, Some(MATCHED));
+    assert_eq!(engine.geo_data_warnings(), Vec::<String>::new());
 
+    let in_use = geoip(&engine);
     replace(&mmdb, b"broken again");
-    engine.reload(cfg("127.0.0.1:10"));
-    let broken = geoip(&engine);
-    engine.reload(cfg("127.0.0.1:11"));
+    wait_for("the status says the database cannot be read", || {
+        says_unreadable(&engine)
+    })
+    .await;
     assert!(
-        Arc::ptr_eq(&geoip(&engine), &broken),
-        "the broken file is not read again"
-    );
-    assert_eq!(
-        ask_from(&engine, "b.test", client).await,
-        Some(MATCHED),
+        Arc::ptr_eq(&geoip(&engine), &in_use),
         "the database in use stays"
     );
+    assert_eq!(ask_from(&engine, "b.test", client).await, Some(MATCHED));
 }
 
 /// 状态里说 `what` `path` 读得出来、却没有规则用到的标签了，`tags` 留着先前的数据的那句话
@@ -940,14 +951,13 @@ async fn a_missing_geosite_file_is_read_once_it_appears() {
 }
 
 /// 引擎随时说得出 Geo 数据有什么不对，一样一句话（面板经控制通道读）：配置了却不存在的文件、读不了的文件和 MMDB、规则
-/// 用到却没有数据提供的标签；文件改好了，监视读进来以后那句话就没了，MMDB 不被监视，下一次热重载读进来以后没了。以前
-/// 这些只记在日志里，规则悄悄地一直不按数据判断，geo_site_not 对所有查询都成立
+/// 用到却没有数据提供的标签；文件和 MMDB 改好了，监视读进来以后那句话就没了。以前这些只记在日志里，规则悄悄地一直不按
+/// 数据判断，geo_site_not 对所有查询都成立
 /// The engine can tell at any time what is wrong with the Geo data, a sentence each (the panel
 /// reads them over the control channel): configured files that are not there, data files and
-/// an MMDB that cannot be read, and tags rules use that no data provides; once a file is put
-/// right its sentence goes as the watch reads it in, and the MMDB's, which is not watched,
-/// once the next hot reload reads it in. These used to be in the log alone, rules quietly
-/// never judging by the data, and geo_site_not holding for every query
+/// an MMDB that cannot be read, and tags rules use that no data provides; once a file or the
+/// MMDB is put right its sentence goes as the watch reads it in. These used to be in the log
+/// alone, rules quietly never judging by the data, and geo_site_not holding for every query
 #[tokio::test]
 async fn geo_data_warnings_say_what_is_missing_or_unreadable() {
     let dir = tempfile::tempdir().unwrap();
@@ -1028,17 +1038,21 @@ async fn geo_data_warnings_say_what_is_missing_or_unreadable() {
         r#"{"entries":[{"country_code":"US","ips":["198.51.100.0/24"]}]}"#,
     )
     .unwrap();
-    crate::matcher::geoip_converter::convert_dat_to_mmdb(&source, &mmdb, None).unwrap();
-    engine.reload(cfg());
-    assert_eq!(engine.geo_data_warnings(), Vec::<String>::new());
+    let readable = dir.path().join("country.mmdb.new");
+    crate::matcher::geoip_converter::convert_dat_to_mmdb(&source, &readable, None).unwrap();
+    std::fs::rename(&readable, &mmdb).unwrap();
+    wait_for("the watch reads the database in", || {
+        engine.geo_data_warnings().is_empty()
+    })
+    .await;
 }
 
-/// 数据文件经符号链接改指到监视不上的地方（目录不存在）以后，Geo 数据的问题里说它在那里监视不上、改动由下一次热重载读，
+/// 数据文件经符号链接改指到监视不上的地方（目录不存在）以后，Geo 数据的问题里说它在那里监视不上、改动由监视的核对接上，
 /// 指回监视得上的地方以后这句话去掉，和配置文件的 `watch_error` 一样。说的是这一个文件：别的文件监视得好好的，不会把它
 /// 去掉
 /// Once a data file is pointed, through a symlink, somewhere that cannot be watched (a
 /// directory that does not exist), the Geo data's problems say it cannot be watched there,
-/// changes being read by the next hot reload, and once it points back somewhere watchable the
+/// changes there caught by the watch's checks, and once it points back somewhere watchable the
 /// sentence goes, as the configuration file's `watch_error` does. It speaks of that one file:
 /// another file being watched well does not take it away
 #[cfg(unix)]
@@ -1096,7 +1110,7 @@ async fn a_data_file_leading_where_nothing_can_be_watched_is_reported() {
 /// sentence saying `what` `path` has places that cannot be watched (why follows)
 fn partly_watched(what: &str, path: &Path) -> String {
     format!(
-        "{what} {} cannot be watched everywhere it leads, changes there are read at the next configuration reload: ",
+        "{what} {} cannot be watched everywhere it leads, {SEEN_WITHIN}: ",
         path.display()
     )
 }
@@ -1110,24 +1124,22 @@ fn link_into_a_missing_directory(dir: &Path, link: &Path) -> std::path::PathBuf 
     target
 }
 
-/// 启动时 GeoSite 数据文件经符号链接指向还不存在的目录：链接所在的目录监视得上，目录里的文件出现却看不到。状态里说它
-/// 有位置监视不上、改动由下一次热重载读；目录建好、文件写进去以后，配置不变的热重载读进来，这句话跟着去掉。以前只要链接
-/// 所在的目录监视得上就当监视着：状态只说它不存在，热重载也不读，直到重启
+/// 启动时 GeoSite 数据文件经符号链接指向还不存在的目录：链接所在的目录监视得上，目录里的文件出现却没有事件。状态里说
+/// 它有位置监视不上、那里的改动由监视的核对接上；目录建好、文件写进去以后，不用热重载，核对就读进来，这句话跟着去掉
 /// At startup a GeoSite data file leads, through a symlink, into a directory not there yet:
-/// the link's directory is watched, yet the file showing up in that directory is not seen. The
-/// status says it has places that cannot be watched, changes being read by the next hot
-/// reload; once the directory is made and the file written, a hot reload with the
-/// configuration unchanged reads it in, and the sentence goes. It used to count as watched as
-/// long as the link's directory was: the status only said it did not exist, and hot reloads did
-/// not read it either, until a restart
+/// the link's directory is watched, yet the file showing up in that directory brings no event.
+/// The status says it has places that cannot be watched, changes there being caught by the
+/// watch's checks; once the directory is made and the file written, a check reads it in with
+/// no hot reload, and the sentence goes
 #[cfg(unix)]
 #[tokio::test]
-async fn a_geosite_file_partly_watched_at_startup_is_read_by_a_reload() {
+async fn a_geosite_file_partly_watched_at_startup_is_read_by_the_check() {
     let dir = tempfile::tempdir().unwrap();
     let conf = dir.path().join("conf");
     std::fs::create_dir(&conf).unwrap();
     let site = conf.join("geosite.dat");
     let target = link_into_a_missing_directory(dir.path(), &site);
+    let _check = crate::watcher::check_every(CHECKED);
     let engine = engine(geosite_config(&[&site], "ads"));
     let warnings = engine.geo_data_warnings();
     assert_eq!(warnings.len(), 3, "{warnings:?}");
@@ -1142,32 +1154,36 @@ async fn a_geosite_file_partly_watched_at_startup_is_read_by_a_reload() {
 
     std::fs::create_dir(target.parent().unwrap()).unwrap();
     std::fs::write(&target, geosite_dat(&[("ads", "ads.test")])).unwrap();
-    engine.reload(geosite_config(&[&site], "ads"));
+    wait_for("the check reads the file in", || {
+        engine.geo().geosite.matches("ads", "x.ads.test")
+    })
+    .await;
     assert_eq!(ask(&engine, "x.ads.test").await, Some(MATCHED));
-    assert_eq!(engine.geo_data_warnings(), Vec::<String>::new());
+    wait_for(
+        "the status says nothing once it is read and watched",
+        || engine.geo_data_warnings().is_empty(),
+    )
+    .await;
 }
 
-/// GeoIP 数据文件走同一套：启动时经符号链接指向还不存在的目录，状态里说它有位置监视不上；文件出现以后配置不变的热重载
-/// 读进来
+/// GeoIP 数据文件走同一套：启动时经符号链接指向还不存在的目录，状态里说它有位置监视不上；文件出现以后核对读进来
 /// The GeoIP data file goes the same way: leading at startup, through a symlink, into a
 /// directory not there yet, it is said to have places that cannot be watched; once the file
-/// shows up a hot reload with the configuration unchanged reads it in
+/// shows up a check reads it in
 #[cfg(unix)]
 #[tokio::test]
-async fn a_geoip_file_partly_watched_at_startup_is_read_by_a_reload() {
+async fn a_geoip_file_partly_watched_at_startup_is_read_by_the_check() {
     let dir = tempfile::tempdir().unwrap();
     let conf = dir.path().join("conf");
     std::fs::create_dir(&conf).unwrap();
     let data = conf.join("geoip.json");
     let target = link_into_a_missing_directory(dir.path(), &data);
-    let cfg = || {
-        config(
-            json!({ "geoip_dat_path": data.to_str().unwrap() }),
-            json!({ "type": "geoip_country", "country_codes": ["TESTNET"] }),
-        )
-    };
     let client: SocketAddr = "198.51.100.7:53000".parse().unwrap();
-    let engine = engine(cfg());
+    let _check = crate::watcher::check_every(CHECKED);
+    let engine = engine(config(
+        json!({ "geoip_dat_path": data.to_str().unwrap() }),
+        json!({ "type": "geoip_country", "country_codes": ["TESTNET"] }),
+    ));
     let warnings = engine.geo_data_warnings();
     assert_eq!(warnings.len(), 3, "{warnings:?}");
     assert!(
@@ -1182,21 +1198,26 @@ async fn a_geoip_file_partly_watched_at_startup_is_read_by_a_reload() {
         r#"{"entries":[{"country_code":"TESTNET","ips":["198.51.100.0/24"]}]}"#,
     )
     .unwrap();
-    engine.reload(cfg());
+    let testnet = [Arc::<str>::from("TESTNET")];
+    wait_for("the check reads the file in", || {
+        engine.geo().geoip.matches_any_tag(client.ip(), &testnet)
+    })
+    .await;
     assert_eq!(ask_from(&engine, "b.test", client).await, Some(MATCHED));
-    assert_eq!(engine.geo_data_warnings(), Vec::<String>::new());
+    wait_for(
+        "the status says nothing once it is read and watched",
+        || engine.geo_data_warnings().is_empty(),
+    )
+    .await;
 }
 
-/// 运行中数据文件经符号链接改指到还不存在的目录里：监视报它有位置监视不上，那个目录建好、文件写进去以后，配置不变的热
-/// 重载读进来。以前这时状态里说它监视不上，热重载却当它监视着、不读，新文件直到重启都用不上
+/// 运行中数据文件经符号链接改指到还不存在的目录里：监视报它有位置监视不上，那个目录建好、文件写进去以后，核对读进来
 /// A data file pointed while running, through a symlink, into a directory not there yet: the
 /// watch reports it has places that cannot be watched, and once that directory is made and the
-/// file written, a hot reload with the configuration unchanged reads it in. The status used to
-/// say it could not be watched there while hot reloads took it as watched and did not read it,
-/// so the new file went unused until a restart
+/// file written, a check reads it in
 #[cfg(unix)]
 #[tokio::test]
-async fn a_data_file_pointed_where_it_is_partly_watched_is_read_by_a_reload() {
+async fn a_data_file_pointed_where_it_is_partly_watched_is_read_by_the_check() {
     use std::os::unix::fs::symlink;
     let dir = tempfile::tempdir().unwrap();
     let (conf, good) = (dir.path().join("conf"), dir.path().join("good"));
@@ -1209,6 +1230,7 @@ async fn a_data_file_pointed_where_it_is_partly_watched_is_read_by_a_reload() {
     .unwrap();
     let site = conf.join("geosite.dat");
     symlink(good.join("geosite.dat"), &site).unwrap();
+    let _check = crate::watcher::check_every(CHECKED);
     let engine = engine(geosite_config(&[&site], "ads"));
     assert_eq!(ask(&engine, "x.good.test").await, Some(MATCHED));
 
@@ -1229,9 +1251,15 @@ async fn a_data_file_pointed_where_it_is_partly_watched_is_read_by_a_reload() {
 
     std::fs::create_dir(target.parent().unwrap()).unwrap();
     std::fs::write(&target, geosite_dat(&[("ads", "later.test")])).unwrap();
-    engine.reload(geosite_config(&[&site], "ads"));
-    assert_eq!(ask(&engine, "x.later.test").await, Some(MATCHED));
-    assert_eq!(engine.geo_data_warnings(), Vec::<String>::new());
+    wait_for("the check reads the file in", || {
+        engine.geo().geosite.matches("ads", "x.later.test")
+    })
+    .await;
+    wait_for(
+        "the status says nothing once it is read and watched",
+        || engine.geo_data_warnings().is_empty(),
+    )
+    .await;
 }
 
 /// GeoSite 数据文件所在的目录是悬空的符号链接（`conf/geo -> missing`）：链接所在的目录照样监视，状态里说它不存在、
@@ -1338,23 +1366,20 @@ async fn a_geosite_file_partly_watched_at_startup_is_watched_once_its_link_is_ma
     assert_eq!(engine.geo_data_warnings(), Vec::<String>::new());
 }
 
-/// GeoSite 数据文件所在的目录删掉，过一会儿才重建、写进新数据：目录没了以后状态里说它监视不上、改动由下一次热重载读，
-/// 在用的数据留着；配置不变的热重载读进新数据，这句话跟着去掉。以前还当它监视着：状态什么都不说，热重载也不读，新数据
-/// 直到重启都用不上
+/// GeoSite 数据文件所在的目录删掉，过一会儿才重建、写进新数据：目录没了以后状态里说它监视不上，在用的数据留着；不用热
+/// 重载，核对就读进新数据，这句话跟着去掉
 /// The directory a GeoSite data file sits in removed, and made again with new data only a
-/// while later: once the directory is gone the status says the file cannot be watched,
-/// changes being read by the next hot reload, the data in use staying; a hot reload with the
-/// configuration unchanged reads the new data in, and the sentence goes. It used to count as
-/// watched still: the status said nothing, hot reloads did not read it either, and the new
-/// data went unused until a restart
+/// while later: once the directory is gone the status says the file cannot be watched, the
+/// data in use staying; a check reads the new data in with no hot reload, and the sentence goes
 #[cfg(unix)]
 #[tokio::test]
-async fn a_geosite_directory_removed_and_made_again_later_is_read_by_a_reload() {
+async fn a_geosite_directory_removed_and_made_again_later_is_read_by_the_check() {
     let root = tempfile::tempdir().unwrap();
     let dir = root.path().join("geo");
     std::fs::create_dir(&dir).unwrap();
     let site = dir.join("geosite.dat");
     std::fs::write(&site, geosite_dat(&[("ads", "first.test")])).unwrap();
+    let _check = crate::watcher::check_every(CHECKED);
     let engine = engine(geosite_config(&[&site], "ads"));
     assert_eq!(ask(&engine, "x.first.test").await, Some(MATCHED));
 
@@ -1371,17 +1396,24 @@ async fn a_geosite_directory_removed_and_made_again_later_is_read_by_a_reload() 
 
     std::fs::create_dir(&dir).unwrap();
     std::fs::write(&site, geosite_dat(&[("ads", "second.test")])).unwrap();
-    engine.reload(geosite_config(&[&site], "ads"));
+    wait_for("the check reads the new data in", || {
+        engine.geo().geosite.matches("ads", "x.second.test")
+    })
+    .await;
     assert_eq!(ask(&engine, "x.second.test").await, Some(MATCHED));
-    assert_eq!(engine.geo_data_warnings(), Vec::<String>::new());
+    wait_for(
+        "the status says nothing once it is read and watched",
+        || engine.geo_data_warnings().is_empty(),
+    )
+    .await;
 }
 
 /// 配置了却不存在、读不了的 Geo 数据文件和 MMDB 记成错误：默认日志级别是 error，记成 warn 的话没开面板时谁也看不到。
-/// 以前都记成 warn。MMDB 那条说它改了以后由下一次热重载读：它不被监视
+/// 以前都记成 warn。MMDB 那条和数据文件一样，说等文件改动：它也被监视
 /// Geo data files and an MMDB that are configured yet not there or unreadable are logged as
 /// errors: the default log level is error, and logged as warns they went unseen without the
-/// panel. They used to be logged as warns. The MMDB's says the next hot reload reads it once
-/// it changes: it is not watched
+/// panel. They used to be logged as warns. The MMDB's says, as the data files' do, that the
+/// file's change is waited for: it is watched too
 #[tokio::test]
 async fn missing_and_unreadable_geo_files_are_logged_as_errors() {
     let dir = tempfile::tempdir().unwrap();
@@ -1421,8 +1453,7 @@ async fn missing_and_unreadable_geo_files_are_logged_as_errors() {
         .collect();
     for wanted in [
         "GeoSite data file not found",
-        // MMDB 不被监视，等的是热重载 / The MMDB is not watched, and what it waits for is a hot reload
-        "failed to open GeoIP database, read again by the next configuration reload once it changes",
+        "failed to open GeoIP database, waiting for the file to change",
         "GeoIP data",
     ] {
         assert!(
@@ -1531,4 +1562,48 @@ async fn a_tag_a_kubernetes_volume_swap_removes_goes() {
     let manager = engine.geo().geosite;
     assert!(manager.matches("ads", "x.ads2.test"));
     assert!(!manager.has_tag("cn"), "cn went with the old version");
+}
+
+/// GeoSite 数据文件在 A/geo 里，A 改名换掉（换发布目录那样，`mv A A.old; mv A.new A`）：只有 A/geo 在监视，事件一个都
+/// 没有，inotify 的监视跟着 A.old/geo 走。不用热重载，核对就读进新目录里的数据；之后新目录里的文件改了读进来，A.old 里
+/// 的改了不读
+/// A GeoSite data file in A/geo, A swapped by renames (as a release directory is, `mv A A.old;
+/// mv A.new A`): A/geo alone is watched, no event comes, and inotify's watch follows A.old/geo.
+/// A check reads the new directory's data in with no hot reload; afterwards the file in the new
+/// directory edited is read in, and the one in A.old edited is not
+#[cfg(unix)]
+#[tokio::test]
+async fn a_geo_directory_swapped_above_is_read_by_the_check() {
+    let root = tempfile::tempdir().unwrap();
+    let real = std::fs::canonicalize(root.path()).unwrap();
+    for (at, suffix) in [("A", "first.test"), ("A.new", "second.test")] {
+        std::fs::create_dir_all(real.join(at).join("geo")).unwrap();
+        let data = geosite_dat(&[("ads", suffix)]);
+        std::fs::write(real.join(at).join("geo/geosite.dat"), data).unwrap();
+    }
+    let site = real.join("A/geo/geosite.dat");
+    let _check = crate::watcher::check_every(CHECKED);
+    let engine = engine(geosite_config(&[&site], "ads"));
+    assert_eq!(ask(&engine, "x.first.test").await, Some(MATCHED));
+
+    std::fs::rename(real.join("A"), real.join("A.old")).unwrap();
+    std::fs::rename(real.join("A.new"), real.join("A")).unwrap();
+    wait_for("the check reads the new directory's data", || {
+        engine.geo().geosite.matches("ads", "x.second.test")
+    })
+    .await;
+    assert_eq!(engine.geo_data_warnings(), Vec::<String>::new());
+    replace(&site, &geosite_dat(&[("ads", "third.test")]));
+    wait_for("the file in the new directory edited is read in", || {
+        engine.geo().geosite.matches("ads", "x.third.test")
+    })
+    .await;
+    replace(
+        &real.join("A.old/geo/geosite.dat"),
+        &geosite_dat(&[("ads", "old.test")]),
+    );
+    tokio::time::sleep(CHECKED * 5).await;
+    let manager = engine.geo().geosite;
+    assert!(manager.matches("ads", "x.third.test"));
+    assert!(!manager.matches("ads", "x.old.test"), "A.old is not read");
 }

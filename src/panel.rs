@@ -201,13 +201,16 @@ struct ActiveConfig {
     /// none, and they are cleared
     problems: Vec<String>,
     /// 配置文件为什么监视不了（见 `watcher::ConfigWatch`），监视着时为 None：启动时装不上或者只装上一部分，或者文件改了
-    /// 指向、新的地方监视不上（又监视上了就回到 None）。监视不了时文件改了不会重载，面板保存的配置也不生效，等不到重载
-    /// 序号变
+    /// 指向、新的地方监视不上（又处处监视上了就回到 None）。装不上时文件改了不会重载，面板保存的配置也不生效，等不到重载
+    /// 序号变；只装上一部分时，经监视得上的地方改的照样马上重载，监视不上的地方改的 10 秒以内才重载（见
+    /// `watcher::Targets::check`）
     /// Why the configuration file cannot be watched (see `watcher::ConfigWatch`), None while
     /// it is: the watch did not go in at startup, or only in part, or the file came to lead
-    /// somewhere that cannot be watched (back to None once it is watched again). Without the
-    /// watch a change to the file is not reloaded, nor is a save from the panel applied, its
-    /// reload sequence never moving on
+    /// somewhere that cannot be watched (back to None once it is watched everywhere again).
+    /// Without the watch a change to the file is not reloaded, nor is a save from the panel
+    /// applied, its reload sequence never moving on; with the watch in only in part, a change
+    /// made through the places watched is still reloaded at once, and one made where the watch
+    /// cannot see is reloaded within 10 s (see `watcher::Targets::check`)
     watch_error: Option<String>,
     /// 配了的入站 DoH 为什么没起来（见 `listeners::BoundListeners::doh_error`），起来了或没配时为 None。DoH 的设置只在
     /// 启动时读，校验和重载不读证书，这一项到下次启动才会变

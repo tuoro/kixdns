@@ -479,14 +479,19 @@ async fn run_dns_server(
         error!(%problem, "configuration problem, loaded all the same; a reload or a save from the panel refuses it");
     }
 
-    // 监视不了时配置文件改了不会重载，面板保存的配置也不生效：记一条 error，默认日志级别看得到，面板经控制通道读
-    // （`config` 的 `watch_error`）。装的时候就有位置监视不上、文件改了指向以后新的地方监视不上时也一样，又监视上了就
-    // 清掉（见 `watcher::ConfigWatch::start_reporting`）
-    // Without the watch a change to the configuration file is not reloaded, nor is a save from
-    // the panel applied: an error is logged, seen at the default log level, and the panel reads
-    // it over the control channel (`config`'s `watch_error`). So too when some of its places
-    // cannot be watched as the watch is installed, or the file comes to lead somewhere that
-    // cannot be, cleared once it is watched again (see `watcher::ConfigWatch::start_reporting`)
+    // 监视不了时（装不上、起不了线程）配置文件改了不会重载，面板保存的配置也不生效：记一条 error，默认日志级别看得到，
+    // 面板经控制通道读（`config` 的 `watch_error`）。装的时候就有位置监视不上、文件改了指向以后新的地方监视不上时，同样记
+    // error、写进 `watch_error`，又处处监视上了就清掉（见 `watcher::ConfigWatch::start_reporting`）；这时经监视得上的
+    // 地方改的照样马上重载，监视不上的地方改的由监视的核对 10 秒以内察觉、重载（见 `watcher::Targets::check`）
+    // Without the watch (not installed, its thread not started) a change to the configuration
+    // file is not reloaded, nor is a save from the panel applied: an error is logged, seen at the
+    // default log level, and the panel reads it over the control channel (`config`'s
+    // `watch_error`). When some of its places cannot be watched as the watch is installed, or the
+    // file comes to lead somewhere that cannot be, an error is logged and `watch_error` set as
+    // well, cleared once it is watched everywhere again (see
+    // `watcher::ConfigWatch::start_reporting`); a change made through the places watched is then
+    // still reloaded at once, and one made where the watch cannot see is noticed by its checks
+    // within 10 s and reloaded (see `watcher::Targets::check`)
     #[cfg(unix)]
     let on_watch = {
         let metrics = panel_metrics.clone();
