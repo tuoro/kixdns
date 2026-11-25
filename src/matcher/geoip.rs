@@ -1,8 +1,7 @@
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
-use std::time::SystemTime;
 
 use anyhow::Context;
 use prost::Message;
@@ -10,6 +9,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Deserialize;
 
 use super::dat_reader::DatReader;
+use crate::watcher::FileStamp;
 
 /// MaxMind GeoLite2-Country 数据库结构，字符串直接借用数据库里的字节
 /// MaxMind GeoLite2-Country database structure, its strings borrowed from the database's bytes
@@ -207,26 +207,6 @@ struct Mmdb {
     file: FileStamp,
 }
 
-/// 一个文件的路径、长度和修改时间：三样都没变，就当内容没变 / A file's path, length and modification
-/// time: with all three unchanged, its content counts as unchanged
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct FileStamp {
-    path: PathBuf,
-    len: u64,
-    modified: Option<SystemTime>,
-}
-
-impl FileStamp {
-    pub(crate) fn of(path: &Path) -> std::io::Result<Self> {
-        let meta = std::fs::metadata(path)?;
-        Ok(Self {
-            path: path.to_path_buf(),
-            len: meta.len(),
-            modified: meta.modified().ok(),
-        })
-    }
-}
-
 impl Mmdb {
     fn open(path: &str, file: FileStamp) -> Result<Self, maxminddb::MaxMindDbError> {
         let content = std::fs::read(path)?;
@@ -338,7 +318,7 @@ impl GeoIpManager {
             }
             Err(e) => {
                 self.mmdb = in_use
-                    .filter(|in_use| in_use.file.path == Path::new(path))
+                    .filter(|in_use| in_use.file.path() == Path::new(path))
                     .cloned();
                 Err(e)
             }

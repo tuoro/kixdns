@@ -13,10 +13,10 @@ use tracing::{error, info, warn};
 
 use super::Engine;
 use super::types::EngineInner;
-use crate::matcher::geoip::{FileStamp, GeoIpManager, is_country_tag};
+use crate::matcher::geoip::{GeoIpManager, is_country_tag};
 use crate::matcher::geosite::{GeoSiteManager, parsed_provides_any};
 use crate::matcher::{GeoManagers, RuntimePipelineConfig};
-use crate::watcher::{FileWatch, PendingWatch};
+use crate::watcher::{FileStamp, FileWatch, PendingWatch};
 use parking_lot::Mutex;
 
 /// 配置里决定加载哪些 GeoSite 数据的部分 / The part of a configuration that decides which GeoSite data is loaded
@@ -526,7 +526,10 @@ fn pending_watch(
     if files.is_empty() {
         return None;
     }
-    match PendingWatch::new(files) {
+    match PendingWatch::new(
+        files,
+        "changes there are read at the next configuration reload",
+    ) {
         Ok(pending) => {
             for (path, err) in pending.uncovered() {
                 problems.watched(kind.file, path, Some(err));
@@ -737,7 +740,7 @@ fn load_geoip(
     if let Some(db_path) = &spec.db_path
         && let Err(err) = fresh.use_mmdb(db_path, in_use)
     {
-        error!(geoip_db = %db_path, error = %format!("{err:#}"), keeping_the_one_in_use = fresh.has_mmdb(), "failed to open GeoIP database, waiting for it to change");
+        error!(geoip_db = %db_path, error = %format!("{err:#}"), keeping_the_one_in_use = fresh.has_mmdb(), "failed to open GeoIP database, read again by the next configuration reload once it changes");
         problems.not_read("GeoIP database", Path::new(db_path), &err);
     }
 
