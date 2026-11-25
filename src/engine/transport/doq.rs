@@ -1150,7 +1150,8 @@ impl DoqStream<'_> {
     /// `finish` 不看 0-RTT 被拒了没有，0-RTT 期间开出的旧流的句柄在被拒以后调它，FIN 掉的是握手完以后开出的同号新流（见
     /// [`EarlyStreams`]），新流上的查询一写就报 `ClosedStream`、失败，上游还收到一个没有查询的流。多线程下，写完时 driver
     /// 正拿着连接锁处理握手完成，`finish` 等锁，放锁后别的查询先开出同号新流，就会这样。Drop 在同一把连接锁里先看是不是被拒的
-    /// 0-RTT 流，是的话不发 FIN；别的发出的和 `finish` 一样
+    /// 0-RTT 流，是的话不发 FIN；别的发出的和 `finish` 一样，只是对端已经 STOP_SENDING 的，照 RFC 9000 第 3.5 节用对端给的
+    /// 码回 RESET_STREAM（`finish` 这时什么也不发）
     /// The query written, ends sending (RFC 9250 section 4.2): quinn's send side is dropped, its
     /// Drop sending FIN. `finish` is not called: quinn 0.11.11's `finish` does not look whether
     /// 0-RTT was rejected, and called on the handle of an old stream opened during 0-RTT once it
@@ -1160,7 +1161,9 @@ impl DoqStream<'_> {
     /// when the driver holds the connection lock handling the handshake's completion as the write
     /// is done, `finish` waiting for the lock and another query opening the new stream first once
     /// it is released. Drop looks whether it is a rejected 0-RTT stream under that same lock and
-    /// sends no FIN if so; for any other stream it sends just what `finish` does
+    /// sends no FIN if so; for any other stream it sends just what `finish` does, save that a
+    /// stream the peer has sent STOP_SENDING for is answered with RESET_STREAM carrying the
+    /// peer's code, as RFC 9000 section 3.5 asks (where `finish` sends nothing)
     fn end_sending(&mut self) {
         self.send = None;
     }
