@@ -108,7 +108,7 @@ mod buffered {
 /// watching the files too
 pub struct DohCertificate {
     current: Arc<ArcSwap<TlsAcceptor>>,
-    /// 证书文件的监视，监视不了时没有 / The watch on the certificate files, none when they cannot be watched
+    /// 证书文件的监视，监视线程起不来时没有 / The watch on the certificate files, none when its thread cannot start
     _watch: Option<watcher::FileWatch>,
 }
 
@@ -159,8 +159,9 @@ fn stamps(cert: &str, key: &str) -> Stamps {
 /// 里改了的每个文件各回调一次，续期时证书和私钥一起换，头一次回调已经把两个都读了
 ///
 /// 证书和私钥也会分两阵写到（scp 一个个推，慢路由器上 acme.sh 一个个 `cat >`），先到的那个配着旧的另一个读不了。所以读不了
-/// 时在监视线程上等一阵改动最长能等的那么久（见 `watcher::AT_MOST`），两个文件又换了就再读；还是那一对、照样读不了才记
-/// error，换上了的只记一条 reloaded
+/// 时在监视线程上等一阵改动最长能等的那么久（见 `watcher::AT_MOST`）再看一次：两个文件这期间又换了就不记，留给那次改动的
+/// 回调去读（监视等它写完，Linux 上等写的一方关上文件），只靠核对察觉改动时等下一次核对；还是那一对才记 error，换上了的只记
+/// 一条 reloaded。每次回调至多等这一次：一直有人改写读不了的一对，监视线程也照样回去收消息，丢掉监视时不会一直等下去
 /// The certificate files changed: the certificate read again goes in, or the one in use stays
 /// when it cannot be read. With both files as they were before the last read (`read`) they are
 /// not read again: the watch calls back once for each file a burst of changes changed, and a
@@ -169,27 +170,28 @@ fn stamps(cert: &str, key: &str) -> Stamps {
 /// The certificate and the key also arrive in two bursts (pushed one by one with scp, or
 /// written one `cat >` at a time by acme.sh on a slow router), the first one in going with the
 /// old other one and failing to read. So on a failure the watch thread waits as long as a
-/// burst of changes may last (see `watcher::AT_MOST`), and reads again when the files changed
-/// meanwhile; only the same pair failing again logs an error, and one brought in logs a single
-/// "reloaded"
+/// burst of changes may last (see `watcher::AT_MOST`) and looks once more: with the files
+/// changed meanwhile nothing is logged, the read left to that change's own callback (the watch
+/// waiting for it to be written, on Linux for the writer to close the file), or to the next
+/// check where changes are noticed by the checks alone; only the same pair logs an error, and
+/// one brought in logs a single "reloaded". Each callback waits once at most: with a pair that
+/// cannot be read rewritten without end the watch thread still goes back to its messages, and
+/// dropping the watch does not wait on and on
 fn reload(current: &ArcSwap<TlsAcceptor>, cert: &str, key: &str, read: &mut Stamps) {
-    let mut now = stamps(cert, key);
+    let now = stamps(cert, key);
     if now == *read {
         debug!(cert, key, "DoH TLS certificate unchanged, not read again");
         return;
     }
-    let built = loop {
-        *read = now;
-        let built = build_tls_acceptor(cert, key);
-        if built.is_ok() {
-            break built;
-        }
+    *read = now;
+    let built = build_tls_acceptor(cert, key);
+    if built.is_err() {
         std::thread::sleep(watcher::AT_MOST);
-        now = stamps(cert, key);
-        if now == *read {
-            break built;
+        if stamps(cert, key) != *read {
+            debug!(cert, key, "DoH TLS certificate changed while waiting");
+            return;
         }
-    };
+    }
     match built {
         Ok(acceptor) => {
             current.store(Arc::new(acceptor));
@@ -1605,39 +1607,77 @@ mod tests {
         .expect("the renewed certificate is used");
     }
 
-    /// 私钥先换上、隔 0.2 秒证书才到（分两阵写到）：读到新私钥配旧证书读不了，等了一会儿看出证书也换了，再读一遍换上，
-    /// 不记 error。以前先记一条 reload failed，下一阵才换上，默认日志级别只看得到失败
+    /// 私钥先换上、隔 0.2 秒证书才到（分两阵写到）：读到新私钥配旧证书读不了，等了一会儿看出证书也换了，由证书那次改动的
+    /// 回调读，换上新的一对，不记 error（日志由 `tests/doh_renewal.rs` 在真程序上看）
     /// The key replaced first and the certificate 0.2 s later (arriving in two bursts): the new
     /// key with the old certificate fails to read, and having waited a while it tells the
-    /// certificate changed too, reads again and brings the pair in, logging no error. A "reload
-    /// failed" used to be logged first and the pair brought in by the next burst, the default
-    /// log level showing the failure alone
+    /// certificate changed too, left to the certificate's change's own callback, which brings the
+    /// new pair in, logging no error (the log is looked at on the real binary by
+    /// `tests/doh_renewal.rs`)
     #[test]
-    fn a_renewal_arriving_in_two_bursts_is_brought_in_without_an_error() {
+    fn a_renewal_arriving_in_two_bursts_is_brought_in() {
         let dir = tempfile::tempdir().unwrap();
         let (cert, key) = crate::engine::test_support::write_certificate(dir.path());
-        let mut read = stamps(&cert, &key);
-        let current = ArcSwap::from_pointee(build_tls_acceptor(&cert, &key).unwrap());
-        let in_use = current.load_full();
+        let certificate = DohCertificate::load(&cert, &key).unwrap();
+        let in_use = certificate.current.load_full();
         let renewal = dir.path().join("renewal");
         std::fs::create_dir(&renewal).unwrap();
         let (new_cert, new_key) = crate::engine::test_support::write_certificate(&renewal);
 
         std::fs::rename(&new_key, &key).unwrap();
-        let certificate = cert.clone();
-        let later = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(200));
-            std::fs::rename(&new_cert, &certificate).unwrap();
-        });
-        let (warnings, guard) = crate::engine::test_support::Warnings::capture();
-        reload(&current, &cert, &key, &mut read);
-        drop(guard);
-        later.join().unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        std::fs::rename(&new_cert, &cert).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while Arc::ptr_eq(&certificate.current.load_full(), &in_use) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the renewed pair is used"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// 读不了的一对一直被改写（这里每 0.3 秒一次）时，监视线程不会一直等下去：丢掉证书（最后一个监听口停下）以后，至多等
+    /// 手上那阵改动的两次回调（证书、私钥各一次）各等一次就停下。以前读不了就等、看到又换了就再读，一直改写就一直不返回，
+    /// 丢掉证书要等改写停了才停得下来
+    /// With a pair that cannot be read rewritten without end (every 0.3 s here) the watch thread
+    /// does not wait on and on: once the certificate is dropped (the last listener stopping), it
+    /// stops after at most one wait in each of the two callbacks of the burst at hand (the
+    /// certificate's and the key's). It used to wait on a failure, and read again on seeing the
+    /// files changed, never returning while they were rewritten, so dropping the certificate
+    /// waited for the rewriting to stop
+    #[test]
+    fn a_pair_rewritten_without_end_does_not_hold_the_watch() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, key) = crate::engine::test_support::write_certificate(dir.path());
+        let certificate = DohCertificate::load(&cert, &key).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let rewriting = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let until = std::time::Instant::now() + Duration::from_secs(10);
+                for round in 0.. {
+                    if stop.load(Ordering::Relaxed) || std::time::Instant::now() > until {
+                        break;
+                    }
+                    std::fs::write(&cert, format!("not a certificate {round}")).unwrap();
+                    std::fs::write(&key, format!("not a key {round}")).unwrap();
+                    std::thread::sleep(Duration::from_millis(300));
+                }
+            })
+        };
+
+        std::thread::sleep(Duration::from_secs(1));
+        let dropping = std::time::Instant::now();
+        drop(certificate);
+        let dropped = dropping.elapsed();
+        stop.store(true, Ordering::Relaxed);
+        rewriting.join().unwrap();
         assert!(
-            !Arc::ptr_eq(&current.load_full(), &in_use),
-            "the renewed pair is used"
+            dropped < watcher::AT_MOST * 2 + Duration::from_secs(1),
+            "dropping took {dropped:?}"
         );
-        assert_eq!(warnings.lines(), Vec::<String>::new());
     }
 
     /// 最后一个监听口停下时证书的监视也停下：监视线程结束，放下它手里的证书。以前这个线程谁也停不了，进程活着它就一直在
