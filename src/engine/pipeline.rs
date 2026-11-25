@@ -341,11 +341,11 @@ impl Engine {
                             ecs,
                         } => {
                             // 规则写了几个 forward 时，轮到头一个就照配置加载时合并好的一起问（见
-                            // `Rule::compute_merged_forward`），每个上游的传输写在它自己的地址里，没写前缀的用 UDP；
+                            // `Rule::merged_forward`），每个上游的传输写在它自己的地址里，没写前缀的用 UDP；
                             // 写在前面的 log 和只有一个 forward 时一样已经执行过。以前合并的转发在执行动作之前就给出，
                             // 这样的规则 log 从不执行
                             // With several forwards written, the first one's turn asks them all as merged
-                            // at config load (see `Rule::compute_merged_forward`), each upstream's
+                            // at config load (see `Rule::merged_forward`), each upstream's
                             // transport written in its own address, UDP for one without a scheme; a log
                             // written before has run, as with a single forward. The merged forward used to
                             // be given before any action ran, and the log of such a rule never did

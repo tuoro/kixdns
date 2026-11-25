@@ -208,8 +208,11 @@ impl Default for GlobalSettings {
             tcp_connection_idle_timeout_seconds: 60, // 1 分钟 / 1 minute
             doq_connection_idle_timeout_seconds: 60, // 1 分钟 / 1 minute
             doq_keepalive_interval_ms: 15_000,
-            // 默认启用 0-RTT，系统会自动检测并回退不支持的服务器
-            // Enabled by default - system automatically detects and falls back for unsupported servers
+            // 默认启用 0-RTT。上游不收早期数据时，查询在同一条连接握手完以后重发（见 doq.rs 的
+            // `DoqMuxClient::early_data_refused`）
+            // Enabled by default. When the upstream refuses early data, the query is sent again on
+            // the same connection once the handshake completes (see
+            // `DoqMuxClient::early_data_refused` in doq.rs)
             doq_enable_0rtt: true,
             flow_control_enabled: false,
             cache_capacity: 10_000,
@@ -322,10 +325,11 @@ impl std::hash::Hash for ForwardTarget {
     }
 }
 
-/// Pre-computed merged upstream list for rules with multiple Forward actions.
-/// Computed at config load time to avoid per-request allocation of 5 FxHashSets + format!/join.
-/// 多 Forward action 规则的预计算合并上游列表。
-/// 在配置加载时计算，避免每请求分配 5 个 FxHashSet + format!/join。
+/// 一条规则的几个 forward 合并成的那一次转发，编译配置时算好（见 [`Rule::merged_forward`]），每个请求不用再按传输
+/// 各建一个 FxHashSet（`Transport::ALL` 里每种一个）去重、拼接
+/// The one forward a rule's several forwards merge into, worked out as the configuration
+/// compiles (see [`Rule::merged_forward`]), so that no request builds an FxHashSet per transport
+/// (one for each in `Transport::ALL`) to deduplicate and join
 #[derive(Debug, Clone)]
 pub struct MergedForward {
     /// 合并后问的上游，每个都带着协议前缀 / The upstreams asked once merged, each with its
@@ -358,12 +362,6 @@ pub struct Rule {
     /// 响应匹配失败后执行的动作序列。 / Action sequence to execute after failed response matching
     #[serde(default)]
     pub response_actions_on_miss: Vec<Action>,
-    /// Pre-computed merge result for multiple Forward actions (None if <=1 Forward action).
-    /// Computed at load time to eliminate per-request FxHashSet + format! + join overhead.
-    /// 多个 Forward action 的预计算合并结果（<=1 个 Forward 时为 None）。
-    /// 在加载时计算以消除每请求的 FxHashSet + format! + join 开销。
-    #[serde(skip)]
-    pub merged_forward: Option<MergedForward>,
 }
 
 /// 请求匹配器：规则和 pipeline_select 用的是同一套，pipeline_select 另外认 `listener_label`
@@ -691,10 +689,10 @@ impl Rule {
         request.iter().chain(response)
     }
 
-    /// 合并转发时问的那几个 forward（写了地址的，见 `compute_merged_forward`）共用的 ecs：写得一样
+    /// 合并转发时问的那几个 forward（写了地址的，见 [`Rule::merged_forward`]）共用的 ecs：写得一样
     /// 时就是它，写得不一样时为 Err。合并后只有一次转发，只能发一个 ECS
     /// The ecs shared by the forwards a merged forward asks (those naming an address, see
-    /// `compute_merged_forward`): it when they all write the same, Err when they differ. The
+    /// [`Rule::merged_forward`]): it when they all write the same, Err when they differ. The
     /// merge is a single forward and can send only one ECS
     pub(crate) fn shared_forward_ecs(&self) -> Result<Option<&EcsMode>, ()> {
         let mut ecs = self.actions.iter().filter_map(|action| match action {
@@ -713,14 +711,16 @@ impl Rule {
         }
     }
 
-    /// Pre-compute merged upstream list for rules with multiple Forward actions.
-    /// Extracts the transport-aware merge logic from the runtime hot path into a one-time
-    /// computation at config load, eliminating per-request FxHashSet + format! + join overhead.
-    /// 预计算多 Forward action 规则的合并上游列表。
-    /// 将传输层感知的合并逻辑从运行时热路径提取到配置加载时的一次性计算，
-    /// 消除每请求的 FxHashSet + format! + join 开销。
-    #[inline]
-    pub fn compute_merged_forward(&mut self) {
+    /// 几个 forward 合并成的那一次转发（见 [`MergedForward`]）：每个 forward 写的上游按传输分组去重，各组按
+    /// `Transport::ALL` 的顺序排成一串。规则写了不止一个 forward、轮到的是 forward（前面没有别的作决定的动作，见
+    /// [`Rule::request_decision`]），而且至少一个 forward 写了地址时才有，否则为 None。编译配置时每条规则算一次
+    /// The one forward several forwards merge into (see [`MergedForward`]): the upstreams each
+    /// forward writes, deduplicated in a group per transport, the groups strung together in the
+    /// order of `Transport::ALL`. It is there only when the rule writes more than one forward, a
+    /// forward has the turn (no other deciding action written before, see
+    /// [`Rule::request_decision`]) and at least one forward names an address, None otherwise.
+    /// Worked out once for each rule as the configuration compiles
+    pub(crate) fn merged_forward(&self) -> Option<MergedForward> {
         use rustc_hash::FxHashSet;
 
         let forward_count = self
@@ -730,7 +730,7 @@ impl Rule {
             .count();
 
         if forward_count <= 1 {
-            return;
+            return None;
         }
         // 动作按写的顺序执行，合并只在轮到 forward 时才算：forward 前面已经写了别的作决定的动作（见
         // [`Rule::request_decision`]）时，规则给的是那个动作的结果，后面的 forward 轮不到。不这样的话，这条规则走完整
@@ -741,7 +741,7 @@ impl Rule {
         // forwards never have their turn. Otherwise the rule forwards on the full path while the
         // fast path answers its static first action
         if !matches!(self.request_decision(), Some(Action::Forward { .. })) {
-            return;
+            return None;
         }
 
         // 每种传输一组，各组按 `Transport::ALL` 的顺序排进合并后的列表 / One set per transport, each
@@ -779,27 +779,26 @@ impl Rule {
                 forward_count,
                 "all forward actions have empty upstream, merged_forward not set"
             );
-            self.merged_forward = None;
-        } else {
-            tracing::debug!(
-                rule = %self.name,
-                forward_count,
-                tcp_count = sets[Transport::Tcp as usize].len(),
-                udp_count = sets[Transport::Udp as usize].len(),
-                tcp_udp_count = sets[Transport::TcpUdp as usize].len(),
-                doh_count = sets[Transport::Doh as usize].len(),
-                dot_count = sets[Transport::Dot as usize].len(),
-                doq_count = sets[Transport::Doq as usize].len(),
-                total_upstreams = all_upstreams.len(),
-                "pre-computed merged forward actions with transport-specific deduplication"
-            );
-            self.merged_forward = Some(MergedForward {
-                target: ForwardTarget::new(&all_upstreams.join(",")),
-                // 写得不一样时不发，启动时 `problems` 记一条错误 / None when they differ;
-                // at startup `problems` logs an error
-                ecs: self.shared_forward_ecs().ok().flatten().cloned(),
-            });
+            return None;
         }
+        tracing::debug!(
+            rule = %self.name,
+            forward_count,
+            tcp_count = sets[Transport::Tcp as usize].len(),
+            udp_count = sets[Transport::Udp as usize].len(),
+            tcp_udp_count = sets[Transport::TcpUdp as usize].len(),
+            doh_count = sets[Transport::Doh as usize].len(),
+            dot_count = sets[Transport::Dot as usize].len(),
+            doq_count = sets[Transport::Doq as usize].len(),
+            total_upstreams = all_upstreams.len(),
+            "pre-computed merged forward actions with transport-specific deduplication"
+        );
+        Some(MergedForward {
+            target: ForwardTarget::new(&all_upstreams.join(",")),
+            // 写得不一样时不发，启动时 `problems` 记一条错误 / None when they differ;
+            // at startup `problems` logs an error
+            ecs: self.shared_forward_ecs().ok().flatten().cloned(),
+        })
     }
 }
 
@@ -1084,12 +1083,13 @@ impl GlobalSettings {
             .unwrap_or_else(|| self.default_request_timeout_ms())
     }
 
-    /// 一次转发问的上游：forward 自己写了的（`written`，见 [`Action::Forward`]）就是它们，没写、或者不是 forward 写的
-    /// （没有规则作决定、allow）是 `default_upstream`。请求阶段和回答阶段的 forward 都照它挑
-    /// The upstreams a forward asks: those the forward writes (`written`, see
-    /// [`Action::Forward`]) when it writes some, `default_upstream` when it writes none or the
-    /// forward is no action's (no rule deciding, an allow). The request phase's forwards and the
-    /// answer phase's alike pick by it
+    /// 一个 forward 动作问的上游：它自己写了的（`written`，见 [`Action::Forward`]）就是它们，没写的是
+    /// `default_upstream`。请求阶段和回答阶段的 forward 都照它挑。没有规则作决定和 allow 不是 forward 动作，直接问
+    /// `default_upstream`（见 `Decision::to_default_upstream`）
+    /// The upstreams a forward action asks: those it writes (`written`, see [`Action::Forward`])
+    /// when it writes some, `default_upstream` when it writes none. The request phase's forwards
+    /// and the answer phase's alike pick by it. No rule deciding and an allow are no forward
+    /// action and ask `default_upstream` straight (see `Decision::to_default_upstream`)
     pub(crate) fn forward_target<'a>(
         &'a self,
         written: Option<&'a ForwardTarget>,
@@ -1209,8 +1209,8 @@ pub enum Transport {
 }
 
 impl Transport {
-    /// 每种传输，按合并的转发给上游分组的顺序（见 [`Rule::compute_merged_forward`]）/ Every transport, in
-    /// the order a merged forward groups its upstreams by (see [`Rule::compute_merged_forward`])
+    /// 每种传输，按合并的转发给上游分组的顺序（见 [`Rule::merged_forward`]）/ Every transport, in
+    /// the order a merged forward groups its upstreams by (see [`Rule::merged_forward`])
     pub(crate) const ALL: [Self; 6] = [
         Self::Tcp,
         Self::Udp,
@@ -2650,13 +2650,12 @@ mod merged_forward_tests {
     /// 一条规则的几个转发动作合并出的上游列表，排好序 / The upstream list a rule's forward
     /// actions merge into, sorted
     fn merged(actions: serde_json::Value) -> Vec<String> {
-        let mut rule: Rule = serde_json::from_value(json!({
+        let rule: Rule = serde_json::from_value(json!({
             "name": "r", "matchers": [{ "type": "any" }], "actions": actions
         }))
         .expect("parse rule");
-        rule.compute_merged_forward();
         let mut list: Vec<String> = rule
-            .merged_forward
+            .merged_forward()
             .expect("several forwards merge")
             .target
             .upstreams()
@@ -2727,12 +2726,11 @@ mod merged_forward_tests {
     #[test]
     fn a_merged_forward_sends_the_ecs_its_forwards_share() {
         let ecs_of = |actions: serde_json::Value| {
-            let mut rule: Rule = serde_json::from_value(json!({
+            let rule: Rule = serde_json::from_value(json!({
                 "name": "r", "matchers": [{ "type": "any" }], "actions": actions
             }))
             .expect("parse rule");
-            rule.compute_merged_forward();
-            rule.merged_forward.expect("several forwards merge").ecs
+            rule.merged_forward().expect("several forwards merge").ecs
         };
         let from_client = json!({ "mode": "from_client_ip", "prefix_v4": 24, "prefix_v6": 56 });
         let forward = |upstream: &str, ecs: &serde_json::Value| json!({ "type": "forward", "upstream": upstream, "ecs": ecs });
@@ -2795,7 +2793,7 @@ mod merged_forward_tests {
     /// what each group holds
     #[test]
     fn a_merged_list_is_grouped_by_transport_in_a_fixed_order() {
-        let mut rule: Rule = serde_json::from_value(json!({
+        let rule: Rule = serde_json::from_value(json!({
             "name": "r", "matchers": [{ "type": "any" }], "actions": [
                 { "type": "forward", "upstream": "doq://192.0.2.6:853, dot://192.0.2.5:853" },
                 { "type": "forward", "upstream": "doh://dns.example/dns-query" },
@@ -2805,8 +2803,7 @@ mod merged_forward_tests {
             ]
         }))
         .expect("parse rule");
-        rule.compute_merged_forward();
-        let merged = rule.merged_forward.expect("several forwards merge");
+        let merged = rule.merged_forward().expect("several forwards merge");
         let list: Vec<String> = merged
             .target
             .upstreams()
