@@ -93,7 +93,7 @@ pipeline_select 的每项包含 Pipeline id、可选的匹配器列表和可选�
 | geo_site_not | value：GeoSite tag |
 | geoip_country | country_codes：字符串数组 |
 | geoip_private | expect：布尔值 |
-| qtype | value：记录类型名（A、AAAA、CNAME、HTTPS、SVCB、CAA、ANY 等，大小写不论），或 RFC 3597 的 `TYPE65` 这样的数字写法 |
+| qtype | value：记录类型名（A、AAAA、CNAME、HTTPS、SVCB、CAA、OPT、IXFR、ANY 等，有名字的类型都认，大小写不论），或 RFC 3597 的 `TYPE65` 这样的数字写法 |
 
 Pipeline selector 支持上表全部类型；请求规则支持除 listener_label 之外的全部类型。
 
@@ -126,7 +126,7 @@ Pipeline selector 支持上表全部类型；请求规则支持除 listener_labe
 | request_domain_regex | value |
 | response_upstream_ip | cidr；支持逗号分隔 CIDR |
 | response_answer_ip | cidr；支持逗号分隔 CIDR |
-| response_type | value；优先检查第一个 Answer 记录，没有 Answer 时使用查询类型 |
+| response_type | value，写法和 qtype 一样；优先检查第一个 Answer 记录，没有 Answer 时使用查询类型 |
 | response_rcode | value：NOERROR、FORMERR、SERVFAIL、NXDOMAIN、NOTIMP、REFUSED，或 OTHER（其余的 RCODE），大小写不论；别的写法是配置问题（见下文） |
 | response_qclass | value |
 | response_edns_present | expect：布尔值 |

@@ -93,7 +93,7 @@ The same structure is used for response_matchers, response_matcher_operator, res
 | geo_site_not | value: GeoSite tag |
 | geoip_country | country_codes: string array |
 | geoip_private | expect: boolean |
-| qtype | value: a record type name (A, AAAA, CNAME, HTTPS, SVCB, CAA, ANY and so on, in any case), or the RFC 3597 form such as `TYPE65` |
+| qtype | value: a record type name (A, AAAA, CNAME, HTTPS, SVCB, CAA, OPT, IXFR, ANY and so on, every type with a name, in any case), or the RFC 3597 form such as `TYPE65` |
 
 Pipeline selectors support all of the rows above. Request rules support all rows except listener_label.
 
@@ -126,7 +126,7 @@ Domain suffix and GeoSite matching are also case-insensitive. `domain_suffix` an
 | request_domain_regex | value |
 | response_upstream_ip | cidr; comma-separated CIDRs are accepted |
 | response_answer_ip | cidr; comma-separated CIDRs are accepted |
-| response_type | value; the first answer record type, or the query type if there is no answer |
+| response_type | value, written as for qtype; the first answer record type, or the query type if there is no answer |
 | response_rcode | value: NOERROR, FORMERR, SERVFAIL, NXDOMAIN, NOTIMP, REFUSED, or OTHER (any other RCODE), in any case; anything else written is a configuration problem (see below) |
 | response_qclass | value |
 | response_edns_present | expect: boolean |
