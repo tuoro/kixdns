@@ -4,7 +4,7 @@ use crate::ecs::EcsKey;
 use crate::engine::Engine;
 use crate::matcher::{
     GeoManagers, Requester, RequesterKey, ResponsePhase, RuntimeMatcher, RuntimePipeline,
-    RuntimePipelineConfig, RuntimeResponseMatcher,
+    RuntimePipelineConfig, RuntimeResponseMatcher, RuntimeRule,
 };
 use crate::proto_utils::QueryFlags;
 use bytes::Bytes;
@@ -595,21 +595,45 @@ fn hash_global_settings_semantics(settings: &GlobalSettings, hasher: &mut impl H
 /// leaves the caches alone. Both used to count on their own, so changing an `ecs` that did
 /// nothing dropped the whole cache
 fn hash_pipeline_semantics(pipeline: &RuntimePipeline, hasher: &mut impl Hasher) {
-    pipeline.id.hash(hasher);
-    pipeline.rules.len().hash(hasher);
-    for rule in &pipeline.rules {
-        rule.name.hash(hasher);
-        rule.matchers.len().hash(hasher);
-        for matcher in rule.matchers.iter() {
+    let RuntimePipeline {
+        id,
+        rules,
+        // 都由规则得出：这个 pipeline 的，和 `answered_through` 里的 pipeline 的（那些另算进来，见
+        // `build_cache_namespaces`），算了规则就算了它们
+        // All derive from rules, this pipeline's and those of the pipelines in
+        // `answered_through` (which count on their own, see `build_cache_namespaces`), and
+        // count through them
+        index: _,
+        last_precomputed: _,
+        requester: _,
+        rule_requester: _,
+        matches_regex: _,
+        geo_data: _,
+        answered_through: _,
+    } = pipeline;
+    id.hash(hasher);
+    rules.len().hash(hasher);
+    for rule in rules {
+        let RuntimeRule {
+            name,
+            matchers,
+            actions,
+            response_phase,
+            // 由 `actions` 得出 / Derives from `actions`
+            merged_forward: _,
+        } = rule;
+        name.hash(hasher);
+        matchers.len().hash(hasher);
+        for matcher in matchers {
             hash_match_operator(matcher.operator, hasher);
             hash_runtime_matcher(&matcher.matcher, hasher);
         }
-        rule.actions.len().hash(hasher);
-        for action in &rule.actions {
+        actions.len().hash(hasher);
+        for action in actions {
             hash_action(action, hasher);
         }
         let (response_matchers, on_match, on_miss) =
-            ResponsePhase::parts(rule.response_phase.as_deref());
+            ResponsePhase::parts(response_phase.as_deref());
         response_matchers.len().hash(hasher);
         for matcher in response_matchers {
             hash_match_operator(matcher.operator, hasher);
@@ -652,11 +676,15 @@ fn hash_ecs_mode(mode: Option<&EcsMode>, hasher: &mut impl Hasher) {
     }
 }
 
-/// 每个动作的字段都写全：新加的字段不说清进不进命名空间就编不过。编好的应答（`answer`）是由写出来的那几项得出的，
-/// 算了那几项就算了它
-/// Every action's fields are spelled out, so a field added later does not compile without
-/// saying whether it enters the namespace. The compiled answer (`answer`) derives from the
-/// fields written, and counts through them
+/// 这个和后面的 `hash_runtime_matcher`、`hash_runtime_response_matcher` 都把每个变体的字段写全：新加的字段不说清进不进
+/// 命名空间就编不过。编好的部分由写出来的那几项得出，算了那几项就算了它们：动作编好的应答（`answer`），`upstream_equals`
+/// 拆好的地址（`addresses`，由 `value` 得出），`response_txt_content` 编好的正则（`regex`，由 `mode` 和 `value` 得出）
+/// This and `hash_runtime_matcher` and `hash_runtime_response_matcher` after it spell out
+/// every variant's fields, so a field added later does not compile without saying whether it
+/// enters the namespace. What is compiled derives from the fields written and counts through
+/// them: an action's compiled answer (`answer`), the addresses `upstream_equals` splits
+/// (`addresses`, from `value`), the regex `response_txt_content` compiles (`regex`, from
+/// `mode` and `value`)
 fn hash_action(action: &Action, hasher: &mut impl Hasher) {
     discriminant(action).hash(hasher);
     match action {
@@ -716,7 +744,10 @@ fn hash_runtime_matcher(matcher: &RuntimeMatcher, hasher: &mut impl Hasher) {
 fn hash_runtime_response_matcher(matcher: &RuntimeResponseMatcher, hasher: &mut impl Hasher) {
     discriminant(matcher).hash(hasher);
     match matcher {
-        RuntimeResponseMatcher::UpstreamEquals { value, .. }
+        RuntimeResponseMatcher::UpstreamEquals {
+            value,
+            addresses: _,
+        }
         | RuntimeResponseMatcher::RequestDomainSuffix { value }
         | RuntimeResponseMatcher::RequestDomainExact { value }
         | RuntimeResponseMatcher::ResponseRequestDomainGeoSite { value }
@@ -732,7 +763,11 @@ fn hash_runtime_response_matcher(matcher: &RuntimeResponseMatcher, hasher: &mut 
         RuntimeResponseMatcher::ResponseAnswerIpGeoipCountry { country_codes } => {
             country_codes.hash(hasher)
         }
-        RuntimeResponseMatcher::ResponseTxtContent { mode, value, .. } => {
+        RuntimeResponseMatcher::ResponseTxtContent {
+            mode,
+            value,
+            regex: _,
+        } => {
             discriminant(mode).hash(hasher);
             value.hash(hasher);
         }
