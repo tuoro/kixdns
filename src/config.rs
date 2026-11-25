@@ -712,12 +712,30 @@ impl Rule {
         })
     }
 
+    /// 几个 forward 合成一次转发：规则写了不止一个 forward，而且作决定的是 forward（见 [`Rule::request_decision`]）。
+    /// 动作按写的顺序执行，forward 前面已经写了别的作决定的动作时，规则给的是那个动作的结果，后面的 forward 轮不到；
+    /// 要是照样合并，这条规则走完整路径时去转发，走快速路径时却照第一个动作回静态应答
+    /// Several forwards merge into one: the rule writes more than one forward, and a forward
+    /// decides (see [`Rule::request_decision`]). Actions run in the order written: with another
+    /// deciding action written before the forwards, what the rule gives is that action's outcome
+    /// and the forwards never have their turn; were they merged all the same, the rule would
+    /// forward on the full path while the fast path answered its static first action
+    fn merges(&self) -> bool {
+        matches!(self.request_decision(), Some(Action::Forward { .. }))
+            && self
+                .actions
+                .iter()
+                .filter(|action| matches!(action, Action::Forward { .. }))
+                .nth(1)
+                .is_some()
+    }
+
     /// 合并转发时问的那几个 forward（问得到地址的，见 [`Rule::merged_forward`]）共用的 ecs：写得一样时就是它，写得不一样
     /// 时为 Err。合并后只有一次转发，只能发一个 ECS
     /// The ecs shared by the forwards a merged forward asks (those asking an address, see
     /// [`Rule::merged_forward`]): it when they all write the same, Err when they differ. The
     /// merge is a single forward and can send only one ECS
-    pub(crate) fn shared_forward_ecs<'a>(
+    fn shared_forward_ecs<'a>(
         &'a self,
         settings: &'a GlobalSettings,
     ) -> Result<Option<&'a EcsMode>, ()> {
@@ -735,34 +753,21 @@ impl Rule {
 
     /// 几个 forward 合并成的那一次转发（见 [`MergedForward`]）：每个 forward 问的上游（没写的问 `settings` 的
     /// `default_upstream`，和只有它一个时一样，见 [`GlobalSettings::forward_target`]）按传输分组去重，各组按
-    /// `Transport::ALL` 的顺序排成一串。规则写了不止一个 forward、轮到的是 forward（前面没有别的作决定的动作，见
-    /// [`Rule::request_decision`]），而且至少一个 forward 问得到地址时才有，否则为 None。编译配置时每条规则算一次
+    /// `Transport::ALL` 的顺序排成一串。几个 forward 合成一次转发（见 [`Rule::merges`]），而且至少一个 forward 问得到
+    /// 地址时才有，否则为 None。编译配置时每条规则算一次
     /// The one forward several forwards merge into (see [`MergedForward`]): the upstreams each
     /// forward asks (`settings`' `default_upstream` for one writing none, as when it is alone,
     /// see [`GlobalSettings::forward_target`]), deduplicated in a group per transport, the groups
-    /// strung together in the order of `Transport::ALL`. It is there only when the rule writes
-    /// more than one forward, a forward has the turn (no other deciding action written before,
-    /// see [`Rule::request_decision`]) and at least one forward asks an address, None otherwise.
+    /// strung together in the order of `Transport::ALL`. It is there only when the forwards
+    /// merge (see [`Rule::merges`]) and at least one forward asks an address, None otherwise.
     /// Worked out once for each rule as the configuration compiles
     pub(crate) fn merged_forward(&self, settings: &GlobalSettings) -> Option<MergedForward> {
         use rustc_hash::FxHashSet;
 
+        if !self.merges() {
+            return None;
+        }
         let forward_count = self.forwards(settings).count();
-
-        if forward_count <= 1 {
-            return None;
-        }
-        // 动作按写的顺序执行，合并只在轮到 forward 时才算：forward 前面已经写了别的作决定的动作（见
-        // [`Rule::request_decision`]）时，规则给的是那个动作的结果，后面的 forward 轮不到。不这样的话，这条规则走完整
-        // 路径时去转发，走快速路径时照第一个动作回静态应答
-        // Actions run in the order written, and the merge counts only when a forward's turn
-        // comes: with another deciding action written before the forwards (see
-        // [`Rule::request_decision`]), what the rule gives is that action's outcome and the
-        // forwards never have their turn. Otherwise the rule forwards on the full path while the
-        // fast path answers its static first action
-        if !matches!(self.request_decision(), Some(Action::Forward { .. })) {
-            return None;
-        }
 
         // 每种传输一组，各组按 `Transport::ALL` 的顺序排进合并后的列表 / One set per transport, each
         // going into the merged list in the order of `Transport::ALL`
@@ -1728,23 +1733,28 @@ pub fn warnings(cfg: &PipelineConfig) -> Vec<String> {
 /// answer action's first jump on), and in the answer phase asks an upstream again on every jump
 /// (see [`MAX_JUMP_LIMIT`])
 fn jump_cycles(cfg: &PipelineConfig) -> Vec<String> {
-    // 一个 id 写了几次时跳转找到最后那个，和运行时一样（见 `RuntimePipelineConfig::pipeline`）；跳到不存在的
+    // 一个 id 写了几次时跳转找到第一个，和运行时一样（见 `RuntimePipelineConfig::from_config`）；跳到不存在的
     // pipeline 是一条 [`problems`]，不算在这里 / With an id written several times a jump finds the
-    // last, as at run time (see `RuntimePipelineConfig::pipeline`); a jump to a pipeline that does
-    // not exist is one of the [`problems`] and counts for nothing here
-    let by_id: rustc_hash::FxHashMap<&str, usize> = cfg
-        .pipelines
-        .iter()
-        .enumerate()
-        .map(|(i, pipeline)| (pipeline.id.as_str(), i))
-        .collect();
-    // 每个 pipeline 的跳转：（规则序号，目标），一条规则跳到同一个目标的只算一次
-    // Each pipeline's jumps: (rule index, target), a rule jumping to one target counted once
+    // first, as at run time (see `RuntimePipelineConfig::from_config`); a jump to a pipeline that
+    // does not exist is one of the [`problems`] and counts for nothing here
+    let mut by_id: rustc_hash::FxHashMap<&str, usize> = rustc_hash::FxHashMap::default();
+    for (i, pipeline) in cfg.pipelines.iter().enumerate() {
+        by_id.entry(pipeline.id.as_str()).or_insert(i);
+    }
+    // 每个 pipeline 的跳转：（规则序号，目标），一条规则跳到同一个目标的只算一次。不是本 id 第一个的 pipeline 从不执行，
+    // 没有跳转；报的位置仍按配置里的序号
+    // Each pipeline's jumps: (rule index, target), a rule jumping to one target counted once.
+    // A pipeline not the first with its id never runs and has no jumps; places are still
+    // reckoned by the indices in the configuration
     let jumps: Vec<Vec<(usize, usize)>> = cfg
         .pipelines
         .iter()
-        .map(|pipeline| {
+        .enumerate()
+        .map(|(i, pipeline)| {
             let mut jumps = Vec::new();
+            if by_id[pipeline.id.as_str()] != i {
+                return jumps;
+            }
             for (j, rule) in pipeline.rules.iter().enumerate() {
                 for action in rule.actions_run() {
                     if let Action::JumpToPipeline { pipeline } = action
@@ -2465,8 +2475,8 @@ fn rule_problems(
     use crate::matcher::static_cname_target;
     use crate::matcher::static_ips;
 
-    let forwards = rule.forwards(settings).count();
-    if forwards > 1 && rule.shared_forward_ecs(settings).is_err() {
+    let merges = rule.merges();
+    if merges && rule.shared_forward_ecs(settings).is_err() {
         report(MERGED_ECS_DIFFER.to_string());
     }
     // 几个 forward 合成一次转发、其中有问得到地址的（写了地址的，或者没写、问 `default_upstream` 的）：写成空的那个只是
@@ -2474,7 +2484,7 @@ fn rule_problems(
     // Several forwards merged into one with one among them asking an address (written, or
     // `default_upstream` for one writing none): one written empty is only skipped, and the
     // query still has upstreams to answer it
-    let merge_has_an_address = forwards > 1
+    let merge_has_an_address = merges
         && rule
             .forwards(settings)
             .any(|(target, ..)| target.names_an_address());
@@ -2518,6 +2528,30 @@ fn rule_problems(
                         upstream_problem(upstream, transport.unwrap_or(Transport::Udp))
                     {
                         report(problem);
+                    }
+                }
+            }
+            // 没写上游的问 default_upstream（见 [`GlobalSettings::forward_target`]），经这个 forward 的传输问。它的地址经
+            // UDP 问时的问题 settings 那里已经报过（带前缀的照前缀问，经哪种传输都一样），这里只报那里没问题、经这个传输问
+            // 却不行的
+            // One writing no upstream asks `default_upstream` (see
+            // [`GlobalSettings::forward_target`]) over this forward's transport. What is wrong with
+            // its addresses asked over UDP is raised under settings already (one with a prefix
+            // being asked by the prefix, alike over every transport), so only those fine there yet
+            // unusable over this transport are raised here
+            Action::Forward {
+                upstream: None,
+                transport: Some(transport),
+                ..
+            } => {
+                for upstream in settings.default_upstream.upstreams() {
+                    if upstream_problem(upstream, Transport::Udp).is_none()
+                        && let Some(problem) = upstream_problem(upstream, *transport)
+                    {
+                        report(format!(
+                            "a forward writing no upstream asks settings.default_upstream over {}, and {problem}",
+                            transport.label()
+                        ));
                     }
                 }
             }
@@ -3377,6 +3411,51 @@ mod validation_tests {
                 vec![jump("a")]
             ),
             1
+        );
+    }
+
+    /// 一个 id 写了几次时，跳转找到第一个，和运行时一样；后面写了同一个 id 的 pipeline 从不执行，它的跳转不成圈。圈报在
+    /// 配置里的序号上。以前找的是最后一个：a 跳 b、b 静态、b 跳 a 报成一个圈，a 跳 b、b 跳 a、b 静态这个真圈却不报
+    /// With an id written several times a jump finds the first, as at run time; a pipeline
+    /// written later with the same id never runs, and its jumps make no circle. A circle is
+    /// raised at its index in the configuration. The last used to be found: a jumping to b, b
+    /// answering statically and b jumping to a was warned about as a circle, while a jumping to
+    /// b, b jumping to a and b answering statically, a circle indeed, was not
+    #[test]
+    fn jumps_find_the_first_pipeline_written_with_an_id() {
+        let any = serde_json::json!([{ "type": "any" }]);
+        let jump = |to: &str| serde_json::json!([{ "type": "jump_to_pipeline", "pipeline": to }]);
+        let answer = serde_json::json!([{ "type": "static_response", "rcode": "NXDOMAIN" }]);
+        let pipeline = |id: &str, actions: &serde_json::Value| serde_json::json!({ "id": id, "rules": [rule("r", any.clone(), actions.clone())] });
+        let circles = |pipelines: [serde_json::Value; 3]| {
+            let config = serde_json::json!({
+                "settings": { "default_upstream": "1.1.1.1:53" },
+                "pipelines": pipelines
+            });
+            super::warnings(&super::parse_config(&config.to_string()).expect("parses"))
+                .into_iter()
+                .filter(|warning| warning.contains("comes back round"))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            circles([
+                pipeline("a", &jump("b")),
+                pipeline("b", &answer),
+                pipeline("b", &jump("a")),
+            ]),
+            Vec::<String>::new()
+        );
+        let found = circles([
+            pipeline("a", &jump("b")),
+            pipeline("b", &jump("a")),
+            pipeline("b", &answer),
+        ]);
+        assert!(
+            found.len() == 1
+                && found[0].starts_with(
+                    "pipelines[1].rules[0]: jumping to \"a\" comes back round to \"b\""
+                ),
+            "{found:#?}"
         );
     }
 
@@ -4242,6 +4321,42 @@ mod validation_tests {
         }
     }
 
+    /// forward 前面写了别的作决定的动作时，几个 forward 不合并（见 `Rule::merged_forward`），也就没有合并才有的问题：ecs
+    /// 写得不一样不报，热重载和校验照收；写成空的那个和只有它一个时一样报。以前不看合并是否发生，
+    /// [static_response, forward(ecs), forward] 报成 ecs 写得不一样，热重载和面板校验因此拒收
+    /// With another deciding action written before the forwards they do not merge (see
+    /// `Rule::merged_forward`), nor do they raise what only a merge would: ecs written
+    /// differently is no problem, and reloads and validation take it; one written empty is
+    /// raised as when it is alone. Whether a merge happened used to go unseen, so
+    /// [static_response, forward(ecs), forward] was raised as ecs settings differing, which made
+    /// reloads and the panel's validation refuse it
+    #[test]
+    fn forwards_that_do_not_merge_raise_no_merge_problem() {
+        let any = serde_json::json!([{ "type": "any" }]);
+        let answer = serde_json::json!({ "type": "static_response", "rcode": "NXDOMAIN" });
+        let config = |actions: serde_json::Value| {
+            serde_json::json!({
+                "settings": { "default_upstream": "1.1.1.1:53" },
+                "pipelines": [{ "id": "main", "rules": [rule("r", any.clone(), actions)] }]
+            })
+        };
+        let differ = config(serde_json::json!([
+            answer,
+            { "type": "forward", "ecs": { "mode": "from_client_ip" } },
+            { "type": "forward" }
+        ]));
+        assert_eq!(problems_of(differ.clone()), Vec::<String>::new());
+        super::validate(&differ.to_string()).expect("forwards that never merge");
+        assert_eq!(
+            problems_of(config(serde_json::json!([
+                answer,
+                { "type": "forward", "upstream": "" },
+                { "type": "forward" }
+            ]))),
+            [format!("pipelines[0].rules[0]: {}", super::NO_UPSTREAM)]
+        );
+    }
+
     /// 写错的网段拒掉，报出写的是什么、在哪：规则的 client_ip、response_upstream_ip、response_answer_ip，以及
     /// pipeline_select 的 client_ip。以前只说「invalid IP address syntax」，规则一多就不知道是哪一条的哪一项
     /// A mistyped network is refused naming what was written and where: a rule's client_ip,
@@ -4595,6 +4710,58 @@ mod validation_tests {
         }
         // 第 12 条的两个空匹配器各报一次 / The two empty matchers of rule 12 are raised once each
         assert_eq!(found.len(), 20, "{found:#?}");
+    }
+
+    /// 没写上游的 forward 经它的传输问 default_upstream：经这个传输问不了的地址是一条配置问题，请求阶段和回答动作里的
+    /// forward 都算，写明是 default_upstream 经哪种传输问的。经 UDP、经别的问得了的传输不报；经 UDP 就问不了的只在
+    /// settings 报一次。以前只查写了上游的 forward：default_upstream 是 127.0.0.1:853 时 {forward, transport: doq} 不报，
+    /// 运行时每个查询都 SERVFAIL
+    /// A forward writing no upstream asks default_upstream over its own transport: an address
+    /// that transport cannot ask is a configuration problem, for request-phase and answer-action
+    /// forwards alike, saying it is default_upstream asked over which transport. Over UDP, and
+    /// over another transport that can ask it, nothing is raised; an address UDP cannot ask is
+    /// raised once, under settings. Only forwards writing upstreams used to be checked:
+    /// default_upstream being 127.0.0.1:853, {forward, transport: doq} raised nothing and every
+    /// query was answered SERVFAIL at run time
+    #[test]
+    fn default_upstream_is_checked_over_the_transport_of_a_forward_asking_it() {
+        let any = serde_json::json!([{ "type": "any" }]);
+        let over =
+            |transport: &str| serde_json::json!({ "type": "forward", "transport": transport });
+        let config = |default: &str| {
+            serde_json::json!({
+                "settings": { "default_upstream": default },
+                "pipelines": [{ "id": "main", "rules": [
+                    rule("doq", any.clone(), serde_json::json!([over("doq")])),
+                    rule("others", any.clone(), serde_json::json!([
+                        over("udp"),
+                        over("tcp"),
+                        over("tcp_udp"),
+                        over("dot"),
+                        over("doh"),
+                        { "type": "forward" }
+                    ])),
+                    {
+                        "name": "answer",
+                        "matchers": any,
+                        "actions": [{ "type": "forward", "upstream": "9.9.9.9:53" }],
+                        "response_actions_on_miss": [over("doq")]
+                    }
+                ] }]
+            })
+        };
+        let unusable = "upstream \"127.0.0.1:853\" is not usable: doq upstream with IP address requires explicit sni (e.g. doq://223.5.5.5:853?sni=alidns.com)";
+        assert_eq!(
+            problems_of(config("127.0.0.1:853")),
+            ["pipelines[0].rules[0]", "pipelines[0].rules[2]"].map(|place| format!(
+                "{place}: a forward writing no upstream asks settings.default_upstream over doq, and {unusable}"
+            ))
+        );
+        let found = problems_of(config("127.0.0.1"));
+        assert!(
+            found.len() == 1 && found[0].starts_with("settings.default_upstream: "),
+            "{found:#?}"
+        );
     }
 
     /// 平常的正确写法一条都不报 / The ordinary right ways of writing raise nothing
