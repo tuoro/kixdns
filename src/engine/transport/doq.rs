@@ -271,7 +271,8 @@ impl DoqConn {
 /// 会删掉握手完以后开出的同号新流登记的唤醒器：新流上的回答到了，没人叫醒等它的查询，要等满预算。所以握手完以后开出的流，
 /// 0-RTT 被拒而旧流还有句柄没丢时，等它们丢完再用（见 [`Self::enter`]）：被拒那一刻 quinn 叫醒所有旧流，它们马上报
 /// `ZeroRttRejected`，等的只是那几个任务跑一下，不花往返。0-RTT 被接受时旧流的流号不变，撞不上，谁都不等。quinn 的这两处
-/// Drop 改成先看是不是被拒的 0-RTT 流、再删唤醒器以后，这个类型整个可以删掉
+/// Drop 改成先看是不是被拒的 0-RTT 流、再删唤醒器以后，这个类型整个可以删掉。旧流的句柄上用到的别的调用都先看这一点；只有
+/// `finish` 不看，它动的是同号新流本身，这里等也挡不住，所以不调它（见 [`DoqStream::end_sending`]）
 ///
 /// On a connection made with 0-RTT, the streams opened during 0-RTT whose quinn handles are still
 /// held, and whether 0-RTT was rejected.
@@ -288,7 +289,9 @@ impl DoqConn {
 /// `ZeroRttRejected` at once, so the wait is for those few tasks to run, no round trip. With
 /// 0-RTT accepted the old streams keep their numbers, nothing collides, and nobody waits. Once
 /// quinn's two Drops look whether they are a rejected 0-RTT stream before removing the waker,
-/// this type can go altogether
+/// this type can go altogether. The other calls made on an old stream's handle all look at that
+/// first; `finish` alone does not, acting on the new stream of the same number itself, which no
+/// waiting here keeps from it, so it is not called (see [`DoqStream::end_sending`])
 struct EarlyStreams {
     /// 0-RTT 被接受没有：quinn 在握手完时决出（见 [`quinn::Connecting::into_0rtt`]），和它叫醒被拒的旧流是同一刻、在同一把
     /// 连接锁里 / Whether 0-RTT was accepted: settled by quinn once the handshake is through (see
@@ -680,7 +683,7 @@ impl DoqMuxClient {
         // Made up before any wait (see [`EarlyStreams::enter`]): dropped while waiting, the
         // stream is still cancelled as RFC 9250 asks
         let mut stream = DoqStream {
-            send,
+            send: Some(send),
             recv,
             answered: false,
             early: None,
@@ -688,12 +691,6 @@ impl DoqMuxClient {
         if let Some(early) = &pooled.early {
             stream.early = early.enter(&stream.recv).await;
         }
-        let DoqStream {
-            send,
-            recv,
-            answered,
-            ..
-        } = &mut stream;
 
         // RFC 9250 §4.2: DNS messages sent over QUIC streams MUST be prefixed
         // with a 2-octet length field, followed by the DNS message content.
@@ -712,8 +709,14 @@ impl DoqMuxClient {
         frame[2] = 0; // Message ID = 0 (RFC 9250 §4.2.1) / 消息 ID = 0
         frame[3] = 0;
 
-        send.write_all(&frame).await.map_err(DoqFailure::Write)?;
-        let _ = send.finish();
+        stream
+            .send
+            .as_mut()
+            .expect("held until the query is written")
+            .write_all(&frame)
+            .await
+            .map_err(DoqFailure::Write)?;
+        stream.end_sending();
 
         // Read response: 2-byte length prefix followed by DNS message
         // 读取响应：2 字节长度前缀，后跟 DNS 消息
@@ -721,13 +724,14 @@ impl DoqMuxClient {
         // We need to read all data until FIN, then parse the length prefix
         // 注意：服务器发送响应后用 FIN 关闭流
         // 我们需要读取所有数据直到 FIN，然后解析长度前缀
-        let mut all_data = recv
+        let mut all_data = stream
+            .recv
             .read_to_end(MAX_DNS_MESSAGE_SIZE + 2)
             .await
             .map_err(DoqFailure::Read)?;
         // 上游已经把流结束了：之后不论应答对不对，都不算放弃 / The upstream has ended the stream: whatever
         // the answer, from here on it is no abandoning
-        *answered = true;
+        stream.answered = true;
 
         if all_data.is_empty() {
             return Err(DoqFailure::Protocol(
@@ -1093,15 +1097,20 @@ const DOQ_NO_ERROR: quinn::VarInt = quinn::VarInt::from_u32(0x0);
 const DOQ_REQUEST_CANCELLED: quinn::VarInt = quinn::VarInt::from_u32(0x3);
 
 /// 一个 DoQ 查询的那一对流。没等到上游把回答发完就被丢掉（时限到了、几个上游竞速它输了）时，按 RFC 9250
-/// 第 4.3.1 节用 [`DOQ_REQUEST_CANCELLED`] 停止接收、重置发送：交给 quinn 丢掉流的话，发出的错误码是 0，
-/// 也就是 DOQ_NO_ERROR，上游会当它正常结束
+/// 第 4.3.1 节用 [`DOQ_REQUEST_CANCELLED`] 停止接收，查询还没写完的也用它重置发送：交给 quinn 丢掉流的话，停止接收带的
+/// 错误码是 0，也就是 DOQ_NO_ERROR，上游会当它正常结束，写了一半的查询还会被 FIN 掉。查询写完了的，发送端已经丢掉（见
+/// [`Self::end_sending`]），取消时 RFC 9250 只要停止接收
 /// The pair of streams of one DoQ query. Dropped before the upstream has finished sending the
-/// answer (a deadline that came first, a race between upstreams lost), it stops receiving and
-/// resets sending with [`DOQ_REQUEST_CANCELLED`], as RFC 9250 section 4.3.1 asks: streams left
-/// for quinn to drop would carry error code 0, DOQ_NO_ERROR, which the upstream takes for a
-/// normal end
+/// answer (a deadline that came first, a race between upstreams lost), it stops receiving with
+/// [`DOQ_REQUEST_CANCELLED`], as RFC 9250 section 4.3.1 asks, resetting sending with it too while
+/// the query is not all written: streams left for quinn to drop would stop receiving with error
+/// code 0, DOQ_NO_ERROR, which the upstream takes for a normal end, and would finish a query
+/// half written. With the query written the send side is dropped already (see
+/// [`Self::end_sending`]), and stopping receiving is all RFC 9250 asks for on cancelling
 struct DoqStream<'a> {
-    send: quinn::SendStream,
+    /// 查询写完就丢掉（见 [`Self::end_sending`]）/ Dropped once the query is written (see
+    /// [`Self::end_sending`])
+    send: Option<quinn::SendStream>,
     recv: quinn::RecvStream,
     /// 上游已经把回答发完 / The upstream has finished sending the answer
     answered: bool,
@@ -1113,10 +1122,33 @@ struct DoqStream<'a> {
     early: Option<EarlyHeld<'a>>,
 }
 
+impl DoqStream<'_> {
+    /// 查询写完了，结束发送（RFC 9250 第 4.2 节）：丢掉 quinn 的发送端，由它的 Drop 发 FIN。不调 `finish`：quinn 0.11.11 的
+    /// `finish` 不看 0-RTT 被拒了没有，0-RTT 期间开出的旧流的句柄在被拒以后调它，FIN 掉的是握手完以后开出的同号新流（见
+    /// [`EarlyStreams`]），新流上的查询一写就报 `ClosedStream`、失败，上游还收到一个没有查询的流。多线程下，写完时 driver
+    /// 正拿着连接锁处理握手完成，`finish` 等锁，放锁后别的查询先开出同号新流，就会这样。Drop 在同一把连接锁里先看是不是被拒的
+    /// 0-RTT 流，是的话不发 FIN；别的发出的和 `finish` 一样
+    /// The query written, ends sending (RFC 9250 section 4.2): quinn's send side is dropped, its
+    /// Drop sending FIN. `finish` is not called: quinn 0.11.11's `finish` does not look whether
+    /// 0-RTT was rejected, and called on the handle of an old stream opened during 0-RTT once it
+    /// was, it finishes the new stream of the same number opened after the handshake (see
+    /// [`EarlyStreams`]), the query on that one failing with `ClosedStream` as soon as it writes
+    /// and the upstream getting a stream with no query in it. On several threads that happens
+    /// when the driver holds the connection lock handling the handshake's completion as the write
+    /// is done, `finish` waiting for the lock and another query opening the new stream first once
+    /// it is released. Drop looks whether it is a rejected 0-RTT stream under that same lock and
+    /// sends no FIN if so; for any other stream it sends just what `finish` does
+    fn end_sending(&mut self) {
+        self.send = None;
+    }
+}
+
 impl Drop for DoqStream<'_> {
     fn drop(&mut self) {
         if !self.answered {
-            let _ = self.send.reset(DOQ_REQUEST_CANCELLED);
+            if let Some(send) = &mut self.send {
+                let _ = send.reset(DOQ_REQUEST_CANCELLED);
+            }
             let _ = self.recv.stop(DOQ_REQUEST_CANCELLED);
         }
     }
