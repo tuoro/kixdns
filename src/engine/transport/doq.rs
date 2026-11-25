@@ -785,24 +785,37 @@ impl DoqMuxClient {
         Ok::<Bytes, DoqFailure>(Bytes::from(all_data).slice(2..))
     }
 
-    /// 池里的连接还能用（没被关掉）就给出来；用旧了的看守任务已经把它从池里拿掉了（见 [`Self::watch`]）
+    /// 池里的连接还能用（没被关掉）就给出来；用旧了的看守任务已经把它从池里拿掉了（见 [`Self::watch`]）。关掉了的，用了 0-RTT
+    /// 而上游没回握手时忘掉它连的地址（见 [`ZeroRtt::forget_if_unanswered`]）：看守任务看到它关了也这么做，可查询可能先看到，
+    /// 接着建的连接就不会再把 0-RTT 发往那里
     /// The pooled connection when still usable (not closed); one worn out has been taken out of
-    /// the pool by its watching task already (see [`Self::watch`])
+    /// the pool by its watching task already (see [`Self::watch`]). One closed has the address it
+    /// dialled forgotten when it used 0-RTT and the upstream never answered its handshake (see
+    /// [`ZeroRtt::forget_if_unanswered`]): its watching task does so too on seeing it closed, but
+    /// a query may see it first, and the connect following sends no 0-RTT there all the same
     fn usable(&self) -> Option<Arc<DoqConn>> {
         let pooled = self.pooled.load_full()?;
         if let Some(reason) = pooled.conn.close_reason() {
             debug!(upstream = %self.upstream, reason = %reason, "DoQ pooled connection already closed, reconnecting");
+            self.zero_rtt.forget_if_unanswered(&pooled);
             return None;
         }
         Some(pooled)
     }
 
     /// 发查询用的连接：池里的能用就用，不能用就等一条新的（见 [`Connect::get_or_make`]）：建连的任务建好了放进池里，这个
-    /// 查询再取用。等来的连接在取用之前就没了时不再等下一条。等来的连接不算取自池里
+    /// 查询再取用。等来的连接在取用之前就没了时再等一次：查询还没在它上面发过，就和它没建成一样。用了 0-RTT 的连接当场就放进
+    /// 池里，上游没回握手就关掉它（比如拒绝新连接），而这个查询的任务一时没轮上时，就会这样；那个地址这时已经忘掉（见
+    /// [`Self::usable`]），再等的一次完整握手。再没了就不再等。等来的连接不算取自池里
     /// The connection to send on: the pooled one when usable, otherwise a new one waited for (see
     /// [`Connect::get_or_make`]): the connecting task pools it once made, and this query takes it
-    /// from there. A connection waited for and gone before it could be taken is not followed by a
-    /// wait for another. A connection waited for does not count as taken from the pool
+    /// from there. A connection waited for and gone before it could be taken has one more waited
+    /// for: the query has sent nothing on it, as if it had never been made. A connection using
+    /// 0-RTT is pooled at once, and that happens when the upstream closes it without answering its
+    /// handshake (refusing new connections, say) while this query's task does not get a turn; the
+    /// address is forgotten by then (see [`Self::usable`]), the one more shaking hands in full.
+    /// Gone again, no more is waited for. A connection waited for does not count as taken from
+    /// the pool
     async fn get_or_connect(&self, target: &DoqTarget) -> anyhow::Result<DoqConnected> {
         let connected = |pooled: Arc<DoqConn>, waited: bool| DoqConnected {
             reused: !waited,
@@ -851,10 +864,20 @@ impl DoqMuxClient {
                 Ok(())
             }
         };
-        let (pooled, waited) =
-            Connect::get_or_make(&self.connecting, |connect| connect, |_| self.usable(), make)
+        let wait = || {
+            Connect::get_or_make(
+                &self.connecting,
+                |connect| connect,
+                |_| self.usable(),
+                &make,
+            )
+        };
+        let (pooled, waited) = match wait().await? {
+            Some(made) => made,
+            None => wait()
                 .await?
-                .context("doq connection closed as soon as it was made")?;
+                .context("doq connection closed as soon as it was made")?,
+        };
         Ok(connected(pooled, waited))
     }
 

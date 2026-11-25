@@ -1216,6 +1216,73 @@ async fn a_0rtt_connection_the_upstream_refused_is_made_again_in_full() {
     }
 }
 
+/// 同上，上游拒绝的时候，等着这条连接的查询还没去取（它的任务一时没轮上，机器忙时多线程下会这样）：查询还没在它上面发过，
+/// 再等一次建连，这次不用 0-RTT、完整握手，答上，0-RTT 照用。`watched` 时看守任务先看到连接关了、把它从池里拿掉；不然是查询
+/// 先看到，连接还在池里，地址也还没忘
+/// As above, with the query waiting for the connection not having taken it yet when the upstream
+/// refuses (its task not getting a turn, as on a busy machine on several threads): the query has
+/// sent nothing on it and waits for one more connect, this one shaking hands in full without
+/// 0-RTT, and is answered, 0-RTT staying on. With `watched` the watching task sees the
+/// connection closed first and takes it out of the pool; otherwise the query sees it first, the
+/// connection still pooled and its address not forgotten yet
+async fn refused_before_the_query_takes_it(watched: bool) {
+    let (addr, client_tls) = spawn_doq_upstream_handshaking(|n| match n {
+        1 => Handshake::Refuse(Duration::ZERO),
+        _ => Handshake::Answer,
+    });
+    // 拿一张票据 / A ticket got
+    resuming_doq_client(addr, client_tls.clone()).await;
+    // 上游写成名字：建连先要解析，查询能停在等建连的地方 / The upstream given by name: the connect
+    // resolves it first, so the query can be held where it waits for the connect
+    let (_server, bootstrap) = loopback_names().await;
+    let client = DoqMuxClient::new(
+        Arc::from(format!("upstream.test:{}?sni=localhost", addr.port())),
+        doq_test_runtime_through(client_tls, true, bootstrap),
+        Arc::default(),
+    );
+    *client.zero_rtt.reached.lock() = Some((addr, Duration::ZERO));
+    let query = udp_test_query("refused.example");
+    let mut send = Box::pin(client.send(&query, Duration::from_secs(2)));
+    assert!(
+        futures::poll!(send.as_mut()).is_pending(),
+        "waiting for the connect"
+    );
+    // 建连的任务用 0-RTT 当场连上、放进池里，上游拒绝了它，查询一直没去取 / The connecting task connects
+    // with 0-RTT at once and pools it, the upstream refuses it, and the query never takes it
+    let made = loop {
+        match client.pooled.load_full() {
+            Some(made) => break made,
+            None => tokio::task::yield_now().await,
+        }
+    };
+    assert!(made.used_0rtt(), "made with 0-RTT");
+    made.conn.closed().await;
+    while client.pooled.load_full().is_some() {
+        tokio::task::yield_now().await;
+    }
+    if !watched {
+        client.pooled.store(Some(made));
+        *client.zero_rtt.reached.lock() = Some((addr, Duration::ZERO));
+    }
+    send.await.expect("connected again and answered");
+    let pooled = client.pooled.load_full().expect("a pooled connection");
+    assert!(!pooled.used_0rtt(), "with a full handshake");
+    assert!(
+        client.zero_rtt.reached.lock().is_some(),
+        "0-RTT stays on, going to the address that full handshake reached"
+    );
+}
+
+#[tokio::test]
+async fn a_0rtt_connection_refused_before_its_query_takes_it_is_made_again_in_full() {
+    refused_before_the_query_takes_it(true).await;
+}
+
+#[tokio::test]
+async fn a_0rtt_connection_seen_refused_by_its_query_first_is_made_again_in_full() {
+    refused_before_the_query_takes_it(false).await;
+}
+
 /// 同上，拒绝来得晚、剩下的预算不够重发：错误里写着连的地址和上游给的原因，这个地址照样忘掉。以前是 quinn 的「0-RTT rejected」
 /// As above, with the refusal coming late and too little budget left to send again: the error
 /// names the address dialled and the upstream's own reason, and the address is forgotten all the
