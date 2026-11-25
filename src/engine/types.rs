@@ -620,7 +620,9 @@ fn hash_pipeline_semantics(pipeline: &RuntimePipeline, hasher: &mut impl Hasher)
             matchers,
             actions,
             response_phase,
-            // 由 `actions` 得出 / Derives from `actions`
+            // 由 `actions` 和 `default_upstream` 得出，后者算在全局设置里（见
+            // `hash_global_settings_semantics`）/ Derives from `actions` and `default_upstream`,
+            // which counts among the global settings (see `hash_global_settings_semantics`)
             merged_forward: _,
         } = rule;
         name.hash(hasher);

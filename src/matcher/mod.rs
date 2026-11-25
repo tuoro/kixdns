@@ -526,7 +526,7 @@ impl RuntimePipelineConfig {
         for (i, p) in cfg.pipelines.into_iter().enumerate() {
             let mut rules = Vec::new();
             for (j, r) in p.rules.into_iter().enumerate() {
-                let merged_forward = r.merged_forward();
+                let merged_forward = r.merged_forward(&cfg.settings);
                 let mut matchers: Vec<_> = r
                     .matchers
                     .into_iter()

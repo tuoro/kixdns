@@ -45,17 +45,18 @@ fn engine_from(config: Value) -> Engine {
     .expect("engine")
 }
 
-/// 一条规则的动作是 `actions` 时客户端拿到的地址：直接进它的规则组（先走快速路径），和从别的规则组跳转进来
-/// What the client gets from a rule with `actions`: entering its pipeline directly (the fast
-/// path first), and jumping in from another pipeline
-async fn answers(actions: Value) -> [Option<Ipv4Addr>; 2] {
+/// 一条规则的动作是 `actions`、设置里另外写了 `settings` 时客户端拿到的地址：直接进它的规则组（先走快速路径），和从
+/// 别的规则组跳转进来
+/// What the client gets from a rule with `actions`, `settings` written on top: entering its
+/// pipeline directly (the fast path first), and jumping in from another pipeline
+async fn answers(settings: Value, actions: Value) -> [Option<Ipv4Addr>; 2] {
     let rule = json!({ "name": "all", "matchers": [{ "type": "any" }], "actions": actions });
     let direct = engine_from(json!({
-        "settings": counting_settings(json!({})),
+        "settings": counting_settings(settings.clone()),
         "pipelines": [{ "id": "main", "rules": [rule.clone()] }]
     }));
     let jumped = engine_from(json!({
-        "settings": counting_settings(json!({})),
+        "settings": counting_settings(settings),
         "pipelines": [
             { "id": "main", "rules": [
                 { "name": "on", "matchers": [{ "type": "any" }],
@@ -85,31 +86,51 @@ async fn an_answer_written_before_the_forwards_is_what_the_rule_gives() {
 
     // 回应写在两个 forward 前面：怎么进来都回它 / The answer before two forwards: given either way in
     assert_eq!(
-        answers(json!([
-            fixed,
-            forward(&first.address),
-            forward(&second.address)
-        ]))
+        answers(
+            json!({}),
+            json!([fixed, forward(&first.address), forward(&second.address)])
+        )
         .await,
         [Some(STATIC); 2]
     );
     // 前面只有日志：照旧合成一次转发 / Only a log before them: merged into one forward as before
     assert_eq!(
-        answers(json!([
-            log,
-            forward(&first.address),
-            forward(&second.address)
-        ]))
+        answers(
+            json!({}),
+            json!([log, forward(&first.address), forward(&second.address)])
+        )
         .await,
         [Some(UPSTREAM); 2]
     );
     // 回应写在 forward 后面：轮不到它 / The answer after the forwards: its turn never comes
     assert_eq!(
-        answers(json!([
-            forward(&first.address),
-            forward(&second.address),
-            fixed
-        ]))
+        answers(
+            json!({}),
+            json!([forward(&first.address), forward(&second.address), fixed])
+        )
+        .await,
+        [Some(UPSTREAM); 2]
+    );
+}
+
+/// 没写 upstream 的 forward 问 default_upstream，和别的 forward 合成一次转发时也一样：写了地址的那个不答，默认上游作答，
+/// 怎么进来都一样
+/// A forward writing no upstream asks default_upstream, merged into one forward with another
+/// too: the one written stays silent and the default upstream answers, either way in
+#[tokio::test]
+async fn a_forward_without_an_upstream_asks_the_default_upstream_in_a_merge_too() {
+    let written = answering_upstream(STATIC, 60).await;
+    written.silence(true);
+    let default = answering_upstream(UPSTREAM, 60).await;
+    let settings = json!({ "default_upstream": default.address, "upstream_timeout_ms": 500 });
+    assert_eq!(
+        answers(
+            settings,
+            json!([
+                { "type": "forward" },
+                { "type": "forward", "upstream": written.address }
+            ])
+        )
         .await,
         [Some(UPSTREAM); 2]
     );
