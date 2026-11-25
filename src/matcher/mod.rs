@@ -435,9 +435,14 @@ impl ResponsePhase {
     /// 匹配器和两种结果下的动作；没有响应阶段时都是空的
     /// The matchers and the actions for either result, all empty without a response phase
     pub fn parts(phase: Option<&Self>) -> (&[RuntimeResponseMatcherWithOp], &[Action], &[Action]) {
-        phase.map_or((&[], &[], &[]), |phase| {
-            (&phase.matchers, &phase.on_match, &phase.on_miss)
-        })
+        phase.map_or(
+            (&[], &[], &[]),
+            |Self {
+                 matchers,
+                 on_match,
+                 on_miss,
+             }| (matchers, on_match, on_miss),
+        )
     }
 }
 
