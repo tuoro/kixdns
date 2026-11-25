@@ -301,7 +301,7 @@ enum Message {
 /// Linux inotify 监视的是 inode 而不是路径，目录能收到目标文件名的 IN_MOVED_TO/IN_CREATE。
 /// 路径经过符号链接时，路上每个符号链接所在的目录和真文件所在的目录都监视（见 [`watch_points`]），
 /// 链接指向别的目录、Kubernetes 卷换 `..data` 这样的变化也能察觉；有变化时重新解析，监视跟着换。
-/// 在监视的目录自己删掉、改名挪走时，用到它的文件也重新解析（见 [`Targets::lost`]）。
+/// 事件说在监视的目录、或者它上面的哪个目录删掉、改名挪走时，用到它的文件也重新解析（见 [`Targets::lost`]）。
 /// 事件按完整路径对上文件，另一个被监视的目录里同名的文件不算。
 /// The watched files. Each file is watched through its directory so atomic replacement
 /// (write tmp + rename over target) is detected: Linux inotify watches inodes, not paths, and
@@ -309,9 +309,10 @@ enum Message {
 /// through symlinks, the directory of every symlink along the way and that of the real file
 /// are watched too (see [`watch_points`]), so a link to another directory, or a Kubernetes
 /// volume swapping `..data`, is detected as well; on a change the path is resolved again and
-/// the watches follow. A watched directory itself removed or renamed away has the files using
-/// it resolved again too (see [`Targets::lost`]). Events are matched to files by full path, so
-/// a file of the same name in another watched directory does not count.
+/// the watches follow. A watched directory, or any directory above it, that an event says was
+/// removed or renamed away has the files using it resolved again too (see [`Targets::lost`]).
+/// Events are matched to files by full path, so a file of the same name in another watched
+/// directory does not count.
 struct Targets {
     files: Vec<Target>,
     /// 在监视的目录，以及各被几个监视点用着 / The directories watched, and how many watch points use each
@@ -441,23 +442,34 @@ impl Targets {
         uncovered.map_or(Ok(()), Err)
     }
 
-    /// 在监视的目录里 `gone` 说没了的（见 [`gone`]）不再监视、不再记数，给出替它们记着数的文件（见 [`Target::held`]）：
-    /// 这些文件重新解析时，目录回来了就重新监视，没回来就是监视不上。监视总要撤：inotify 的监视跟着改名挪走的旧目录走，
-    /// 事件却还按原来的路径报；删掉的目录 inotify、kqueue 已经撤了，再撤只是报错；FSEvents 按路径监视，撤了和别的平台
-    /// 一样。notify 监视着的目录就总是这里记着的那些
-    /// Those of the watched directories that `gone` names (see [`gone`]) are watched and
-    /// counted no more, giving the files they were counted for (see [`Target::held`]): resolved
-    /// again, these are watched there anew once the directory is back, and cannot be watched
-    /// there if not. The watch always comes out: inotify's follows a directory renamed away, its
-    /// events still reported under the old path; inotify and kqueue have taken out a removed
-    /// directory's already, so this only errs; FSEvents watches by path, and with it out
-    /// behaves as the others. So the directories notify watches are always those counted here
+    /// 在监视的目录里是 `gone` 说没了的（见 [`gone`]）、或者在它下面的，不再监视、不再记数，给出替它们记着数的文件（见
+    /// [`Target::held`]）：这些文件重新解析时，目录回来了就重新监视，没回来就是监视不上。下面的目录跟着一起没了：
+    /// inotify 只给改名的那个目录自己报一个，下面的监视不声不响地跟着挪走的旧目录走；notify 收到被监视目录改名挪走、
+    /// 删掉时，把下面的监视也一并撤了，不告诉谁。监视总要撤：inotify 的监视跟着改名挪走的旧目录走，事件却还按原来的
+    /// 路径报；删掉的目录 inotify、kqueue 已经撤了，notify 撤过的再撤只是报错；FSEvents 按路径监视，撤了和别的平台
+    /// 一样。所以就事件报得到的来说，notify 监视着的目录总是这里记着的那些
+    /// Those of the watched directories that `gone` names (see [`gone`]), or that sit under
+    /// one it names, are watched and counted no more, giving the files they were counted for
+    /// (see [`Target::held`]): resolved again, these are watched there anew once the directory
+    /// is back, and cannot be watched there if not. The directories under one go with it:
+    /// inotify reports a rename to the directory renamed alone, the watches under it following
+    /// the old directory away without a word; notify, told a directory it watches was renamed
+    /// away or removed, takes the watches under it out too, telling no one. The watch always
+    /// comes out: inotify's follows a directory renamed away, its events still reported under
+    /// the old path; inotify and kqueue have taken out a removed directory's already, and one
+    /// notify took out only errs; FSEvents watches by path, and with it out behaves as the
+    /// others. So, as far as events tell, the directories notify watches are always those
+    /// counted here
     fn lost(&mut self, watcher: &mut RecommendedWatcher, gone: &[PathBuf]) -> Vec<usize> {
+        let lost: Vec<PathBuf> = self
+            .dirs
+            .keys()
+            .filter(|dir| gone.iter().any(|path| dir.starts_with(path)))
+            .cloned()
+            .collect();
         let mut files = Vec::new();
-        for dir in gone {
-            if self.dirs.remove(dir).is_none() {
-                continue;
-            }
+        for dir in &lost {
+            self.dirs.remove(dir);
             // notify 已经撤了的报错，不用管 / notify errs for one it has taken out, which needs no handling
             let _ = watcher.unwatch(dir);
             for (index, target) in self.files.iter_mut().enumerate() {
@@ -1627,6 +1639,90 @@ mod tests {
             rx.recv_timeout(Duration::from_secs(1)),
             Err(mpsc::RecvTimeoutError::Timeout),
             "the old directory is no longer watched"
+        );
+    }
+
+    /// 文件 P/a.dat 和 P/C/b.dat，P 和 P/C 都在监视，P 改名换掉（`mv P P.old; mv P.new P`）：两个文件都换到新目录上、
+    /// 各读一遍，之后新的 P/C 里改了回调，挪走的 P.old/C 里改了不回调。inotify 只给 P 自己报改名，P/C 的监视不声不响地
+    /// 跟着旧目录走，事件却还按 P/C 报，所以 P/C 跟着 P 一起算没了
+    /// Files P/a.dat and P/C/b.dat, P and P/C both watched, P swapped by renames (`mv P P.old;
+    /// mv P.new P`): both files move to the new directories and are read once each; later edits
+    /// in the new P/C are called back, and edits in P.old/C moved away are not. inotify reports
+    /// the rename to P alone, P/C's watch following the old directory away without a word, its
+    /// events still reported under P/C, so P/C counts as gone along with P
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_swapped_by_renames_takes_the_watched_ones_under_it_along() {
+        swap_with_watched_directories_under_it(false);
+    }
+
+    /// 同上，P 所在的目录也在监视（三层都在监视）：notify 收到 P 改名挪走时把 P/C 的监视也一并撤了，不告诉谁，P/C 里
+    /// 新旧两边改了都看不到，所以 P/C 同样跟着 P 一起算没了
+    /// As above, with the directory P sits in watched too (three levels watched): notify, told P
+    /// was renamed away, takes P/C's watch out too, telling no one, and edits on either side of
+    /// P/C would go unseen, so P/C counts as gone along with P all the same
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_swapped_by_renames_in_a_watched_one_takes_the_watched_ones_under_it_along() {
+        swap_with_watched_directories_under_it(true);
+    }
+
+    /// P 和 P/C 都在监视（`above`：P 所在的目录也在监视）时 P 改名换掉，见上面两个测试 / P swapped by
+    /// renames with P and P/C both watched (`above`: the directory P sits in watched too), see the
+    /// two tests above
+    #[cfg(unix)]
+    fn swap_with_watched_directories_under_it(above: bool) {
+        let root = tempfile::tempdir().expect("tempdir");
+        let real = std::fs::canonicalize(root.path()).unwrap();
+        let (dir, new, old) = (real.join("P"), real.join("P.new"), real.join("P.old"));
+        for at in [&dir, &new] {
+            std::fs::create_dir_all(at.join("C")).unwrap();
+            std::fs::write(at.join("a.dat"), "a").unwrap();
+            std::fs::write(at.join("C/b.dat"), "b").unwrap();
+        }
+        let (a, b) = (dir.join("a.dat"), dir.join("C/b.dat"));
+        let mut files = vec![a.clone(), b.clone()];
+        // 不建它，免得 FSEvents 把建它报给刚装上的监视；它所在的目录照样监视 / Not created, lest FSEvents
+        // report its creation to the watch just installed; the directory it sits in is watched all the same
+        if above {
+            files.push(real.join("x.dat"));
+        }
+        let (tx, rx) = mpsc::channel();
+        let _watch = PendingWatch::new(&files, UNSEEN)
+            .expect("watch")
+            .start("test-watch", move |path| {
+                let _ = tx.send(path.to_path_buf());
+            })
+            .expect("start");
+
+        std::fs::rename(&dir, &old).unwrap();
+        std::fs::rename(&new, &dir).unwrap();
+        let mut swapped = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !(swapped.contains(&a) && swapped.contains(&b)) {
+            match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(path) => swapped.push(path),
+                Err(_) => break,
+            }
+        }
+        // 同一次改动的后续事件 / What else the same change brings
+        while let Ok(path) = rx.recv_timeout(Duration::from_millis(500)) {
+            swapped.push(path);
+        }
+        swapped.sort();
+        swapped.dedup();
+        assert_eq!(
+            swapped,
+            [b.clone(), a],
+            "both files read in the new directories"
+        );
+        std::fs::write(&b, "b edited").unwrap();
+        called_back(&rx, &b, "the file in the new P/C edited");
+        std::fs::write(old.join("C/b.dat"), "old b edited").unwrap();
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1)),
+            Err(mpsc::RecvTimeoutError::Timeout),
+            "the old P/C is no longer watched"
         );
     }
 
