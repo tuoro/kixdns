@@ -479,6 +479,8 @@ async fn the_watch_reads_a_replaced_mmdb() {
             format!(r#"{{"entries":[{{"country_code":"{country}","ips":["198.51.100.0/24"]}}]}}"#);
         std::fs::write(&source, entries).unwrap();
         crate::matcher::geoip_converter::convert_dat_to_mmdb(&source, &aside, None).unwrap();
+        // 两份一样长 / The two are as long
+        crate::engine::test_support::written_apart(&aside);
         std::fs::rename(&aside, &mmdb).unwrap();
     };
     convert("US");

@@ -66,12 +66,14 @@ sha2 = "0.10"
 # 智能流控在 Windows 上读内存：系统的、本进程的、所在作业对象的限制
 # Smart flow control reads memory on Windows: the system's, this process's and its job object's limits
 # 也读本机网卡上的 IPv6 地址，认出和内核在同一个网段上的主机 / It also reads this machine's IPv6 addresses to tell the hosts on its own network
+# 文件监视按卷序列号和文件 ID 认目录 / The file watch tells directories apart by volume serial number and file ID
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
     "Win32_Networking_WinSock",
+    "Win32_Storage_FileSystem",
     "Win32_System_JobObjects",
     "Win32_System_ProcessStatus",
     "Win32_System_SystemInformation",

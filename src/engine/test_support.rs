@@ -683,9 +683,25 @@ async fn next_http_request(
     Some((head, body))
 }
 
-/// 在 `dir` 里放一对自签的证书和私钥（给 localhost），返回两个路径。已经有的整个换掉，像续期那样先写好再改名盖过去
+/// 给 `path` 一个这个进程里别的文件都没有的修改时间，像隔了一阵才写的那样。修改时间、改动时间按内核时钟的节拍走，
+/// 一份紧接着一份写的、一样长的文件可能样子都一样（OpenWrt 虚拟机上就是，见 `watcher::FileStamp`）
+/// Gives `path` a modification time no other file of this process has, as if written a while
+/// apart. Modification and change times go by the kernel clock's tick, and files of one length
+/// written one right after another may look all alike (as on an OpenWrt VM, see
+/// `watcher::FileStamp`)
+pub(crate) fn written_apart(path: &std::path::Path) {
+    static WRITTEN: AtomicUsize = AtomicUsize::new(0);
+    let apart = Duration::from_secs(WRITTEN.fetch_add(1, Ordering::Relaxed) as u64);
+    let at = std::time::UNIX_EPOCH + Duration::from_secs(1 << 30) + apart;
+    let file = std::fs::File::options().write(true).open(path).unwrap();
+    file.set_modified(at).unwrap();
+}
+
+/// 在 `dir` 里放一对自签的证书和私钥（给 localhost），返回两个路径。已经有的整个换掉，像续期那样先写好再改名盖过去；
+/// 每份都像隔了一阵才签的（见 [`written_apart`]）
 /// Puts a self-signed certificate (for localhost) and its key in `dir`, giving both paths. Ones
-/// already there are replaced whole, written aside and renamed over them as a renewal does
+/// already there are replaced whole, written aside and renamed over them as a renewal does;
+/// each looks issued a while apart (see [`written_apart`])
 pub(crate) fn write_certificate(dir: &std::path::Path) -> (String, String) {
     let key = rcgen::KeyPair::generate().unwrap();
     let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
@@ -695,6 +711,7 @@ pub(crate) fn write_certificate(dir: &std::path::Path) -> (String, String) {
     let paths = [("cert.pem", cert.pem()), ("key.pem", key.serialize_pem())].map(|(name, pem)| {
         let (path, aside) = (dir.join(name), dir.join(format!("{name}.new")));
         std::fs::write(&aside, pem).unwrap();
+        written_apart(&aside);
         std::fs::rename(&aside, &path).unwrap();
         path.to_str().unwrap().to_owned()
     });
