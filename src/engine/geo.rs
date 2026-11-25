@@ -133,12 +133,13 @@ impl DataStatus {
         say(&mut self.files, (path.to_path_buf(), said));
     }
 
-    /// `what` 的监视线程因为 `err` 起不来：哪个文件都没人监视，改了要等重启才读
+    /// `what` 的监视线程因为 `err` 起不来：哪个文件都没人监视，改了要等重启或者改了读什么的热加载才读
     /// The watch thread of `what` could not start because of `err`: no file is watched by
-    /// anything, and a change waits for a restart to be read
+    /// anything, and a change waits to be read for a restart or a reload changing which files are
+    /// read
     fn not_watched(&mut self, what: &str, err: &dyn std::fmt::Display) {
         self.watch = Some(format!(
-            "{what} cannot be watched for changes, which are read after a restart: {err}"
+            "{what} cannot be watched for changes, which are read after a restart or a reload changing which files are read: {err}"
         ));
         self.partly_watched.clear();
     }
@@ -484,7 +485,7 @@ fn start_watch(
     pending?
         .start_reporting(name, on_change, on_watch)
         .inspect_err(|err| {
-            error!(name, error = %err, "cannot start the data file watcher, changes to the files are read after a restart");
+            error!(name, error = %err, "cannot start the data file watcher, changes to the files are read after a restart or a reload changing which files are read");
             status.lock().not_watched(what, err);
         })
         .ok()
@@ -781,20 +782,20 @@ fn missing_geoip_tags(
         .collect()
 }
 
-/// 监视到 MMDB `path` 变了：重新读进来，和在用的标签一起装进新的管理器（见 [`GeoIpManager::with_mmdb`]），建好再换进
-/// 状态 `state`，建的这段时间里请求照常按在用的那份判断；文件没变时什么都不换。读不了（正在替换、写坏了、删掉了）时留着
-/// 在用的那份，写进 `status`，等文件下次改动。`tags` 是规则用到的 GeoIP 标签，`dat_given` 说配置里有没有数据文件，
-/// 算没有数据提供的标签用（见 [`missing_geoip_tags`]）。监视线程是唯一换 GeoIP 数据的（热重载先停下监视再换数据），所以
-/// 开始时拿到的在用数据到换进去时仍是在用的那份
+/// 监视到 MMDB `path` 变了：重新读进来，和在用的标签一起装进新的管理器（见 [`GeoIpManager::with_mmdb`]：不看文件的
+/// 样子，按内容比），建好再换进状态 `state`，建的这段时间里请求照常按在用的那份判断；内容没变时什么都不换。读不了（正在
+/// 替换、写坏了、删掉了）时留着在用的那份，写进 `status`，等文件下次改动。`tags` 是规则用到的 GeoIP 标签，`dat_given`
+/// 说配置里有没有数据文件，算没有数据提供的标签用（见 [`missing_geoip_tags`]）。监视线程是唯一换 GeoIP 数据的（热重载先
+/// 停下监视再换数据），所以开始时拿到的在用数据到换进去时仍是在用的那份
 /// A watched MMDB `path` changed: it is read in again, into a new manager with the tags in use
-/// (see [`GeoIpManager::with_mmdb`]), swapped into the state `state` once built, requests going
-/// on judging by the data in use meanwhile; with the file unchanged nothing is swapped. When it
-/// cannot be read (being replaced, broken, removed) the one in use stays, `status` is told, and
-/// the file's next change is waited for. `tags` are the GeoIP tags rules use and `dat_given`
-/// whether a data file is configured, for the tags no data provides (see
-/// [`missing_geoip_tags`]). The watch thread is the only one swapping GeoIP data (a hot reload
-/// stops the watch before swapping data), so the data in use taken at the start is still the
-/// data in use at the swap
+/// (see [`GeoIpManager::with_mmdb`]: by the content, not by what the file looks like), swapped
+/// into the state `state` once built, requests going on judging by the data in use meanwhile;
+/// with the content unchanged nothing is swapped. When it cannot be read (being replaced,
+/// broken, removed) the one in use stays, `status` is told, and the file's next change is
+/// waited for. `tags` are the GeoIP tags rules use and `dat_given` whether a data file is
+/// configured, for the tags no data provides (see [`missing_geoip_tags`]). The watch thread is
+/// the only one swapping GeoIP data (a hot reload stops the watch before swapping data), so the
+/// data in use taken at the start is still the data in use at the swap
 fn reload_mmdb(
     state: &ArcSwap<EngineInner>,
     path: &Path,
