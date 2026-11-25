@@ -2831,21 +2831,21 @@ fn watch_started_after(
 }
 
 /// 报来的改动之后文件还是读之前的样子、内容和启动时读到的一字不差：不重载，代数还是 1。macOS 的 FSEvents 会把装监视
-/// 之前不久的写入这样报给刚装上的监视；这里一字不差地再写一遍、把修改时间改回去，哪个平台上都一样。以前同一份配置
-/// 在启动以后又重载一次，配置里有问题时多记一条重载失败
+/// 之前不久的写入这样报给刚装上的监视（这里装监视之前刚写过）；inotify 这里报的是打开来写、一个字没写就关上。以前同一份
+/// 配置在启动以后又重载一次，配置里有问题时多记一条重载失败
 /// The file, after the change reported, looking as it did before it was read and holding word
 /// for word what startup read: no reload, the generation still 1. macOS's FSEvents reports a
-/// write made shortly before the watch was installed this way to the watch just installed;
-/// here it is written again word for word and its modification time put back, alike on every
-/// platform. The same configuration used to be reloaded once more after startup, a failed
-/// reload logged besides for a configuration with a problem
+/// write made shortly before the watch was installed this way to the watch just installed
+/// (here it was written just before); what inotify reports here is the file opened for writing
+/// and closed with nothing written. The same configuration used to be reloaded once more after
+/// startup, a failed reload logged besides for a configuration with a problem
 #[tokio::test]
 async fn a_change_reported_to_the_config_as_read_at_startup_is_not_reloaded() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("pipeline.json");
     let v1 = static_config("192.0.2.1");
-    let (engine, recorder, _watching) = watch_started_after(&path, &v1, |modified| {
-        write_modified_at(&path, &v1, modified)
+    let (engine, recorder, _watching) = watch_started_after(&path, &v1, |_| {
+        drop(std::fs::File::options().write(true).open(&path).unwrap());
     });
 
     // 比读到写完的最长等待（0.3 秒不再写）久得多 / Far longer than the longest wait for a write to
