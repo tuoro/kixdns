@@ -176,12 +176,12 @@ impl ConfigWatch {
     }
 }
 
-/// 一个文件的路径、长度、修改时间和是哪一个（见 [`Identity`]）：四样都没变，就当内容没变。记下文件读之前什么样：监视
+/// 一个文件的路径、长度、修改时间和改动时间（见 [`Changed`]）：四样都没变，就当内容没变。记下文件读之前什么样：监视
 /// 报来的改动是不是还是读到的那份（见 [`ConfigWatch`]），监视核对时文件换没换样子（见 [`Targets::check`]），MMDB
 /// 换没换（见 `GeoIpManager::use_mmdb`），整个监视装不上时 Geo 数据文件换没换样子
-/// A file's path, length, modification time and which one it is (see [`Identity`]): with all
-/// four unchanged, its content counts as unchanged. It notes what a file looked like before it
-/// was read: whether a change the watch reports is still what was read (see [`ConfigWatch`]),
+/// A file's path, length, modification time and change time (see [`Changed`]): with all four
+/// unchanged, its content counts as unchanged. It notes what a file looked like before it was
+/// read: whether a change the watch reports is still what was read (see [`ConfigWatch`]),
 /// whether the file looks otherwise when the watch checks itself (see [`Targets::check`]),
 /// whether the MMDB was replaced (see `GeoIpManager::use_mmdb`), and whether a Geo data file
 /// looks otherwise when its watch could not be installed at all
@@ -190,7 +190,7 @@ pub(crate) struct FileStamp {
     path: PathBuf,
     len: u64,
     modified: Option<SystemTime>,
-    identity: Option<Identity>,
+    changed: Option<Changed>,
 }
 
 impl FileStamp {
@@ -200,7 +200,7 @@ impl FileStamp {
             path: path.to_path_buf(),
             len: meta.len(),
             modified: meta.modified().ok(),
-            identity: identity(&meta),
+            changed: changed(&meta),
         })
     }
 
@@ -210,24 +210,30 @@ impl FileStamp {
     }
 }
 
-/// 文件或目录是哪一个：unix 上是所在的设备和 inode，换成别的（改名换掉、删掉重建、卸载又挂上一个新的）就不同。别的
-/// 平台只比得了建立时间：Windows 的文件名隧道会让十五秒内在同一个名字上新建、改名过来的沿用旧的建立时间，这时只有长度、
-/// 修改时间看得出换了
-/// Which file or directory it is: on unix the device and inode it is on, differing once
-/// another takes its place (swapped by renames, removed and made again, a file system
-/// unmounted and another mounted). Elsewhere only the creation time compares: Windows' file
-/// name tunnelling hands the old creation time to whatever is created or renamed under the same
-/// name within fifteen seconds, and then only the length and modification time tell
+/// 文件的改动时间。unix 上是 inode 的 ctime：改名盖过来的别的文件带着它自己写入、改名的时刻，长度、修改时间都一样也看得
+/// 出换了（只有内核时钟的同一个节拍里先后写好的两份分不出）；只改属性（chmod、chown）也会换，那个文件就多读一次。不用
+/// inode 号：vfat、exfat、noserverino 的 CIFS、不带 use_ino 的 FUSE 上，文件被逐出 inode 缓存再读回就换一个号，没改也
+/// 像换了。别的平台用建立时间：Windows 的文件名隧道会让十五秒内在同一个名字上新建、改名过来的沿用旧的建立时间，这时只有
+/// 长度、修改时间看得出换了
+/// A file's change time. On unix the inode's ctime: another file renamed over it carries the
+/// moment it was itself written or renamed, so it tells even with the length and modification
+/// time alike (save two written within one tick of the kernel clock); a metadata change alone
+/// (chmod, chown) moves it too, and that file is read once more. Not the inode number: on vfat,
+/// exfat, noserverino CIFS and FUSE without use_ino a file gets another one once evicted from
+/// the inode cache and read back, looking replaced unchanged. Elsewhere the creation time:
+/// Windows' file name tunnelling hands the old creation time to whatever is created or renamed
+/// under the same name within fifteen seconds, and then only the length and modification time
+/// tell
 #[cfg(unix)]
-type Identity = (u64, u64);
+type Changed = (i64, i64);
 #[cfg(not(unix))]
-type Identity = SystemTime;
+type Changed = SystemTime;
 
-fn identity(meta: &std::fs::Metadata) -> Option<Identity> {
+fn changed(meta: &std::fs::Metadata) -> Option<Changed> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
-        Some((meta.dev(), meta.ino()))
+        Some((meta.ctime(), meta.ctime_nsec()))
     }
     #[cfg(not(unix))]
     {
@@ -235,9 +241,49 @@ fn identity(meta: &std::fs::Metadata) -> Option<Identity> {
     }
 }
 
+/// 目录是哪一个，换成别的（改名换掉、删掉重建）就不同：unix 上是所在的设备和 inode（监视着的目录 inotify 钉在内存里，
+/// 不会逐出缓存换号），Windows 上是卷序列号和文件 ID（建立时间不行：目录改名换掉时文件名隧道把旧的建立时间给了改名过来
+/// 的那个）。卸载又挂上的还是这一个，见 [`Targets::check`]
+/// Which directory it is, differing once another takes its place (swapped by renames, removed
+/// and made again): on unix the device and inode it is on (inotify pins a watched directory in
+/// memory, so it is never evicted to come back under another number), on Windows the volume
+/// serial number and file ID (not the creation time: as a directory is swapped by renames, file
+/// name tunnelling hands the old creation time to the one renamed in). Unmounted and mounted
+/// again it is still this one, see [`Targets::check`]
+#[cfg(unix)]
+type Identity = (u64, u64);
+#[cfg(windows)]
+type Identity = (u32, u64);
+
 /// `dir` 现在是哪一个，看不了时是 None / Which one `dir` is now, None when that cannot be looked at
+#[cfg(unix)]
 fn identity_of(dir: &Path) -> Option<Identity> {
-    identity(&std::fs::metadata(dir).ok()?)
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = std::fs::metadata(dir).ok()?;
+    Some((meta.dev(), meta.ino()))
+}
+
+/// `dir` 现在是哪一个，看不了时是 None。和 `std::fs::metadata` 一样打开：不要读写权限、谁都不挡，打得开目录
+/// Which one `dir` is now, None when that cannot be looked at. Opened as `std::fs::metadata`
+/// opens it: asking neither to read nor to write, sharing with everyone, able to open a directory
+#[cfg(windows)]
+fn identity_of(dir: &Path) -> Option<Identity> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, GetFileInformationByHandle,
+    };
+    let dir = std::fs::OpenOptions::new()
+        .access_mode(0)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(dir)
+        .ok()?;
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: 句柄在 `dir` 活着时有效，`info` 是给它填的 / The handle is valid while `dir` lives,
+    // and `info` is for it to fill in
+    let filled = unsafe { GetFileInformationByHandle(dir.as_raw_handle(), &mut info) } != 0;
+    let index = u64::from(info.nFileIndexHigh) << 32 | u64::from(info.nFileIndexLow);
+    filled.then_some((info.dwVolumeSerialNumber, index))
 }
 
 /// 已经装好、还没开始处理的文件监视：这期间的变化先排队，[`PendingWatch::start`] 以后再交给回调。
@@ -612,25 +658,37 @@ impl Targets {
 
     /// 核对监视有没有跟丢事件报不到的变化（见 [`CHECK_EVERY`]），`pending` 说的文件已经在等回调，不看。给出两样：
     ///
-    /// - 要当成改了的文件：用到的目录不再是装监视时那一个的（上层目录改了名、文件系统卸载又挂上；这些目录像没了一样处理，
-    ///   见 [`Targets::lost`]），和文件自己换了样子的（见 [`Target::seen`]：有位置监视不上的地方改了，网络文件系统上别的
-    ///   机器改的）。
+    /// - 要当成改了的文件：用到的目录不再是装监视时那一个的（上层目录改了名；这些目录像没了一样处理，见
+    ///   [`Targets::lost`]），和文件自己换了样子的（见 [`Target::seen`]：有位置监视不上的地方改了，网络文件系统上别的
+    ///   机器改的，文件系统卸载又挂上之间改的）。
     /// - 又处处监视上了的文件：有位置监视不上的（所在的目录删掉以后过了 [`QUIET`] 才重建、监视数用完了），重新解析以后
     ///   都监视上了。样子没变，不用回调，监视得怎样要报。
+    ///
+    /// 文件系统卸载又挂上时目录还是那一个（同样的设备和 inode，见 [`Identity`]），inotify 却撤了它的监视，notify 不说。
+    /// 所以 Linux 上比样子之前把还是那一个的目录都再监视一遍：还在的监视不变（IN_MASK_ADD），撤了的重新装上，这之前的
+    /// 改动比得出样子，之后的事件报得到。装不上（比如目录改成了列不出）时还在的监视照旧，撤了的那里就只靠比样子
     ///
     /// Checks for what the watch has lost track of with no event telling (see [`CHECK_EVERY`]),
     /// leaving out the files `pending` names, which wait for their callback already. It gives two
     /// things:
     ///
     /// - The files to count as changed: those using a directory that is no longer the one its
-    ///   watch went in on (a directory above renamed, a file system unmounted and mounted again;
-    ///   such directories are handled as gone, see [`Targets::lost`]), and those looking
-    ///   otherwise themselves (see [`Target::seen`]: a change where the watch cannot see, or made
-    ///   by another machine on a network file system).
+    ///   watch went in on (a directory above renamed; such directories are handled as gone, see
+    ///   [`Targets::lost`]), and those looking otherwise themselves (see [`Target::seen`]: a
+    ///   change where the watch cannot see, made by another machine on a network file system, or
+    ///   while a file system was unmounted and mounted again).
     /// - The files watched everywhere again: those with places that could not be watched (their
     ///   directory made again only past [`QUIET`] after its removal, the watches run out), all
     ///   watched once resolved again. Looking the same, they need no callback, though how they
     ///   are watched is to be reported.
+    ///
+    /// A file system unmounted and mounted again leaves the directory the same one (the same
+    /// device and inode, see [`Identity`]), yet inotify has taken its watch out, notify telling
+    /// no one. So on Linux, before the files are compared, every directory still the same one is
+    /// watched again: a watch still in stays as it is (IN_MASK_ADD), one taken out goes back in,
+    /// a change before that shows in the comparison and the events tell those after. Where that
+    /// fails (the directory made unlistable, say) a watch still in stays, and where it was taken
+    /// out the comparison alone tells
     fn check(
         &mut self,
         watcher: &mut RecommendedWatcher,
@@ -643,6 +701,10 @@ impl Targets {
             .map(|(dir, _)| dir.clone())
             .collect();
         let mut changed = self.lost(watcher, &moved);
+        #[cfg(target_os = "linux")]
+        for dir in self.dirs.keys() {
+            let _ = watcher.watch(dir, RecursiveMode::NonRecursive);
+        }
         let mut covered = Vec::new();
         for index in 0..self.files.len() {
             if pending(index) || changed.contains(&index) {
@@ -1352,12 +1414,12 @@ mod tests {
         );
     }
 
-    /// 只改属性（chmod）不回调：内容没变，没有要重新读的。以前每次都重载。只在 Linux 上测：macOS 的 FSEvents
-    /// 给这次 chmod 报的事件把此前新建、写入的标志也带上，分不出来
-    /// A metadata change alone (chmod) calls nothing back: the content is as it was, with
-    /// nothing to read again. Each used to reload. Tested on Linux only: for this chmod macOS
-    /// FSEvents reports events carrying the earlier creation and write too, which cannot be
-    /// told apart
+    /// 只改属性（chmod）的事件不回调：内容没变，没有要马上重新读的（下次核对时它换了样子，见 [`Changed`]）。以前每次都
+    /// 重载。只在 Linux 上测：macOS 的 FSEvents 给这次 chmod 报的事件把此前新建、写入的标志也带上，分不出来
+    /// A metadata change alone (chmod) is not called back on its event: the content is as it
+    /// was, with nothing to read again at once (the next check finds it looking otherwise, see
+    /// [`Changed`]). Each used to reload. Tested on Linux only: for this chmod macOS FSEvents
+    /// reports events carrying the earlier creation and write too, which cannot be told apart
     #[cfg(target_os = "linux")]
     #[test]
     fn a_metadata_change_calls_nothing_back() {
@@ -2083,6 +2145,62 @@ mod tests {
         targets.refresh(&mut watcher, 0).expect("watched");
         let dir = real.join("A/geo");
         assert_eq!(targets.dirs[&dir].identity, identity_of(&dir));
+        assert_eq!(targets.check(&mut watcher, |_| false), (vec![], vec![]));
+    }
+
+    /// 文件系统卸载又挂上：目录还是那一个，inotify 却撤了它的监视，notify 不说（这里绕过 [`Targets`] 撤掉监视来模拟）。
+    /// 核对把监视装回去，之后的改动事件报得到。以前核对只比目录是不是那一个，看不出来，之后每次改动都要等核对比样子
+    /// A file system unmounted and mounted again: the directory is the same one, yet inotify has
+    /// taken its watch out, notify telling no one (here the watch is taken out behind
+    /// [`Targets`]' back to stand in). The check puts the watch back, and later changes are
+    /// reported by events. The check used to compare only whether the directory was the same
+    /// one, which could not tell, and every change after waited for a check to compare the files
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_check_puts_back_a_watch_taken_out_of_the_same_directory() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let real = std::fs::canonicalize(root.path()).unwrap();
+        let configured = real.join("data.json");
+        std::fs::write(&configured, "v1").unwrap();
+        let (events, rx) = mpsc::channel();
+        let (mut watcher, mut targets, _) =
+            Targets::watch(std::slice::from_ref(&configured), events).expect("watch");
+        watcher.unwatch(&real).expect("the watch taken out");
+
+        assert_eq!(targets.check(&mut watcher, |_| false), (vec![], vec![]));
+        std::fs::write(&configured, "v2").unwrap();
+        let event = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("an event")
+            .expect("not an error");
+        assert!(event.paths.contains(&configured), "{event:?}");
+    }
+
+    /// vfat 上的文件被逐出 inode 缓存再读回，换了一个 inode 号，内容没变：核对不当它改了，不再读一遍。被监视的目录
+    /// inotify 钉在内存里，还是那一个。要 root（丢缓存）和 `KIXDNS_TEST_VFAT` 说的一个 vfat 上的目录，比如回环挂上的镜像
+    /// A file on vfat evicted from the inode cache and read back gets another inode number, its
+    /// content unchanged: the check does not take it for changed and reads it no more. The
+    /// watched directory, pinned in memory by inotify, is still the same one. Needs root (to drop
+    /// the caches) and a directory on vfat that `KIXDNS_TEST_VFAT` names, an image mounted by
+    /// loop, say
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs root and a directory on vfat that KIXDNS_TEST_VFAT names"]
+    fn a_file_read_back_into_the_inode_cache_is_not_taken_for_changed() {
+        use std::os::unix::fs::MetadataExt as _;
+        let vfat = std::env::var_os("KIXDNS_TEST_VFAT").expect("KIXDNS_TEST_VFAT");
+        let dir = tempfile::tempdir_in(vfat).expect("tempdir");
+        let configured = dir.path().join("b.dat");
+        std::fs::write(&configured, "v1").unwrap();
+        let (mut watcher, mut targets, _) =
+            Targets::watch(std::slice::from_ref(&configured), |_| {}).expect("watch");
+        let inode = || std::fs::metadata(&configured).unwrap().ino();
+        let before = inode();
+
+        // SAFETY: sync 不带参数 / sync takes no arguments
+        unsafe { libc::sync() };
+        std::fs::write("/proc/sys/vm/drop_caches", "3").expect("caches dropped, as root");
+        assert_ne!(inode(), before, "read back under another inode number");
         assert_eq!(targets.check(&mut watcher, |_| false), (vec![], vec![]));
     }
 
