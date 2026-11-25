@@ -689,20 +689,42 @@ impl Rule {
         request.iter().chain(response)
     }
 
-    /// 合并转发时问的那几个 forward（写了地址的，见 [`Rule::merged_forward`]）共用的 ecs：写得一样
-    /// 时就是它，写得不一样时为 Err。合并后只有一次转发，只能发一个 ECS
-    /// The ecs shared by the forwards a merged forward asks (those naming an address, see
+    /// 每个 forward 问的上游（没写的问 `default_upstream`，见 [`GlobalSettings::forward_target`]）、它的传输（没写是
+    /// UDP）和 ecs，按写的顺序
+    /// What each forward asks, in the order written: its upstreams (`default_upstream` for one
+    /// writing none, see [`GlobalSettings::forward_target`]), its transport (UDP when not
+    /// written) and its ecs
+    fn forwards<'a>(
+        &'a self,
+        settings: &'a GlobalSettings,
+    ) -> impl Iterator<Item = (&'a ForwardTarget, Transport, Option<&'a EcsMode>)> {
+        self.actions.iter().filter_map(|action| match action {
+            Action::Forward {
+                upstream,
+                transport,
+                ecs,
+            } => Some((
+                settings.forward_target(upstream.as_ref()),
+                transport.unwrap_or(Transport::Udp),
+                ecs.as_ref(),
+            )),
+            _ => None,
+        })
+    }
+
+    /// 合并转发时问的那几个 forward（问得到地址的，见 [`Rule::merged_forward`]）共用的 ecs：写得一样时就是它，写得不一样
+    /// 时为 Err。合并后只有一次转发，只能发一个 ECS
+    /// The ecs shared by the forwards a merged forward asks (those asking an address, see
     /// [`Rule::merged_forward`]): it when they all write the same, Err when they differ. The
     /// merge is a single forward and can send only one ECS
-    pub(crate) fn shared_forward_ecs(&self) -> Result<Option<&EcsMode>, ()> {
-        let mut ecs = self.actions.iter().filter_map(|action| match action {
-            Action::Forward {
-                upstream: Some(upstream),
-                ecs,
-                ..
-            } if upstream.names_an_address() => Some(ecs.as_ref()),
-            _ => None,
-        });
+    pub(crate) fn shared_forward_ecs<'a>(
+        &'a self,
+        settings: &'a GlobalSettings,
+    ) -> Result<Option<&'a EcsMode>, ()> {
+        let mut ecs = self
+            .forwards(settings)
+            .filter(|(target, ..)| target.names_an_address())
+            .map(|(.., ecs)| ecs);
         let first = ecs.next().flatten();
         if ecs.all(|other| other == first) {
             Ok(first)
@@ -711,23 +733,21 @@ impl Rule {
         }
     }
 
-    /// 几个 forward 合并成的那一次转发（见 [`MergedForward`]）：每个 forward 写的上游按传输分组去重，各组按
+    /// 几个 forward 合并成的那一次转发（见 [`MergedForward`]）：每个 forward 问的上游（没写的问 `settings` 的
+    /// `default_upstream`，和只有它一个时一样，见 [`GlobalSettings::forward_target`]）按传输分组去重，各组按
     /// `Transport::ALL` 的顺序排成一串。规则写了不止一个 forward、轮到的是 forward（前面没有别的作决定的动作，见
-    /// [`Rule::request_decision`]），而且至少一个 forward 写了地址时才有，否则为 None。编译配置时每条规则算一次
+    /// [`Rule::request_decision`]），而且至少一个 forward 问得到地址时才有，否则为 None。编译配置时每条规则算一次
     /// The one forward several forwards merge into (see [`MergedForward`]): the upstreams each
-    /// forward writes, deduplicated in a group per transport, the groups strung together in the
-    /// order of `Transport::ALL`. It is there only when the rule writes more than one forward, a
-    /// forward has the turn (no other deciding action written before, see
-    /// [`Rule::request_decision`]) and at least one forward names an address, None otherwise.
+    /// forward asks (`settings`' `default_upstream` for one writing none, as when it is alone,
+    /// see [`GlobalSettings::forward_target`]), deduplicated in a group per transport, the groups
+    /// strung together in the order of `Transport::ALL`. It is there only when the rule writes
+    /// more than one forward, a forward has the turn (no other deciding action written before,
+    /// see [`Rule::request_decision`]) and at least one forward asks an address, None otherwise.
     /// Worked out once for each rule as the configuration compiles
-    pub(crate) fn merged_forward(&self) -> Option<MergedForward> {
+    pub(crate) fn merged_forward(&self, settings: &GlobalSettings) -> Option<MergedForward> {
         use rustc_hash::FxHashSet;
 
-        let forward_count = self
-            .actions
-            .iter()
-            .filter(|a| matches!(a, Action::Forward { .. }))
-            .count();
+        let forward_count = self.forwards(settings).count();
 
         if forward_count <= 1 {
             return None;
@@ -746,25 +766,17 @@ impl Rule {
 
         // 每种传输一组，各组按 `Transport::ALL` 的顺序排进合并后的列表 / One set per transport, each
         // going into the merged list in the order of `Transport::ALL`
-        let mut sets: [FxHashSet<String>; 6] = Default::default();
+        let mut sets: [FxHashSet<String>; Transport::ALL.len()] = Default::default();
 
-        for action in &self.actions {
-            if let Action::Forward {
-                upstream: Some(upstream),
-                transport,
-                ..
-            } = action
-            {
-                let action_transport = transport.unwrap_or(Transport::Udp);
-                for addr in upstream.upstreams() {
-                    // 前缀照单个转发那样认，没有前缀或前缀不认识时用这个动作的传输。TCP 和 UDP 双发的
-                    // 上游只记一份，合并后仍然双发
-                    // The prefix is read as for a single forward, the action's transport taken
-                    // without one or for one it does not know. An upstream asked over TCP and
-                    // UDP at once is recorded once and still asked both ways after the merge
-                    let (address, transport) = parse_upstream_addr(addr, action_transport);
-                    sets[transport as usize].insert(format!("{}://{address}", transport.label()));
-                }
+        for (target, action_transport, _) in self.forwards(settings) {
+            for addr in target.upstreams() {
+                // 前缀照单个转发那样认，没有前缀或前缀不认识时用这个动作的传输。TCP 和 UDP 双发的
+                // 上游只记一份，合并后仍然双发
+                // The prefix is read as for a single forward, the action's transport taken
+                // without one or for one it does not know. An upstream asked over TCP and
+                // UDP at once is recorded once and still asked both ways after the merge
+                let (address, transport) = parse_upstream_addr(addr, action_transport);
+                sets[transport as usize].insert(format!("{}://{address}", transport.label()));
             }
         }
 
@@ -777,7 +789,7 @@ impl Rule {
             tracing::debug!(
                 rule = %self.name,
                 forward_count,
-                "all forward actions have empty upstream, merged_forward not set"
+                "no forward action asks an upstream address, so no merged forward"
             );
             return None;
         }
@@ -797,7 +809,7 @@ impl Rule {
             target: ForwardTarget::new(&all_upstreams.join(",")),
             // 写得不一样时不发，启动时 `problems` 记一条错误 / None when they differ;
             // at startup `problems` logs an error
-            ecs: self.shared_forward_ecs().ok().flatten().cloned(),
+            ecs: self.shared_forward_ecs(settings).ok().flatten().cloned(),
         })
     }
 }
@@ -1625,7 +1637,7 @@ pub fn problems(cfg: &PipelineConfig) -> Vec<String> {
                     ));
                 }
             }
-            Entry::Rule(rule) => rule_problems(rule, &pipelines, report),
+            Entry::Rule(rule) => rule_problems(rule, &cfg.settings, &pipelines, report),
         }
         for (within, matcher) in entry.matchers() {
             if let Some(problem) = matcher.problem() {
@@ -2428,6 +2440,7 @@ enum Weight {
 
 fn rule_problems(
     rule: &Rule,
+    settings: &GlobalSettings,
     pipelines: &rustc_hash::FxHashSet<&str>,
     mut report: impl FnMut(String),
 ) {
@@ -2452,21 +2465,19 @@ fn rule_problems(
     use crate::matcher::static_cname_target;
     use crate::matcher::static_ips;
 
-    let forwards = rule
-        .actions
-        .iter()
-        .filter(|action| matches!(action, Action::Forward { .. }))
-        .count();
-    if forwards > 1 && rule.shared_forward_ecs().is_err() {
+    let forwards = rule.forwards(settings).count();
+    if forwards > 1 && rule.shared_forward_ecs(settings).is_err() {
         report(MERGED_ECS_DIFFER.to_string());
     }
-    // 几个 forward 合成一次转发、其中有写了地址的：写成空的那个只是被跳过，查询照样有上游作答
-    // Several forwards merged into one with an address among them: one written empty is only
-    // skipped, and the query still has upstreams to answer it
+    // 几个 forward 合成一次转发、其中有问得到地址的（写了地址的，或者没写、问 `default_upstream` 的）：写成空的那个只是
+    // 被跳过，查询照样有上游作答
+    // Several forwards merged into one with one among them asking an address (written, or
+    // `default_upstream` for one writing none): one written empty is only skipped, and the
+    // query still has upstreams to answer it
     let merge_has_an_address = forwards > 1
-        && rule.actions.iter().any(|action| {
-            matches!(action, Action::Forward { upstream: Some(upstreams), .. } if upstreams.names_an_address())
-        });
+        && rule
+            .forwards(settings)
+            .any(|(target, ..)| target.names_an_address());
     // 回答动作里的 forward 各自转发，不合并 / The forwards among the answer actions forward
     // each on its own and do not merge
     let actions = rule
@@ -2644,7 +2655,7 @@ mod tests {
 
 #[cfg(test)]
 mod merged_forward_tests {
-    use super::Rule;
+    use super::{GlobalSettings, Rule};
     use serde_json::json;
 
     /// 一条规则的几个转发动作合并出的上游列表，排好序 / The upstream list a rule's forward
@@ -2655,7 +2666,7 @@ mod merged_forward_tests {
         }))
         .expect("parse rule");
         let mut list: Vec<String> = rule
-            .merged_forward()
+            .merged_forward(&GlobalSettings::default())
             .expect("several forwards merge")
             .target
             .upstreams()
@@ -2700,6 +2711,49 @@ mod merged_forward_tests {
         ));
     }
 
+    /// 没写 upstream 的 forward 问 default_upstream，几个 forward 合成一次转发时也一样，和只有它一个时问的相同：
+    /// default_upstream 里的上游照这个 forward 的传输读，和别的 forward 的一起按传输去重
+    /// A forward writing no upstream asks default_upstream, in a merge of several forwards too,
+    /// the same as it asks alone: the upstreams of default_upstream read by this forward's
+    /// transport and deduplicated with the other forwards' by transport
+    #[test]
+    fn a_forward_without_an_upstream_merges_the_default_upstream() {
+        let config: super::PipelineConfig = serde_json::from_value(json!({
+            "settings": { "default_upstream": "192.0.2.1:53, tcp://192.0.2.2:53" },
+            "pipelines": [{ "id": "main", "rules": [{
+                "name": "r",
+                "matchers": [{ "type": "any" }],
+                "actions": [
+                    { "type": "forward" },
+                    { "type": "forward", "upstream": [], "transport": "tcp" },
+                    { "type": "forward", "upstream": "192.0.2.1:53, 192.0.2.3:53" }
+                ]
+            }] }]
+        }))
+        .expect("parse config");
+        let runtime = crate::matcher::RuntimePipelineConfig::from_config(config).expect("compiles");
+        let merged = runtime.pipelines[0].rules[0]
+            .merged_forward
+            .as_ref()
+            .expect("several forwards merge");
+        let mut list: Vec<&str> = merged
+            .target
+            .upstreams()
+            .iter()
+            .map(AsRef::as_ref)
+            .collect();
+        list.sort_unstable();
+        assert_eq!(
+            list,
+            [
+                "tcp://192.0.2.1:53",
+                "tcp://192.0.2.2:53",
+                "udp://192.0.2.1:53",
+                "udp://192.0.2.3:53",
+            ]
+        );
+    }
+
     /// 写在 forward 前面的 replace_txt_response 不挡着合并：请求阶段手上没有应答可换，它什么也不做，轮到的照样是 forward
     /// （见 `Rule::request_decision`）。以前只有 log 不算，这样的规则只问第一个 forward 的上游
     /// A replace_txt_response written before the forwards keeps them merged: in the request
@@ -2719,10 +2773,11 @@ mod merged_forward_tests {
     }
 
     /// 合并后的这一次转发只能发一个 ECS：几个 forward 的 ecs 写得一样时就是它；写得不一样（包括有的写、
-    /// 有的不写）时为 None，和不写 ecs 一样。没写 upstream 的 forward 不在合并里，它的 ecs 不算
+    /// 有的不写）时为 None，和不写 ecs 一样。没写 upstream 的 forward 问 default_upstream，也在合并里，它的 ecs 照样算
     /// The one merged forward can send one ECS only: the forwards' ecs when they all write
     /// the same; None when they differ (some written and some not, too), as without ecs. A
-    /// forward without an upstream is not in the merge, and its ecs does not count
+    /// forward without an upstream asks default_upstream and is in the merge too, its ecs
+    /// counting as well
     #[test]
     fn a_merged_forward_sends_the_ecs_its_forwards_share() {
         let ecs_of = |actions: serde_json::Value| {
@@ -2730,7 +2785,9 @@ mod merged_forward_tests {
                 "name": "r", "matchers": [{ "type": "any" }], "actions": actions
             }))
             .expect("parse rule");
-            rule.merged_forward().expect("several forwards merge").ecs
+            rule.merged_forward(&GlobalSettings::default())
+                .expect("several forwards merge")
+                .ecs
         };
         let from_client = json!({ "mode": "from_client_ip", "prefix_v4": 24, "prefix_v6": 56 });
         let forward = |upstream: &str, ecs: &serde_json::Value| json!({ "type": "forward", "upstream": upstream, "ecs": ecs });
@@ -2762,10 +2819,17 @@ mod merged_forward_tests {
         assert_eq!(
             ecs_of(json!([
                 forward("192.0.2.1:53", &from_client),
+                { "type": "forward", "upstream": null, "ecs": from_client }
+            ])),
+            shared
+        );
+        assert_eq!(
+            ecs_of(json!([
+                forward("192.0.2.1:53", &from_client),
                 forward("192.0.2.2:53", &from_client),
                 { "type": "forward", "upstream": null, "ecs": { "mode": "clear" } }
             ])),
-            shared
+            None
         );
         // 写成空的（或者只有逗号）的 upstream 也一样：合并时跳过它，它的 ecs 不算
         // An upstream written empty (or commas only) is the same: the merge skips it, and its
@@ -2803,7 +2867,9 @@ mod merged_forward_tests {
             ]
         }))
         .expect("parse rule");
-        let merged = rule.merged_forward().expect("several forwards merge");
+        let merged = rule
+            .merged_forward(&GlobalSettings::default())
+            .expect("several forwards merge");
         let list: Vec<String> = merged
             .target
             .upstreams()
@@ -4052,12 +4118,13 @@ mod validation_tests {
         );
     }
 
-    /// 一条规则里几个 forward 合成一次转发时，写成空的那个只是被跳过，查询照样由别的上游作答：不算问题，
-    /// 它的 ecs 也不算进「ecs 写得不一样」。全都是空的、或者回答动作里的空 forward，照旧要报
+    /// 一条规则里几个 forward 合成一次转发时，写成空的那个只是被跳过，查询照样由别的上游作答（没写 upstream 的
+    /// forward 问的 default_upstream 也算）：不算问题，它的 ecs 也不算进「ecs 写得不一样」。全都是空的、或者回答动作里的空
+    /// forward，照旧要报
     /// When a rule's forwards merge into one, one written empty is only skipped and the
-    /// others answer the query: no problem, and its ecs does not count towards "ecs settings
-    /// differ". All of them empty, or an empty forward among the answer actions, is named as
-    /// before
+    /// others answer the query (the default_upstream a forward writing no upstream asks
+    /// among them): no problem, and its ecs does not count towards "ecs settings differ". All
+    /// of them empty, or an empty forward among the answer actions, is named as before
     #[test]
     fn an_empty_forward_beside_real_ones_is_no_problem() {
         let any = serde_json::json!([{ "type": "any" }]);
@@ -4077,6 +4144,11 @@ mod validation_tests {
                         "beside",
                         any.clone(),
                         serde_json::json!([forward(empty), forward("127.0.0.1:53")])
+                    ),
+                    rule(
+                        "beside the default",
+                        any.clone(),
+                        serde_json::json!([forward(empty), { "type": "forward" }])
                     ),
                     rule(
                         "shared",
@@ -4113,11 +4185,12 @@ mod validation_tests {
         }
     }
 
-    /// 一条规则里几个 forward 的 ecs 写得不一样时（包括有的写、有的不写），是一条配置问题：写明规则，说清怎么改。
-    /// 写得一样、都不写、只有一个 forward 时不算
+    /// 一条规则里几个 forward 的 ecs 写得不一样时（包括有的写、有的不写），是一条配置问题：写明规则，说清怎么改。没写
+    /// upstream 的 forward 问 default_upstream，它的 ecs 也算。写得一样、都不写、只有一个 forward 时不算
     /// A rule whose forwards write different ecs (some written and some not, too) is a
-    /// configuration problem naming the rule and saying how to fix it. The same ecs on
-    /// each, none at all, or a single forward is no problem
+    /// configuration problem naming the rule and saying how to fix it. A forward writing no
+    /// upstream asks default_upstream, and its ecs counts too. The same ecs on each, none at
+    /// all, or a single forward is no problem
     #[test]
     fn forwards_with_different_ecs_in_one_rule_are_a_problem() {
         let any = serde_json::json!([{ "type": "any" }]);
@@ -4140,12 +4213,24 @@ mod validation_tests {
                     forward("8.8.8.8:53", &serde_json::json!({ "mode": "from_client_ip", "prefix_v4": 24, "prefix_v6": 56 }))
                 ])),
                 rule("none", any.clone(), serde_json::json!([plain("1.1.1.1:53"), plain("8.8.8.8:53")])),
-                rule("single", any.clone(), serde_json::json!([forward("1.1.1.1:53", &from_client)]))
+                rule("single", any.clone(), serde_json::json!([forward("1.1.1.1:53", &from_client)])),
+                rule("default", any.clone(), serde_json::json!([
+                    forward("8.8.8.8:53", &from_client),
+                    { "type": "forward" }
+                ])),
+                rule("default alike", any.clone(), serde_json::json!([
+                    forward("8.8.8.8:53", &from_client),
+                    { "type": "forward", "ecs": from_client }
+                ]))
             ]}]
         });
         let found = problems_of(config);
-        assert_eq!(found.len(), 2, "{found:?}");
-        for place in ["pipelines[0].rules[0]", "pipelines[0].rules[1]"] {
+        assert_eq!(found.len(), 3, "{found:?}");
+        for place in [
+            "pipelines[0].rules[0]",
+            "pipelines[0].rules[1]",
+            "pipelines[0].rules[5]",
+        ] {
             assert!(
                 found.iter().any(|problem| {
                     problem.starts_with(&format!("{place}: "))
