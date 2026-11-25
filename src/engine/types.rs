@@ -369,8 +369,9 @@ pub struct EngineInner {
     /// Each pipeline's response-affecting configuration fingerprint, combined with the
     /// fingerprints of the Geo data it uses (see [`Self::at_geo`])
     pub cache_namespaces: FxHashMap<Arc<str>, u64>,
-    /// 只按配置算出的指纹 / The fingerprints from the configuration alone
-    config_namespaces: FxHashMap<Arc<str>, u64>,
+    /// 只按配置算出的指纹，和 `pipeline.pipelines` 同序 / The fingerprints from the configuration
+    /// alone, in the order of `pipeline.pipelines`
+    config_namespaces: Vec<u64>,
     /// 匹配器判断时读的 Geo 数据，`cache_namespaces` 按它算：请求 load 一次状态，判断和命名空间就是同一份数据（见
     /// [`GeoManagers`]）
     /// The Geo data matchers judge by, from which `cache_namespaces` is worked out: a request
@@ -469,16 +470,13 @@ impl EngineInner {
 /// the fingerprints of the data of the Geo tags each pipeline reads
 fn with_geo(
     cfg: &RuntimePipelineConfig,
-    config_namespaces: &FxHashMap<Arc<str>, u64>,
+    config_namespaces: &[u64],
     geo: &GeoManagers,
 ) -> FxHashMap<Arc<str>, u64> {
     cfg.pipelines
         .iter()
-        .map(|pipeline| {
-            let base = config_namespaces
-                .get(&pipeline.id)
-                .copied()
-                .unwrap_or_default();
+        .zip(config_namespaces)
+        .map(|(pipeline, &base)| {
             let namespace = if pipeline.geo_data.is_empty() {
                 base
             } else {
@@ -492,7 +490,9 @@ fn with_geo(
         .collect()
 }
 
-pub(crate) fn build_cache_namespaces(cfg: &RuntimePipelineConfig) -> FxHashMap<Arc<str>, u64> {
+/// 每个 pipeline 只按配置算出的指纹，和 `cfg.pipelines` 同序 / Each pipeline's fingerprint from
+/// the configuration alone, in the order of `cfg.pipelines`
+pub(crate) fn build_cache_namespaces(cfg: &RuntimePipelineConfig) -> Vec<u64> {
     cfg.pipelines
         .iter()
         .map(|pipeline| {
@@ -507,7 +507,7 @@ pub(crate) fn build_cache_namespaces(cfg: &RuntimePipelineConfig) -> FxHashMap<A
             for &reached in &pipeline.answered_through {
                 hash_pipeline_semantics(&cfg.pipelines[reached], &mut hasher);
             }
-            (pipeline.id.clone(), hasher.finish())
+            hasher.finish()
         })
         .collect()
 }
@@ -824,6 +824,16 @@ mod tests {
         RuntimePipelineConfig::from_config(config).expect("build runtime config")
     }
 
+    /// 按 pipeline 的 id 取 [`build_cache_namespaces`] 算出的命名空间 / The namespaces
+    /// [`build_cache_namespaces`] works out, by pipeline id
+    fn by_id(cfg: &RuntimePipelineConfig) -> rustc_hash::FxHashMap<std::sync::Arc<str>, u64> {
+        cfg.pipelines
+            .iter()
+            .map(|pipeline| pipeline.id.clone())
+            .zip(build_cache_namespaces(cfg))
+            .collect()
+    }
+
     #[test]
     fn namespace_is_stable_for_identical_configuration() {
         let first = runtime_config("8.8.8.8:53", "9.9.9.9:53");
@@ -867,8 +877,8 @@ mod tests {
 
     #[test]
     fn changing_one_pipeline_only_changes_its_namespace() {
-        let before = build_cache_namespaces(&runtime_config("8.8.8.8:53", "9.9.9.9:53"));
-        let after = build_cache_namespaces(&runtime_config("8.8.4.4:53", "9.9.9.9:53"));
+        let before = by_id(&runtime_config("8.8.8.8:53", "9.9.9.9:53"));
+        let after = by_id(&runtime_config("8.8.4.4:53", "9.9.9.9:53"));
 
         assert_ne!(before.get("first"), after.get("first"));
         assert_eq!(before.get("second"), after.get("second"));
@@ -912,7 +922,7 @@ mod tests {
                 ]
             }))
             .expect("parse config");
-            build_cache_namespaces(&RuntimePipelineConfig::from_config(config).expect("build"))
+            by_id(&RuntimePipelineConfig::from_config(config).expect("build"))
         };
         let (before, after) = (namespaces("9.9.9.9:53"), namespaces("9.9.9.10:53"));
         assert_ne!(before.get("continued"), after.get("continued"));
@@ -924,8 +934,8 @@ mod tests {
         let before_config = runtime_config("8.8.8.8:53", "9.9.9.9:53");
         let mut after_config = before_config.clone();
         after_config.settings.default_upstream = "1.0.0.1:53".into();
-        let before = build_cache_namespaces(&before_config);
-        let after = build_cache_namespaces(&after_config);
+        let before = by_id(&before_config);
+        let after = by_id(&after_config);
 
         assert_ne!(before.get("first"), after.get("first"));
         assert_ne!(before.get("second"), after.get("second"));
@@ -948,11 +958,11 @@ mod tests {
             }),
         ];
         let before_config = runtime_config("8.8.8.8:53", "9.9.9.9:53");
-        let before = build_cache_namespaces(&before_config);
+        let before = by_id(&before_config);
         for (name, change) in changes {
             let mut after_config = before_config.clone();
             change(&mut after_config.settings);
-            let after = build_cache_namespaces(&after_config);
+            let after = by_id(&after_config);
             assert_ne!(before.get("first"), after.get("first"), "{name}");
             assert_ne!(before.get("second"), after.get("second"), "{name}");
         }
@@ -1061,8 +1071,8 @@ mod tests {
             22,
             "every setting read at startup changed"
         );
-        let before = build_cache_namespaces(&before_config);
-        let after = build_cache_namespaces(&after_config);
+        let before = by_id(&before_config);
+        let after = by_id(&after_config);
 
         assert_eq!(before.get("first"), after.get("first"));
         assert_eq!(before.get("second"), after.get("second"));
