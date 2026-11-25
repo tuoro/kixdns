@@ -114,26 +114,24 @@ pub struct DohCertificate {
 
 impl DohCertificate {
     /// 读 `cert_path` 和 `key_path`，读之前先装好监视（见 `watcher::PendingWatch`）：读的时候证书续期了，这次改动排着队，
-    /// 照样换上。以前先读后监视，中间续期的证书要等下一次改动才用上。监视不了，或者哪个文件有位置监视不上（见
-    /// `watcher::PendingWatch::uncovered`），只记错误、说那里续期的证书要重启才用上，证书照用
+    /// 照样换上。以前先读后监视，中间续期的证书要等下一次改动才用上。监视不了只记错误，证书照用；有位置监视不上的文件，
+    /// 记的错误说那里续期的证书要重启才用上（见 `watcher::PendingWatch::new` 的 `unseen`）
     /// Reads `cert_path` and `key_path`, watching them before they are read (see
     /// `watcher::PendingWatch`): a renewal made while they are read waits in line and is brought
     /// in all the same. They used to be read before being watched, and a renewal in between was
-    /// used only after the next change. When they cannot be watched, or a file has places that
-    /// cannot be (see `watcher::PendingWatch::uncovered`), an error is logged, saying a renewal
-    /// there is not used until restart, and the certificate is used as read
+    /// used only after the next change. When they cannot be watched an error is logged and the
+    /// certificate used as read; for a file with places that cannot be watched, the error logged
+    /// says a renewal there is not used until restart (see `unseen` of
+    /// `watcher::PendingWatch::new`)
     pub fn load(cert_path: &str, key_path: &str) -> anyhow::Result<Arc<Self>> {
-        let pending =
-            watcher::PendingWatch::new(&[PathBuf::from(cert_path), PathBuf::from(key_path)]);
+        let pending = watcher::PendingWatch::new(
+            &[PathBuf::from(cert_path), PathBuf::from(key_path)],
+            "a renewal there is not used until restart",
+        );
         let current = Arc::new(ArcSwap::from_pointee(build_tls_acceptor(
             cert_path, key_path,
         )?));
         let watch = pending
-            .inspect(|pending| {
-                for (path, err) in pending.uncovered() {
-                    error!(path = %path.display(), error = %err, "cannot watch the DoH certificate file everywhere it leads, a renewal there is not used until restart");
-                }
-            })
             .and_then(|pending| {
                 let reloaded = Arc::clone(&current);
                 let (cert, key) = (cert_path.to_owned(), key_path.to_owned());
@@ -1441,12 +1439,12 @@ mod tests {
     }
 
     /// 证书的文件有位置监视不上（这里是进得去、列不出的目录，像 inotify 的监视数用完时那样装不上监视）：证书照样用上，
-    /// 日志里每个这样的文件记一条错误，说那里续期的证书要重启才用上。以前只有整个监视装不上时才这么说，有位置监视不上时
-    /// 只有一条不提后果的。root 列得出这样的目录，也监视得上，没有要看的
+    /// 日志里每个这样的文件只记一条错误，说那里续期的证书要重启才用上。以前只有整个监视装不上时才这么说，有位置监视不上
+    /// 时只有一条不提后果的。root 列得出这样的目录，也监视得上，没有要看的
     /// The certificate's files have places that cannot be watched (here a directory that can
     /// be entered, not listed, refusing a watch as when inotify's watches run out): the
-    /// certificate is used all the same, and an error is logged for each such file, saying a
-    /// renewal there is not used until restart. Only a watch failing as a whole used to say so,
+    /// certificate is used all the same, and one error alone is logged for each such file,
+    /// saying a renewal there is not used until restart. Only a watch failing as a whole used to say so,
     /// places that could not be watched getting a line that named no consequence. root lists
     /// such a directory and watches it, with nothing to see
     #[cfg(target_os = "linux")]
@@ -1470,10 +1468,13 @@ mod tests {
         assert!(certificate.is_ok(), "the certificate is used as read");
         let lines = warnings.lines();
         for file in [&cert, &key] {
+            let said: Vec<&String> = lines
+                .iter()
+                .filter(|line| line.contains(&format!("path={file} ")))
+                .collect();
+            assert_eq!(said.len(), 1, "one error for {file}: {lines:#?}");
             assert!(
-                lines.iter().any(|line| line.contains(
-                    "cannot watch the DoH certificate file everywhere it leads, a renewal there is not used until restart"
-                ) && line.contains(&format!("path={file}"))),
+                said[0].contains("a renewal there is not used until restart"),
                 "{file}: {lines:#?}"
             );
         }

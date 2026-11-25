@@ -46,7 +46,7 @@ impl ConfigWatch {
     /// 开始监视配置文件 `path`，在读它之前调用 / Starts watching the configuration file `path`;
     /// call it before reading the file
     pub fn new(path: &Path) -> notify::Result<Self> {
-        let watch = PendingWatch::new(&[path.to_path_buf()])?;
+        let watch = PendingWatch::new(&[path.to_path_buf()], "changes there are not reloaded")?;
         let before_read = FileStamp::of(path).ok();
         Ok(Self { watch, before_read })
     }
@@ -168,27 +168,36 @@ pub(crate) struct PendingWatch {
     /// 装的时候有位置监视不上的文件，和为什么（见 [`PendingWatch::uncovered`]）/ The files with places
     /// that could not be watched when installed, and why (see [`PendingWatch::uncovered`])
     uncovered: Uncovered,
+    /// 监视不上的地方改了会怎样（见 [`PendingWatch::new`]）/ What becomes of a change where the
+    /// watch cannot see (see [`PendingWatch::new`])
+    unseen: &'static str,
     tx: Sender<Message>,
     rx: Receiver<Message>,
 }
 
 impl PendingWatch {
-    /// 开始监视 `paths`（见 [`Targets`]）。有位置监视不上的文件各记一条 error，见 [`PendingWatch::uncovered`]
-    /// Starts watching `paths` (see [`Targets`]). A file with places that cannot be watched is
-    /// logged as an error, see [`PendingWatch::uncovered`]
-    pub(crate) fn new(paths: &[PathBuf]) -> notify::Result<Self> {
+    /// 开始监视 `paths`（见 [`Targets`]）。`unseen` 说监视不上的地方改了会怎样，比如 "a renewal there is not used
+    /// until restart"：装的时候有位置监视不上的文件（见 [`PendingWatch::uncovered`]），和开始以后文件改了指向、新的
+    /// 地方监视不上的（见 [`PendingWatch::start_reporting`]），各记一条带着它的 error
+    /// Starts watching `paths` (see [`Targets`]). `unseen` tells what becomes of a change where
+    /// the watch cannot see, "a renewal there is not used until restart", say: a file with
+    /// places that cannot be watched as it is installed (see [`PendingWatch::uncovered`]), or
+    /// once it comes to lead somewhere that cannot be after the start (see
+    /// [`PendingWatch::start_reporting`]), is logged as an error carrying it
+    pub(crate) fn new(paths: &[PathBuf], unseen: &'static str) -> notify::Result<Self> {
         let (tx, rx) = mpsc::channel();
         let events = tx.clone();
         let (watcher, targets, uncovered) = Targets::watch(paths, move |event| {
             let _ = events.send(Message::Event(event));
         })?;
         for (path, err) in &uncovered {
-            error!(path = %path.display(), error = %err, "cannot watch every place the file leads");
+            error!(path = %path.display(), error = %err, "cannot watch every place the file leads, {unseen}");
         }
         Ok(Self {
             watcher,
             targets,
             uncovered,
+            unseen,
             tx,
             rx,
         })
@@ -238,6 +247,7 @@ impl PendingWatch {
         let Self {
             watcher,
             targets,
+            unseen,
             tx,
             rx,
             ..
@@ -249,6 +259,7 @@ impl PendingWatch {
             let (mut watcher, mut targets) = (watcher, targets);
             pump(
                 &name,
+                unseen,
                 &mut watcher,
                 &mut targets,
                 &rx,
@@ -636,16 +647,18 @@ fn watch_points(path: &Path) -> std::io::Result<Vec<PathBuf>> {
 /// 把变化交给 `on_change`，直到收到停止消息或通道关闭。一阵改动等到改了的文件都写完（见 [`Change::settle`]）、
 /// 最多 [`AT_MOST`]，每个文件重新解析、监视跟着换，监视得怎样交给 `on_watch`（见 [`PendingWatch::start_reporting`]），
 /// 再各回调一次。在监视的目录删掉、改名挪走时，用到它的文件也算改了（见 [`Targets::lost`]）。记的日志带着监视的名字
-/// `name` 和它的文件，看得出是哪个监视
+/// `name` 和它的文件，看得出是哪个监视；文件改了指向、新的地方监视不上时记的那条带着 `unseen`（见 [`PendingWatch::new`]）
 /// Hands changes to `on_change` until told to stop or the channel closes. A burst of changes
 /// is waited for until every file changed is written (see [`Change::settle`]), at most
 /// [`AT_MOST`]; then each file is resolved again with the watches following, how it is watched
 /// goes to `on_watch` (see [`PendingWatch::start_reporting`]), and it is called back once. A
 /// watched directory removed or renamed away counts as a change to the files using it (see
 /// [`Targets::lost`]). What it logs carries the watch's `name` and its files, telling which
-/// watch it is
+/// watch it is; a file coming to lead somewhere that cannot be watched is logged with `unseen`
+/// (see [`PendingWatch::new`])
 fn pump(
     name: &str,
+    unseen: &str,
     watcher: &mut RecommendedWatcher,
     targets: &mut Targets,
     rx: &Receiver<Message>,
@@ -708,7 +721,7 @@ fn pump(
                     let watched = targets.refresh(watcher, index);
                     let configured = &targets.files[index].configured;
                     if let Err(err) = &watched {
-                        error!(name, path = %configured.display(), error = %err, "cannot watch the file where it now leads");
+                        error!(name, path = %configured.display(), error = %err, "cannot watch the file where it now leads, {unseen}");
                     }
                     on_watch(configured, watched.as_ref().err());
                     on_change(configured);
@@ -723,6 +736,10 @@ fn pump(
 mod tests {
     use super::*;
 
+    /// 测试里监视不上的地方改了会怎样（见 [`PendingWatch::new`]）/ What becomes of a change where a
+    /// test's watch cannot see (see [`PendingWatch::new`])
+    const UNSEEN: &str = "changes there go unseen in this test";
+
     /// 监视装好、还没开始处理时文件变了，开始处理以后这次变化照样交给回调
     /// A change made after the watch is installed but before it starts handling changes
     /// still reaches the callback once it starts
@@ -732,7 +749,7 @@ mod tests {
         let target = dir.path().join("target.file");
         std::fs::write(&target, "v1").expect("seed file");
 
-        let pending = PendingWatch::new(std::slice::from_ref(&target)).expect("watch");
+        let pending = PendingWatch::new(std::slice::from_ref(&target), UNSEEN).expect("watch");
         std::fs::write(&target, "v2").expect("change file");
         let (tx, rx) = mpsc::channel();
         let _watch = pending
@@ -758,7 +775,7 @@ mod tests {
         std::fs::write(&target, "v1").expect("seed file");
 
         let (tx, rx) = mpsc::channel();
-        let watch = PendingWatch::new(std::slice::from_ref(&target))
+        let watch = PendingWatch::new(std::slice::from_ref(&target), UNSEEN)
             .expect("watch")
             .start("test-watch", move |_| {
                 let _ = tx.send(());
@@ -789,7 +806,7 @@ mod tests {
         std::fs::write(&other, "v1").expect("seed file");
 
         let (tx, rx) = mpsc::channel();
-        let _watch = PendingWatch::new(&[target.clone(), other.clone()])
+        let _watch = PendingWatch::new(&[target.clone(), other.clone()], UNSEEN)
             .expect("watch")
             .start("test-watch", move |path| {
                 let _ = tx.send(path.to_path_buf());
@@ -820,7 +837,7 @@ mod tests {
         assert!(relative.is_relative());
 
         let (tx, rx) = mpsc::channel();
-        let _watch = PendingWatch::new(std::slice::from_ref(&relative))
+        let _watch = PendingWatch::new(std::slice::from_ref(&relative), UNSEEN)
             .expect("watch")
             .start("test-watch", move |path| {
                 let _ = tx.send(path.to_path_buf());
@@ -847,7 +864,7 @@ mod tests {
         std::fs::write(&target, "v1").expect("seed file");
 
         let (tx, rx) = mpsc::channel();
-        let _watch = PendingWatch::new(std::slice::from_ref(&target))
+        let _watch = PendingWatch::new(std::slice::from_ref(&target), UNSEEN)
             .expect("watch")
             .start("test-watch", move |_| {
                 let _ = tx.send(());
@@ -939,14 +956,15 @@ mod tests {
 
     /// notify 漏了事件（比如 inotify 的队列满了）时报的 Rescan 不带路径：什么都可能改过，每个文件都回调一次，记一条
     /// error；notify 报的错也记 error，这两条带着监视的文件。重新解析以后有位置监视不上的文件（这里是所在的目录不在）
-    /// 也记一条 error，带着它的路径。每条都带着监视的名字：配置、GeoSite、GeoIP、DoH 证书各有一个监视，看得出是哪个
+    /// 也记一条 error，带着它的路径和那里改了会怎样（见 [`PendingWatch::new`]）。每条都带着监视的名字：配置、GeoSite、
+    /// GeoIP、DoH 证书各有一个监视，看得出是哪个
     /// The Rescan notify reports when events were missed (inotify's queue overflowing, say)
     /// names no path: anything may have changed, so every file is called back once and an
     /// error is logged; an error notify reports is logged as an error too, both carrying the
     /// watch's files. A file with places that cannot be watched once resolved again (here its
-    /// directory is not there) logs an error too, carrying its path. Each carries the watch's
-    /// name: the configuration, GeoSite, GeoIP and the DoH certificate each have a watch, and
-    /// which one it is shows
+    /// directory is not there) logs an error too, carrying its path and what becomes of a change
+    /// there (see [`PendingWatch::new`]). Each carries the watch's name: the configuration,
+    /// GeoSite, GeoIP and the DoH certificate each have a watch, and which one it is shows
     #[test]
     fn a_rescan_calls_every_file_back_and_errors_are_logged() {
         use tracing_subscriber::layer::SubscriberExt as _;
@@ -983,7 +1001,7 @@ mod tests {
             tx,
             rx,
             ..
-        } = PendingWatch::new(&files).expect("watch");
+        } = PendingWatch::new(&files, UNSEEN).expect("watch");
         let rescan = notify::Event::new(EventKind::Other).set_flag(notify::event::Flag::Rescan);
         tx.send(Message::Event(Ok(rescan))).unwrap();
         tx.send(Message::Event(Err(notify::Error::generic("broken"))))
@@ -1005,6 +1023,7 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || {
             pump(
                 "test-watch",
+                UNSEEN,
                 &mut watcher,
                 &mut targets,
                 &rx,
@@ -1031,6 +1050,7 @@ mod tests {
         }
         let unwatched = format!("path={} ", files[2].display());
         assert!(errors[2].contains(&unwatched), "{}", errors[2]);
+        assert!(errors[2].contains(UNSEEN), "{}", errors[2]);
     }
 
     /// 一阵改动等到每个文件都安静下来：写着的文件晚，其它文件早安静了也得等它；它写完了就按它的时刻；
@@ -1075,7 +1095,7 @@ mod tests {
 
         let (tx, rx) = mpsc::channel();
         let read = target.clone();
-        let _watch = PendingWatch::new(std::slice::from_ref(&target))
+        let _watch = PendingWatch::new(std::slice::from_ref(&target), UNSEEN)
             .expect("watch")
             .start("test-watch", move |_| {
                 let _ = tx.send(std::fs::read_to_string(&read).unwrap_or_default());
@@ -1118,7 +1138,7 @@ mod tests {
         std::fs::write(&target, "v1").expect("seed file");
 
         let (tx, rx) = mpsc::channel();
-        let _watch = PendingWatch::new(std::slice::from_ref(&target))
+        let _watch = PendingWatch::new(std::slice::from_ref(&target), UNSEEN)
             .expect("watch")
             .start("test-watch", move |_| {
                 let _ = tx.send(());
@@ -1162,7 +1182,7 @@ mod tests {
         std::os::unix::fs::symlink(real.join("config.json"), &configured).unwrap();
 
         let (tx, rx) = mpsc::channel();
-        let _watch = PendingWatch::new(std::slice::from_ref(&configured))
+        let _watch = PendingWatch::new(std::slice::from_ref(&configured), UNSEEN)
             .expect("watch")
             .start("test-watch", move |path| {
                 let _ = tx.send(path.to_path_buf());
@@ -1203,7 +1223,7 @@ mod tests {
         let configured = at("tls.crt");
 
         let (tx, rx) = mpsc::channel();
-        let _watch = PendingWatch::new(std::slice::from_ref(&configured))
+        let _watch = PendingWatch::new(std::slice::from_ref(&configured), UNSEEN)
             .expect("watch")
             .start("test-watch", move |path| {
                 let _ = tx.send(path.to_path_buf());
@@ -1246,7 +1266,7 @@ mod tests {
         symlink(old.join("data.json"), &configured).unwrap();
 
         let (tx, rx) = mpsc::channel();
-        let _watch = PendingWatch::new(std::slice::from_ref(&configured))
+        let _watch = PendingWatch::new(std::slice::from_ref(&configured), UNSEEN)
             .expect("watch")
             .start("test-watch", move |path| {
                 let _ = tx.send(path.to_path_buf());
@@ -1390,7 +1410,8 @@ mod tests {
         let (watched, nowhere) = (real.join("watched.file"), real.join("missing/nowhere.file"));
         std::fs::write(&watched, "v1").expect("seed file");
 
-        let pending = PendingWatch::new(&[nowhere.clone(), watched.clone()]).expect("watch");
+        let pending =
+            PendingWatch::new(&[nowhere.clone(), watched.clone()], UNSEEN).expect("watch");
         let uncovered: Vec<&Path> = pending.uncovered().map(|(path, _)| path).collect();
         assert_eq!(uncovered, [nowhere.as_path()]);
         let (tx, rx) = mpsc::channel();
@@ -1423,7 +1444,7 @@ mod tests {
         std::os::unix::fs::symlink(root.path().join("missing/linked.json"), &linked).unwrap();
         std::fs::write(&plain, "plain").unwrap();
 
-        let pending = PendingWatch::new(&[linked.clone(), plain]).expect("watch");
+        let pending = PendingWatch::new(&[linked.clone(), plain], UNSEEN).expect("watch");
         let uncovered: Vec<(&Path, String)> = pending
             .uncovered()
             .map(|(path, err)| (path, err.to_string()))
@@ -1495,7 +1516,7 @@ mod tests {
 
         let (tx, rx) = mpsc::channel();
         let (called, called_rx) = mpsc::channel();
-        let _watch = PendingWatch::new(std::slice::from_ref(&configured))
+        let _watch = PendingWatch::new(std::slice::from_ref(&configured), UNSEEN)
             .expect("watch")
             .start_reporting(
                 "test-watch",
@@ -1551,7 +1572,7 @@ mod tests {
         let configured = dir.join("data.json");
         std::fs::write(&configured, "v1").unwrap();
         let (tx, rx) = mpsc::channel();
-        let _watch = PendingWatch::new(std::slice::from_ref(&configured))
+        let _watch = PendingWatch::new(std::slice::from_ref(&configured), UNSEEN)
             .expect("watch")
             .start("test-watch", move |path| {
                 let _ = tx.send(path.to_path_buf());
@@ -1589,7 +1610,7 @@ mod tests {
         std::fs::write(&configured, "v1").unwrap();
         std::fs::write(new.join("data.json"), "v2").unwrap();
         let (tx, rx) = mpsc::channel();
-        let _watch = PendingWatch::new(std::slice::from_ref(&configured))
+        let _watch = PendingWatch::new(std::slice::from_ref(&configured), UNSEEN)
             .expect("watch")
             .start("test-watch", move |path| {
                 let _ = tx.send(path.to_path_buf());
@@ -1629,7 +1650,7 @@ mod tests {
             tx,
             rx,
             ..
-        } = PendingWatch::new(std::slice::from_ref(&configured)).expect("watch");
+        } = PendingWatch::new(std::slice::from_ref(&configured), UNSEEN).expect("watch");
         std::fs::remove_dir_all(&dir).unwrap();
         std::fs::create_dir(&dir).unwrap();
         // 删掉、重建的事件漏了 / The events of the removal and the making again are missed
@@ -1645,6 +1666,7 @@ mod tests {
         let mut called = 0;
         pump(
             "test-watch",
+            UNSEEN,
             &mut watcher,
             &mut targets,
             &rx,

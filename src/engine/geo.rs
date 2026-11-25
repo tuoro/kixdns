@@ -526,7 +526,10 @@ fn pending_watch(
     if files.is_empty() {
         return None;
     }
-    match PendingWatch::new(files) {
+    match PendingWatch::new(
+        files,
+        "changes there are read at the next configuration reload",
+    ) {
         Ok(pending) => {
             for (path, err) in pending.uncovered() {
                 problems.watched(kind.file, path, Some(err));
