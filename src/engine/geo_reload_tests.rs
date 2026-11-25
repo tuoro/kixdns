@@ -479,8 +479,9 @@ async fn the_watch_reads_a_replaced_mmdb() {
             format!(r#"{{"entries":[{{"country_code":"{country}","ips":["198.51.100.0/24"]}}]}}"#);
         std::fs::write(&source, entries).unwrap();
         crate::matcher::geoip_converter::convert_dat_to_mmdb(&source, &aside, None).unwrap();
-        // 两份一样长 / The two are as long
-        crate::engine::test_support::written_apart(&aside);
+        // 两份一样长，紧接着写的可能样子都一样（见 `watcher::FileStamp`）：监视照事件读 / The two are as long,
+        // and written one right after the other they may look alike (see `watcher::FileStamp`):
+        // the watch reads on the event
         std::fs::rename(&aside, &mmdb).unwrap();
     };
     convert("US");

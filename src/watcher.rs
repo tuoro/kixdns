@@ -238,19 +238,25 @@ impl FileStamp {
 }
 
 /// 文件的改动时间。unix 上是 inode 的 ctime：改名盖过来的别的文件带着它自己写入、改名的时刻，长度、修改时间都一样也看得
-/// 出换了（只有内核时钟的同一个节拍里先后写好的两份分不出）；只改属性（chmod、chown）也会换，那个文件就多读一次。不用
+/// 出换了（只有内核时钟的同一个节拍里先后写好的两份分不出）；只改属性（chmod、chown）也会换，那个文件就多读一次。vfat、
+/// exfat 不存 ctime，读进来时等于修改时间（FAT 精确到 2 秒），那里只靠长度和修改时间分辨，同一个两秒里改名换上同样长的
+/// 别的文件看不出来；exfat 上改名或 chmod 以后内存里记着当时的时刻，逐出 inode 缓存一次就又等于修改时间，会多读一遍。不用
 /// inode 号：vfat、exfat、noserverino 的 CIFS、不带 use_ino 的 FUSE 上，文件被逐出 inode 缓存再读回就换一个号，没改也
 /// 像换了。别的平台用建立时间：Windows 的文件名隧道会让十五秒内在同一个名字上新建、改名过来的沿用旧的建立时间，这时只有
 /// 长度、修改时间看得出换了
 /// A file's change time. On unix the inode's ctime: another file renamed over it carries the
 /// moment it was itself written or renamed, so it tells even with the length and modification
 /// time alike (save two written within one tick of the kernel clock); a metadata change alone
-/// (chmod, chown) moves it too, and that file is read once more. Not the inode number: on vfat,
-/// exfat, noserverino CIFS and FUSE without use_ino a file gets another one once evicted from
-/// the inode cache and read back, looking replaced unchanged. Elsewhere the creation time:
-/// Windows' file name tunnelling hands the old creation time to whatever is created or renamed
-/// under the same name within fifteen seconds, and then only the length and modification time
-/// tell
+/// (chmod, chown) moves it too, and that file is read once more. vfat and exfat keep no ctime,
+/// reading it back as the modification time (to 2 seconds on FAT), so there only the length
+/// and modification time tell, and another file of the same length renamed in within the same
+/// two seconds does not show; on exfat a rename or chmod leaves the moment in memory, back to
+/// the modification time once the inode is evicted from the cache, and the file is read once
+/// more. Not the inode number: on vfat, exfat, noserverino CIFS and FUSE without use_ino a file
+/// gets another one once evicted from the inode cache and read back, looking replaced
+/// unchanged. Elsewhere the creation time: Windows' file name tunnelling hands the old creation
+/// time to whatever is created or renamed under the same name within fifteen seconds, and then
+/// only the length and modification time tell
 #[cfg(unix)]
 type Changed = (i64, i64);
 #[cfg(not(unix))]
