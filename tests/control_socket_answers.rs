@@ -157,18 +157,20 @@ fn the_control_socket_answers_bodies_it_cannot_use_in_its_own_words() {
             "valid": true,
             "pipeline_count": 1,
             "rule_count": 1,
-            "warnings": []
+            "warnings": [],
+            "coded_warnings": []
         })
     );
 }
 
 /// 一份有 30 条问题的配置：校验的 422 回答和重载失败以后 `config` 结果的 `last_reload` 都把 30 条一条不落地放进
-/// `problems`，每条完整；`message` 和 `last_reload.error` 还是连起来的一句，截到 2048 个字符。以前只有那一句，
-/// 30 条只看得到 14 条，最后一条截在半句
+/// `problems`，每条完整，`coded_problems` 是带代号的同样 30 条；`message` 和 `last_reload.error` 还是连起来的一句，
+/// 截到 2048 个字符。以前只有那一句，30 条只看得到 14 条，最后一条截在半句
 /// A configuration with 30 problems: the validation's 422 answer and, after the reload fails,
-/// the `config` result's `last_reload` both hold all 30 in `problems`, each whole; `message` and
-/// `last_reload.error` are still the one sentence joining them, cut to 2048 characters. There
-/// used to be that sentence alone, which showed 14 of the 30, the last cut off midway
+/// the `config` result's `last_reload` both hold all 30 in `problems`, each whole, and the same
+/// 30 with their codes in `coded_problems`; `message` and `last_reload.error` are still the one
+/// sentence joining them, cut to 2048 characters. There used to be that sentence alone, which
+/// showed 14 of the 30, the last cut off midway
 #[test]
 fn a_refused_configuration_lists_every_problem() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -189,7 +191,21 @@ fn a_refused_configuration_lists_every_problem() {
     let expected =
         kixdns::config::problems(&kixdns::config::parse_config(&config.to_string()).unwrap());
     assert_eq!(expected.len(), 30, "{expected:#?}");
-    let every_problem = serde_json::json!(expected);
+    let texts: Vec<String> = expected.iter().map(ToString::to_string).collect();
+    let every_problem = serde_json::json!(texts);
+    let every_coded: Vec<serde_json::Value> = texts
+        .iter()
+        .enumerate()
+        .map(|(n, text)| {
+            serde_json::json!({
+                "place": format!("pipelines[0].rules[{n}]"),
+                "code": "rcode_unknown",
+                "args": { "rcode": format!("WHATEVER{n}") },
+                "text": text,
+            })
+        })
+        .collect();
+    let every_coded = serde_json::json!(every_coded);
 
     let (status, body) = sized(
         &control,
@@ -201,6 +217,7 @@ fn a_refused_configuration_lists_every_problem() {
     assert_eq!(code, "config_invalid");
     assert_eq!(message.chars().count(), 2048, "{message}");
     assert_eq!(body["error"]["problems"], every_problem);
+    assert_eq!(body["error"]["coded_problems"], every_coded);
 
     let staged = config_path.with_extension("staged");
     std::fs::write(&staged, config.to_string()).unwrap();
@@ -226,6 +243,7 @@ fn a_refused_configuration_lists_every_problem() {
         "{active}"
     );
     assert_eq!(reload["problems"], every_problem);
+    assert_eq!(reload["coded_problems"], every_coded);
 }
 
 /// `config` 结果说出起不来的和没有数据的：入站 DoH 的证书读不了时 `doh_error` 写着原因，DNS 照常答；配置的 GeoSite
@@ -273,19 +291,55 @@ fn the_config_result_says_why_doh_is_off_and_which_geo_data_is_missing() {
         .as_str()
         .unwrap_or_else(|| panic!("{active}"));
     assert!(doh_error.contains("cert"), "{doh_error}");
+    let missing = format!("GeoSite data file {} does not exist", geosite.display());
+    let unprovided = "GeoSite tags cn are in no data file: geo_site never matches them and geo_site_not always does";
     assert_eq!(
         active["data_warnings"],
+        serde_json::json!([missing, unprovided]),
+        "{active}"
+    );
+    // 带代号的同样两条，Geo 数据的没有位置 / The same two with their codes, those on the Geo
+    // data having no place
+    assert_eq!(
+        active["coded_data_warnings"],
         serde_json::json!([
-            format!("GeoSite data file {} does not exist", geosite.display()),
-            "GeoSite tags cn are in no data file: geo_site never matches them and geo_site_not always does",
+            {
+                "place": null,
+                "code": "data_file_missing",
+                "args": { "file": "geosite", "path": geosite.display().to_string() },
+                "text": missing,
+            },
+            {
+                "place": null,
+                "code": "geosite_tags_unprovided",
+                "args": { "tags": ["cn"] },
+                "text": unprovided,
+            },
         ]),
         "{active}"
     );
+    let problem = "pipelines[0].rules[1].matchers[0]: geo_site_not \"\" matches every name";
+    assert_eq!(active["problems"], serde_json::json!([problem]), "{active}");
     assert_eq!(
-        active["problems"],
-        serde_json::json!([
-            "pipelines[0].rules[1].matchers[0]: geo_site_not \"\" matches every name"
-        ]),
+        active["coded_problems"],
+        serde_json::json!([{
+            "place": "pipelines[0].rules[1].matchers[0]",
+            "code": "matches_every_name",
+            "args": { "matcher": "geo_site_not", "value": "" },
+            "text": problem,
+        }]),
         "{active}"
+    );
+    assert_eq!(active["coded_warnings"], serde_json::json!([]), "{active}");
+    // 面板看到这个运行时能力才读带代号的字段 / The panel reads the coded fields only once it
+    // sees this runtime capability
+    let (status, health) = control_get(&control, "/v1/health");
+    assert_eq!(status, 200, "{health}");
+    assert!(
+        health["capabilities"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("message_codes_v1")),
+        "{health}"
     );
 }

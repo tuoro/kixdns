@@ -9,12 +9,12 @@
 
 use super::*;
 /// 正则写得比 `max` 字节长时的报错 / The error for a regex written longer than `max` bytes
-pub(crate) fn regex_within(pattern: &str, max: usize) -> anyhow::Result<()> {
+pub(crate) fn regex_within(pattern: &str, max: usize) -> Result<(), Said> {
     if pattern.len() > max {
-        anyhow::bail!(
-            "regex pattern too long: {} bytes (max {max})",
-            pattern.len()
-        );
+        return Err(Said::RegexTooLong {
+            bytes: pattern.len(),
+            most: max,
+        });
     }
     Ok(())
 }
@@ -36,11 +36,13 @@ pub(crate) fn regex_within(pattern: &str, max: usize) -> anyhow::Result<()> {
 /// fast too. Only the syntax is checked, nothing compiles: a GeoSite data file's regexes for
 /// one tag are combined into one set once read, which is the only compile (see
 /// `geosite::Regexes::new`).
-pub(super) fn ascii_regex_pattern(pattern: &str) -> anyhow::Result<String> {
+pub(super) fn ascii_regex_pattern(pattern: &str) -> Result<String, Said> {
     regex_within(pattern, MAX_REGEX_LEN)?;
     let hir = regex_syntax::Parser::new()
         .parse(pattern)
-        .map_err(Box::new)?;
+        .map_err(|err| Said::RegexInvalid {
+            error: err.to_string(),
+        })?;
     // 写出的正则解析回来就是这棵树 / The pattern written out parses back into this very tree
     Ok(ascii_hir(hir).to_string())
 }
@@ -91,22 +93,21 @@ fn ascii_hir(hir: regex_syntax::hir::Hir) -> regex_syntax::hir::Hir {
 /// (reported as it compiles). The names rules see are lowercase: a literal holding a capital,
 /// or a class taking capitals alone, fits no name. A class counts by its ASCII part, as it
 /// compiles (see [`ascii_hir`])
-pub(crate) fn capitals_warning(kind: &str, pattern: &str) -> Option<String> {
+pub(crate) fn capitals_warning(kind: &'static str, pattern: &str) -> Option<Said> {
     regex_within(pattern, MAX_REGEX_LEN).ok()?;
     let hir = regex_syntax::Parser::new().parse(pattern).ok()?;
     let mut capitals = Vec::new();
     find_capitals(&hir, &mut capitals);
-    (!capitals.is_empty()).then(|| {
-        format!(
-            "{kind} \"{pattern}\": the capitals in {} never match, as the names rules see are lowercase; write them in lowercase or under (?i)",
-            capitals.join(", ")
-        )
+    (!capitals.is_empty()).then(|| Said::RegexCapitals {
+        matcher: kind,
+        pattern: pattern.to_owned(),
+        capitals,
     })
 }
 
-/// `hir` 里照写永远命不中的大写部分（见 [`capitals_warning`]），按正则的写法加上引号记进 `found`
+/// `hir` 里照写永远命不中的大写部分（见 [`capitals_warning`]），按正则的写法记进 `found`
 /// The parts of `hir` in capitals that never match as written (see [`capitals_warning`]), put
-/// into `found` as a pattern writes them, in quotes
+/// into `found` as a pattern writes them
 fn find_capitals(hir: &regex_syntax::hir::Hir, found: &mut Vec<String>) {
     use regex_syntax::hir::{Class, ClassUnicode, ClassUnicodeRange, HirKind};
     let written = match hir.kind() {
@@ -139,7 +140,7 @@ fn find_capitals(hir: &regex_syntax::hir::Hir, found: &mut Vec<String>) {
         }
         HirKind::Empty | HirKind::Look(_) => None,
     };
-    found.extend(written.map(|written| format!("\"{written}\"")));
+    found.extend(written);
 }
 
 /// 域名的正则（规则和入口的 `domain_regex`、回答条件的 `request_domain_regex`）：最长 [`MAX_REGEX_LEN`] 字节，按写的
@@ -149,8 +150,10 @@ fn find_capitals(hir: &regex_syntax::hir::Hir, found: &mut Vec<String>) {
 /// conditions): at most [`MAX_REGEX_LEN`] bytes as written, checked before it is parsed; valid
 /// as written, with every class kept to its ASCII part, as in GeoSite regexes (see
 /// [`ascii_regex_pattern`]); and within 1 MB compiled (see [`limited_regex`])
-pub(super) fn domain_regex(pattern: &str) -> anyhow::Result<Regex> {
-    Ok(limited_regex(&ascii_regex_pattern(pattern)?)?)
+pub(super) fn domain_regex(pattern: &str) -> Result<Regex, Said> {
+    limited_regex(&ascii_regex_pattern(pattern)?).map_err(|err| Said::RegexInvalid {
+        error: err.to_string(),
+    })
 }
 
 /// 一条正则编译后最多多大，防止复杂度攻击：匹配器的正则（见 [`limited_regex`]），以及 GeoSite 数据里合成一个集合的

@@ -25,6 +25,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::engine::Engine;
+use crate::notice::Notice;
 use crate::observe::{
     CacheHit, CacheHitKind, ConfigLoaded, ConfigReloadFailed, DecisionDetail, DecisionMade,
     EngineObserver, RequestContext, RequestOutcome, RequestStatus, RuleAnswer, RuleCacheLookup,
@@ -187,7 +188,7 @@ struct ActiveConfig {
     /// not compile), each cut to [`MAX_ERROR_LENGTH`], none left out; `last_reload_error` is them
     /// joined into one sentence and cut to the same length, which leaves some out when there are
     /// many. Empty when the reload succeeded or failed for another reason
-    last_reload_problems: Vec<String>,
+    last_reload_problems: Reported,
     /// 当前配置改了、但要重启才生效的设置（见 `ConfigLoaded::restart_pending`）
     /// Settings the current configuration changes that take a restart to apply (see
     /// `ConfigLoaded::restart_pending`)
@@ -199,7 +200,7 @@ struct ActiveConfig {
     /// the same and logs an error for each, and they are reported over the control channel too, so
     /// the panel need not search the log; a successful reload means the new configuration has
     /// none, and they are cleared
-    problems: Vec<String>,
+    problems: Reported,
     /// 配置文件为什么监视不了（见 `watcher::ConfigWatch`），监视着时为 None：启动时监视线程起不来，或者有位置监视不上（建不起
     /// notify 的监视时是处处），或者文件改了指向、新的地方监视不上（又处处监视上了就回到 None）。监视线程起不来时文件改了不会
     /// 重载，面板保存的配置也不生效，等不到重载序号变；有位置监视不上时，经监视得上的地方改的照样马上重载，监视不上的地方改的
@@ -223,7 +224,39 @@ struct ActiveConfig {
     /// What the current configuration writes that loads all the same yet is worth knowing (see
     /// `config::warnings`), each cut to [`MAX_ERROR_LENGTH`], replaced by those of each
     /// configuration as it takes effect
-    warnings: Vec<String>,
+    warnings: Reported,
+}
+
+/// 控制通道报的一串话（见 `notice::Notice`）：每条的原话，和带代号的同样几条（`{place, code, args, text}`，`text` 就是
+/// 那句原话），一条对一条，顺序一样。面板认得的代号按代号和参数用自己的说法讲，认不出的照原话
+/// A list of notices as the control channel reports them (see `notice::Notice`): the words of
+/// each, and the same ones with their codes (`{place, code, args, text}`, `text` being those
+/// very words), one for one and in the same order. The panel says the codes it knows its own way
+/// by the code and the arguments, and the others by the words
+#[derive(Clone, Default)]
+struct Reported {
+    texts: Vec<String>,
+    coded: Vec<serde_json::Value>,
+}
+
+impl Reported {
+    /// 照原样报 / Reported as they are
+    fn whole(notices: &[Notice]) -> Self {
+        let texts = notices.iter().map(Notice::to_string).collect();
+        let coded = notices.iter().map(Notice::json).collect();
+        Self { texts, coded }
+    }
+
+    /// 每条原话截到 [`MAX_ERROR_LENGTH`]，带代号的那条里也是截好的；参数不截 / The words of each cut to
+    /// [`MAX_ERROR_LENGTH`], as they are in the coded one too; the arguments are not cut
+    fn clipped(notices: &[Notice]) -> Self {
+        let mut reported = Self::whole(notices);
+        for (text, coded) in reported.texts.iter_mut().zip(&mut reported.coded) {
+            *text = truncate(text, MAX_ERROR_LENGTH);
+            coded["text"] = json!(text);
+        }
+        reported
+    }
 }
 
 /// 一个线程记下的一格 / What one thread has counted in a bucket
@@ -1009,15 +1042,15 @@ impl PanelMetrics {
         active.loaded_at_unix = unix_timestamp();
         active.last_reload_success = true;
         active.last_reload_error = None;
-        active.last_reload_problems.clear();
+        active.last_reload_problems = Reported::default();
         active.restart_pending = config
             .restart_pending
             .iter()
             .map(|setting| setting.to_string())
             .collect();
-        active.warnings = clipped(config.warnings);
+        active.warnings = Reported::clipped(config.warnings);
         if config.generation > 1 {
-            active.problems.clear();
+            active.problems = Reported::default();
             self.reload_success.fetch_add(1, Ordering::Relaxed);
             self.reload_sequence.fetch_add(1, Ordering::Release);
         }
@@ -1115,7 +1148,7 @@ impl PanelMetrics {
         let mut active = self.active_config.write();
         active.last_reload_success = false;
         active.last_reload_error = Some(truncate(failed.error, MAX_ERROR_LENGTH));
-        active.last_reload_problems = clipped(failed.problems);
+        active.last_reload_problems = Reported::clipped(failed.problems);
         self.reload_failure.fetch_add(1, Ordering::Relaxed);
         self.reload_sequence.fetch_add(1, Ordering::Release);
     }
@@ -1140,21 +1173,24 @@ impl PanelMetrics {
             "last_reload": {
                 "success": active.last_reload_success,
                 "error": active.last_reload_error,
-                "problems": active.last_reload_problems,
+                "problems": active.last_reload_problems.texts,
+                "coded_problems": active.last_reload_problems.coded,
             },
             "restart_pending": active.restart_pending,
-            "problems": active.problems,
+            "problems": active.problems.texts,
+            "coded_problems": active.problems.coded,
             "watch_error": active.watch_error,
             "doh_error": active.doh_error,
-            "warnings": active.warnings,
+            "warnings": active.warnings.texts,
+            "coded_warnings": active.warnings.coded,
         })
     }
 
     /// 启动时读的配置有这些问题（见 `ActiveConfig::problems`），和重载被拒时一样每条截到 [`MAX_ERROR_LENGTH`]
     /// The configuration read at startup has these problems (see `ActiveConfig::problems`), each
     /// cut to [`MAX_ERROR_LENGTH`] as on a refused reload
-    pub fn startup_problems(&self, problems: &[String]) {
-        self.active_config.write().problems = clipped(problems);
+    pub fn startup_problems(&self, problems: &[Notice]) {
+        self.active_config.write().problems = Reported::clipped(problems);
     }
 
     /// 配置文件因为 `error` 监视不了，None 是监视着（见 `ActiveConfig::watch_error`）/ The configuration
@@ -1203,7 +1239,8 @@ impl PanelMetrics {
                 "querylog_wait_v1",
                 "querylog_stored_v1",
                 "querylog_until_v1",
-                "querylog_records_v1"
+                "querylog_records_v1",
+                "message_codes_v1"
             ],
         })
     }
@@ -1997,7 +2034,9 @@ async fn handle_request(
         (&Method::GET, "/v1/health") => json_response(StatusCode::OK, metrics.health_json()),
         (&Method::GET, "/v1/config/active") => {
             let mut config = metrics.config_json();
-            config["data_warnings"] = json!(engine.geo_data_warnings());
+            let data = Reported::whole(&engine.geo_data_warnings());
+            config["data_warnings"] = json!(data.texts);
+            config["coded_data_warnings"] = json!(data.coded);
             json_response(StatusCode::OK, config)
         }
         (&Method::GET, "/v1/metrics") => metrics_response(&metrics, engine).await,
@@ -2310,7 +2349,9 @@ fn config_invalid(error: &anyhow::Error) -> Rejection {
         "config_invalid",
         &truncate(&format!("{error:#}"), MAX_ERROR_LENGTH),
     );
-    body["error"]["problems"] = json!(clipped(crate::config::Problems::of(error)));
+    let problems = Reported::clipped(crate::config::Problems::coded(error));
+    body["error"]["problems"] = json!(problems.texts);
+    body["error"]["coded_problems"] = json!(problems.coded);
     (StatusCode::UNPROCESSABLE_ENTITY, body)
 }
 
@@ -2773,16 +2814,20 @@ async fn validate_body(body: Bytes) -> Response<Full<Bytes>> {
     })
     .await;
     match validated {
-        Ok(Ok(report)) => json_response(
-            StatusCode::OK,
-            json!({
-                "protocol_version": PROTOCOL_VERSION,
-                "valid": true,
-                "pipeline_count": report.pipeline_count,
-                "rule_count": report.rule_count,
-                "warnings": clipped(&report.warnings),
-            }),
-        ),
+        Ok(Ok(report)) => {
+            let warnings = Reported::clipped(&report.coded_warnings);
+            json_response(
+                StatusCode::OK,
+                json!({
+                    "protocol_version": PROTOCOL_VERSION,
+                    "valid": true,
+                    "pipeline_count": report.pipeline_count,
+                    "rule_count": report.rule_count,
+                    "warnings": warnings.texts,
+                    "coded_warnings": warnings.coded,
+                }),
+            )
+        }
         Ok(Err(rejection)) => respond(rejection),
         Err(error) => json_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2937,15 +2982,6 @@ fn labeled_metric<'a>(
 
 fn truncate(value: &str, max_length: usize) -> String {
     value.chars().take(max_length).collect()
-}
-
-/// 配置的问题或警告逐条截到 [`MAX_ERROR_LENGTH`] / A configuration's problems or warnings, each cut to
-/// [`MAX_ERROR_LENGTH`]
-fn clipped(problems: &[String]) -> Vec<String> {
-    problems
-        .iter()
-        .map(|problem| truncate(problem, MAX_ERROR_LENGTH))
-        .collect()
 }
 
 fn unix_timestamp() -> u64 {
@@ -5397,24 +5433,38 @@ mod diagnostic_tests {
         let engine = engine_for(raw, Arc::clone(&metrics));
         assert_eq!(
             metrics.config_json()["problems"],
-            serde_json::json!(problems),
+            serde_json::json!(crate::notice::texts(&problems)),
             "the initial load keeps them"
         );
+        let coded: Vec<_> = problems.iter().map(crate::notice::Notice::json).collect();
+        assert_eq!(
+            metrics.config_json()["coded_problems"],
+            serde_json::json!(coded)
+        );
+        assert_eq!(coded[0]["place"], "settings.min_tll");
+        assert_eq!(coded[0]["code"], "key_not_read");
 
         engine.reload(runtime_for(fixed));
         assert_eq!(metrics.config_json()["problems"], serde_json::json!([]));
+        assert_eq!(
+            metrics.config_json()["coded_problems"],
+            serde_json::json!([])
+        );
     }
 
     /// 启动时读的配置的问题、每份配置的警告和重载被拒时的问题一样，每条截到 [`super::MAX_ERROR_LENGTH`]：控制通道报的配置
-    /// 文字都一样长
+    /// 文字都一样长。带代号的那几条里的原话也截好了，参数不截
     /// The problems of the configuration read at startup and the warnings of each configuration
     /// are each cut to [`super::MAX_ERROR_LENGTH`] as a refused reload's problems are, so every
-    /// configuration text the control channel reports is held to one length
+    /// configuration text the control channel reports is held to one length. The words in the
+    /// coded ones are cut as well, the arguments not
     #[test]
     fn startup_problems_and_warnings_are_cut_as_reload_problems_are() {
+        use crate::notice::{Notice, Said};
         use crate::observe::{ConfigLoaded, ConfigReloadFailed, EngineObserver};
-        let long = "x".repeat(super::MAX_ERROR_LENGTH + 1);
-        let long = std::slice::from_ref(&long);
+        let place = "x".repeat(super::MAX_ERROR_LENGTH + 1);
+        let long = [Notice::at(&place, Said::KeyNotRead)];
+        let long = long.as_slice();
         let metrics = PanelMetrics::new(false);
         metrics.startup_problems(long);
         metrics.config_loaded(&ConfigLoaded {
@@ -5428,15 +5478,25 @@ mod diagnostic_tests {
             upstreams: &[],
         });
         let cut = serde_json::json!(["x".repeat(super::MAX_ERROR_LENGTH)]);
+        let coded = serde_json::json!([{
+            "place": place,
+            "code": "key_not_read",
+            "args": {},
+            "text": cut[0],
+        }]);
         let config = metrics.config_json();
         assert_eq!(config["problems"], cut, "startup problems");
+        assert_eq!(config["coded_problems"], coded, "startup problems");
         assert_eq!(config["warnings"], cut, "warnings");
+        assert_eq!(config["coded_warnings"], coded, "warnings");
         metrics.config_reload_failed(&ConfigReloadFailed {
             path: std::path::Path::new("pipeline.json"),
             error: "refused",
             problems: long,
         });
-        assert_eq!(metrics.config_json()["last_reload"]["problems"], cut);
+        let reload = &metrics.config_json()["last_reload"];
+        assert_eq!(reload["problems"], cut);
+        assert_eq!(reload["coded_problems"], coded);
     }
 
     /// 控制通道的 config 报出配置文件为什么监视不了：那时改配置文件、面板保存都不会生效。监视着时为 null；这是进程的事，
@@ -5527,10 +5587,39 @@ mod diagnostic_tests {
         let answer: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(answer["valid"], true, "{answer}");
         assert_eq!(answer["warnings"], warnings, "{answer}");
+        // 带代号的和原话一条对一条 / The coded ones go one for one with the words
+        let coded = &answer["coded_warnings"];
+        let codes: Vec<&str> = coded
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip(warnings.as_array().unwrap())
+            .map(|(coded, text)| {
+                assert_eq!(&coded["text"], text);
+                coded["code"].as_str().unwrap()
+            })
+            .collect();
+        assert_eq!(
+            codes,
+            [
+                "background_refresh_rule_unused",
+                "setting_retired",
+                "cache_capacity_large",
+                "request_timeout_short",
+                "no_country_code",
+                "no_country_code",
+                "no_country_code",
+            ]
+        );
+        assert_eq!(
+            coded[3]["args"],
+            serde_json::json!({ "value": 3000, "upstream": 2000 })
+        );
 
         let metrics = Arc::new(PanelMetrics::new(false));
         let engine = engine_for(raw, Arc::clone(&metrics));
         assert_eq!(metrics.config_json()["warnings"], warnings);
+        assert_eq!(&metrics.config_json()["coded_warnings"], coded);
         engine.reload(runtime_for(serde_json::json!({
             "settings": { "default_upstream": "127.0.0.1:9" },
             "pipelines": [{ "id": "main", "rules": [{
@@ -5538,6 +5627,66 @@ mod diagnostic_tests {
             }] }]
         })));
         assert_eq!(metrics.config_json()["warnings"], serde_json::json!([]));
+        assert_eq!(
+            metrics.config_json()["coded_warnings"],
+            serde_json::json!([])
+        );
+    }
+
+    /// 校验拒掉配置时，422 回答的 `error.problems` 旁边是带代号的 `error.coded_problems`，一条对一条、顺序一样；上游地址
+    /// 为什么用不了套在参数里，也带代号，系统给的那句错误原样放在 `error` 里
+    /// When validation refuses a configuration, the 422 answer's `error.problems` has the coded
+    /// `error.coded_problems` beside it, one for one and in the same order; why an upstream
+    /// address cannot be used is held in the arguments with a code of its own, the system's
+    /// error put in `error` as it is
+    #[tokio::test]
+    async fn a_refused_validation_lists_its_reasons_with_their_codes() {
+        let raw = serde_json::json!({
+            "settings": { "default_upstream": "udp://localhost:53", "cache_capacity": 0 },
+            "pipelines": []
+        });
+        let response = super::validate_body(bytes::Bytes::from(raw.to_string())).await;
+        assert_eq!(response.status(), hyper::StatusCode::UNPROCESSABLE_ENTITY);
+        let body = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let answer: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let unusable = "upstream \"udp://localhost:53\" is not usable: expected an IP address and a port: invalid socket address syntax";
+        let empty = "0 leaves the cache no room for any answer; it must be greater than 0";
+        assert_eq!(
+            answer["error"]["problems"],
+            serde_json::json!([
+                format!("settings.default_upstream: {unusable}"),
+                format!("settings.cache_capacity: {empty}"),
+            ]),
+            "{answer}"
+        );
+        assert_eq!(
+            answer["error"]["coded_problems"],
+            serde_json::json!([
+                {
+                    "place": "settings.default_upstream",
+                    "code": "upstream_unusable",
+                    "args": {
+                        "upstream": "udp://localhost:53",
+                        "reason": {
+                            "code": "address_not_ip_port",
+                            "args": { "error": "invalid socket address syntax" },
+                            "text": "expected an IP address and a port: invalid socket address syntax"
+                        }
+                    },
+                    "text": format!("settings.default_upstream: {unusable}")
+                },
+                {
+                    "place": "settings.cache_capacity",
+                    "code": "cache_capacity_zero",
+                    "args": {},
+                    "text": format!("settings.cache_capacity: {empty}")
+                }
+            ]),
+            "{answer}"
+        );
     }
 
     /// 诊断回复里有一条回答写着这个地址 / Some answer in the diagnostic reply names this address
@@ -5898,6 +6047,17 @@ mod diagnostic_tests {
                 "{capability}"
             );
         }
+    }
+
+    /// 运行时能力里有 `message_codes_v1`：配置的问题和告警、拒掉配置的原因和 Geo 数据的问题旁边各有一份带代号的（见
+    /// `notice`），面板看到它才读那几个 `coded_` 开头的字段
+    /// The runtime capabilities hold `message_codes_v1`: beside a configuration's problems and
+    /// warnings, the reasons a configuration is refused for and what is wrong with the Geo data
+    /// stands a coded list each (see `notice`), and the panel reads those `coded_` fields only
+    /// once it sees this
+    #[test]
+    fn health_declares_the_message_codes() {
+        assert!(capabilities().iter().any(|name| name == "message_codes_v1"));
     }
 
     /// 包里 `panel/capabilities.json` 声明的配置能力，health 都声明：面板按前者判断还没起来的内核包，按后者判断运行中的
