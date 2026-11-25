@@ -12,8 +12,9 @@
 //! when it cannot, with no DNS handling of its own. The TLS acceptor is reloaded when the
 //! certificate or key file changes (an ACME renewal, say), the old certificate kept on failure.
 
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -30,7 +31,10 @@ use hyper::server::conn::{http1, http2};
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use rustls::ServerConfig;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+use rustls::pki_types::{
+    CertificateDer, PrivateKeyDer,
+    pem::{self, PemObject},
+};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info};
@@ -128,9 +132,9 @@ impl DohCertificate {
     pub fn load(cert_path: &str, key_path: &str) -> anyhow::Result<Arc<Self>> {
         let pending =
             watcher::PendingWatch::new(&[PathBuf::from(cert_path), PathBuf::from(key_path)]);
-        let mut read = stamps(cert_path, key_path);
+        let (mut read, content) = read_pem(cert_path, key_path);
         let current = Arc::new(ArcSwap::from_pointee(build_tls_acceptor(
-            cert_path, key_path,
+            cert_path, key_path, content,
         )?));
         let reloaded = Arc::clone(&current);
         let (cert, key) = (cert_path.to_owned(), key_path.to_owned());
@@ -147,47 +151,63 @@ impl DohCertificate {
     }
 }
 
-/// 证书和私钥读之前什么样（见 `watcher::FileStamp`），不存在的是 None / What the certificate and the
-/// key looked like before they were read (see `watcher::FileStamp`), None for one not there
-type Stamps = [Option<watcher::FileStamp>; 2];
+/// 证书和私钥文件里的内容，读不了的那个是读不了的原因 / What the certificate and the key files
+/// hold, or why one cannot be read
+type Pem = [std::io::Result<Vec<u8>>; 2];
 
-fn stamps(cert: &str, key: &str) -> Stamps {
-    [cert, key].map(|path| watcher::FileStamp::of(Path::new(path)).ok())
+/// 读证书和私钥，给出读到的内容和它的指纹：内容一样，指纹就一样，读不了的那个只算读不了。监视只记着指纹，不另存一份私钥
+/// Reads the certificate and the key, giving what was read and its fingerprint: the same
+/// content gives the same one, a file that cannot be read counting as unreadable alone. The
+/// watch keeps the fingerprint alone, not another copy of the key
+fn read_pem(cert: &str, key: &str) -> (u64, Pem) {
+    let content = [cert, key].map(std::fs::read);
+    let mut hasher = DefaultHasher::new();
+    content
+        .each_ref()
+        .map(|file| file.as_ref().ok())
+        .hash(&mut hasher);
+    (hasher.finish(), content)
 }
 
-/// 证书文件改了：换上重新读出来的证书，读不了就留着在用的。两个文件和上次读之前（`read`）一样就不再读：监视给一阵改动
-/// 里改了的每个文件各回调一次，续期时证书和私钥一起换，头一次回调已经把两个都读了
+/// 证书文件改了：换上重新读出来的证书，读不了就留着在用的。两个文件的内容和上次读到的一样（指纹是 `read`，见
+/// [`read_pem`]）就不再建：监视给一阵改动里改了的每个文件各回调一次，续期时证书和私钥一起换，头一次回调已经把两个都换上了。
+/// 按内容比，不看文件的样子：vfat、exfat 上紧接着换上同样长的另一对，样子可能看不出来（见 `watcher::FileStamp`），内容
+/// 看得出来；建 acceptor 用的就是比过的这份内容
 ///
 /// 证书和私钥也会分两阵写到（scp 一个个推，慢路由器上 acme.sh 一个个 `cat >`），先到的那个配着旧的另一个读不了。所以读不了
-/// 时在监视线程上等一阵改动最长能等的那么久（见 `watcher::AT_MOST`）再看一次：两个文件这期间又换了就不记，留给那次改动的
-/// 回调去读（监视等它写完，Linux 上等写的一方关上文件），只靠核对察觉改动时等下一次核对；还是那一对才记 error，换上了的只记
+/// 时在监视线程上等一阵改动最长能等的那么久（见 `watcher::AT_MOST`）再读一次：两个文件这期间又换了内容就不记，留给那次改动
+/// 的回调去读（监视等它写完，Linux 上等写的一方关上文件），只靠核对察觉改动时等下一次核对；还是那一对才记 error，换上了的只记
 /// 一条 reloaded。每次回调至多等这一次：一直有人改写读不了的一对，监视线程也照样回去收消息，丢掉监视时不会一直等下去
 /// The certificate files changed: the certificate read again goes in, or the one in use stays
-/// when it cannot be read. With both files as they were before the last read (`read`) they are
-/// not read again: the watch calls back once for each file a burst of changes changed, and a
-/// renewal replaces the certificate and the key together, both read by the first callback
+/// when it cannot be read. With both files holding what was read last (its fingerprint `read`,
+/// see [`read_pem`]) nothing is built: the watch calls back once for each file a burst of
+/// changes changed, and a renewal replaces the certificate and the key together, both brought
+/// in by the first callback. It goes by the content, not by what the files look like: another
+/// pair of the same length put in place right after on vfat or exfat may look alike (see
+/// `watcher::FileStamp`) while its content tells, and the acceptor is built from the very
+/// content compared
 ///
 /// The certificate and the key also arrive in two bursts (pushed one by one with scp, or
 /// written one `cat >` at a time by acme.sh on a slow router), the first one in going with the
 /// old other one and failing to read. So on a failure the watch thread waits as long as a
-/// burst of changes may last (see `watcher::AT_MOST`) and looks once more: with the files
+/// burst of changes may last (see `watcher::AT_MOST`) and reads them once more: with the content
 /// changed meanwhile nothing is logged, the read left to that change's own callback (the watch
 /// waiting for it to be written, on Linux for the writer to close the file), or to the next
 /// check where changes are noticed by the checks alone; only the same pair logs an error, and
 /// one brought in logs a single "reloaded". Each callback waits once at most: with a pair that
 /// cannot be read rewritten without end the watch thread still goes back to its messages, and
 /// dropping the watch does not wait on and on
-fn reload(current: &ArcSwap<TlsAcceptor>, cert: &str, key: &str, read: &mut Stamps) {
-    let now = stamps(cert, key);
+fn reload(current: &ArcSwap<TlsAcceptor>, cert: &str, key: &str, read: &mut u64) {
+    let (now, content) = read_pem(cert, key);
     if now == *read {
-        debug!(cert, key, "DoH TLS certificate unchanged, not read again");
+        debug!(cert, key, "DoH TLS certificate unchanged");
         return;
     }
     *read = now;
-    let built = build_tls_acceptor(cert, key);
+    let built = build_tls_acceptor(cert, key, content);
     if built.is_err() {
         std::thread::sleep(watcher::AT_MOST);
-        if stamps(cert, key) != *read {
+        if read_pem(cert, key).0 != *read {
             debug!(cert, key, "DoH TLS certificate changed while waiting");
             return;
         }
@@ -679,12 +699,20 @@ fn error_response(status: StatusCode) -> Response<Full<Bytes>> {
         .unwrap()
 }
 
-/// Build the TLS acceptor from PEM cert/key files. Single source of truth for
-/// both startup and hot reload, so the two paths validate identically.
-fn build_tls_acceptor(cert_path: &str, key_path: &str) -> anyhow::Result<TlsAcceptor> {
-    let certs = load_certs(cert_path)?;
+/// 用从证书和私钥文件 `cert_path`、`key_path` 读到的 `content`（见 [`read_pem`]）建 TLS acceptor。启动和热重载都用它，
+/// 两处检查得一样
+/// Builds the TLS acceptor from `content`, what was read from the certificate and key files
+/// `cert_path` and `key_path` (see [`read_pem`]). Startup and hot reloads both use it, so the
+/// two check alike
+fn build_tls_acceptor(
+    cert_path: &str,
+    key_path: &str,
+    content: Pem,
+) -> anyhow::Result<TlsAcceptor> {
+    let [cert, key] = content;
+    let certs = load_certs(cert_path, cert)?;
     anyhow::ensure!(!certs.is_empty(), "no certificates found in {cert_path}");
-    let key = load_private_key(key_path)?;
+    let key = load_private_key(key_path, key)?;
 
     let mut tls_config = ServerConfig::builder()
         .with_no_client_auth()
@@ -696,18 +724,28 @@ fn build_tls_acceptor(cert_path: &str, key_path: &str) -> anyhow::Result<TlsAcce
     Ok(TlsAcceptor::from(Arc::new(tls_config)))
 }
 
-/// 从 PEM 文件 `path` 读证书链；读不了的错误说是哪个文件 / Reads the certificate chain from the
-/// PEM file `path`; an error reading it names the file
-fn load_certs(path: &str) -> anyhow::Result<Vec<CertificateDer<'static>>> {
-    CertificateDer::pem_file_iter(path)
-        .and_then(Iterator::collect)
+/// 从 PEM 文件 `path` 里读到的 `content` 取证书链；取不出的错误说是哪个文件 / The certificate chain in
+/// `content`, what was read from the PEM file `path`; an error getting it names the file
+fn load_certs(
+    path: &str,
+    content: std::io::Result<Vec<u8>>,
+) -> anyhow::Result<Vec<CertificateDer<'static>>> {
+    content
+        .map_err(pem::Error::Io)
+        .and_then(|content| CertificateDer::pem_slice_iter(&content).collect())
         .with_context(|| format!("read DoH certificate {path}"))
 }
 
-/// 从 PEM 文件 `path` 读私钥；读不了的错误说是哪个文件 / Reads the private key from the PEM file
-/// `path`; an error reading it names the file
-fn load_private_key(path: &str) -> anyhow::Result<PrivateKeyDer<'static>> {
-    PrivateKeyDer::from_pem_file(path).with_context(|| format!("read DoH private key {path}"))
+/// 从 PEM 文件 `path` 里读到的 `content` 取私钥；取不出的错误说是哪个文件 / The private key in `content`,
+/// what was read from the PEM file `path`; an error getting it names the file
+fn load_private_key(
+    path: &str,
+    content: std::io::Result<Vec<u8>>,
+) -> anyhow::Result<PrivateKeyDer<'static>> {
+    content
+        .map_err(pem::Error::Io)
+        .and_then(|content| PrivateKeyDer::from_pem_slice(&content))
+        .with_context(|| format!("read DoH private key {path}"))
 }
 
 // ============================================================================
@@ -1431,8 +1469,8 @@ mod tests {
         std::fs::write(&cert_path, "").expect("write empty cert");
         std::fs::write(&key_path, "not a pem").expect("write key");
 
-        let Err(err) = build_tls_acceptor(cert_path.to_str().unwrap(), key_path.to_str().unwrap())
-        else {
+        let (cert, key) = (cert_path.to_str().unwrap(), key_path.to_str().unwrap());
+        let Err(err) = build_tls_acceptor(cert, key, read_pem(cert, key).1) else {
             panic!("empty cert file must be rejected");
         };
         let msg = format!("{err:#}");
@@ -1452,8 +1490,9 @@ mod tests {
         std::fs::write(&cert_path, cert.pem()).expect("write cert pem");
         std::fs::write(&key_path, key_pair.serialize_pem()).expect("write key pem");
 
+        let (cert, key) = (cert_path.to_str().unwrap(), key_path.to_str().unwrap());
         assert!(
-            build_tls_acceptor(cert_path.to_str().unwrap(), key_path.to_str().unwrap()).is_ok(),
+            build_tls_acceptor(cert, key, read_pem(cert, key).1).is_ok(),
             "valid cert/key pair must build an acceptor"
         );
     }
@@ -1476,6 +1515,67 @@ mod tests {
         })
         .await
         .expect("the renewed certificate is used");
+    }
+
+    /// 证书按内容判断换没换。另一对和读的那份一样长，修改时间也设成一样（vfat 上改动时间就是修改时间，紧接着换上的另一对就是
+    /// 这样，样子一模一样，见 `watcher::FileStamp`），照样换上；同一对再放回去，样子换了，也不再建。以前按样子判断：vfat 上
+    /// 样子一样的另一对当成没变，再也不读，日志里说的还是前一份；放回同一对又建一遍，记一条 reloaded
+    /// Whether the certificate changed goes by its content. Another pair as long as the one read,
+    /// given the same modification time too (on vfat the change time is the modification time,
+    /// and another pair put in right after is just so, looking the very same, see
+    /// `watcher::FileStamp`), goes in all the same; the same pair put back, looking otherwise, is
+    /// not built again. It used to go by the look: on vfat the other pair looking the same was
+    /// taken as unchanged and never read, the log telling of the one before; the same pair put
+    /// back was built again, logging a "reloaded"
+    #[test]
+    fn the_certificate_is_judged_by_its_content() {
+        // 每份都用空格补到 2048 字节，两对一样长（PEM 段以外的不读）/ Each file padded with spaces to
+        // 2048 bytes, the two pairs alike in length (what is outside a PEM section is not read)
+        let pair = || {
+            let key = rcgen::KeyPair::generate().unwrap();
+            let params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+            [params.self_signed(&key).unwrap().pem(), key.serialize_pem()]
+                .map(|pem| format!("{pem:<2048}"))
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ["cert.pem", "key.pem"].map(|name| dir.path().join(name));
+        for (path, pem) in paths.iter().zip(pair()) {
+            std::fs::write(path, pem).unwrap();
+        }
+        let [cert, key] = paths.each_ref().map(|path| path.to_str().unwrap());
+        let certificate = DohCertificate::load(cert, key).unwrap();
+        // 先写在旁边、修改时间设成在那儿的那份的，再改名盖过去 / Written aside and given the modification
+        // time of the one there, then renamed over it
+        let put = |pair: &[String; 2]| {
+            for (path, pem) in paths.iter().zip(pair) {
+                let aside = path.with_extension("new");
+                std::fs::write(&aside, pem).unwrap();
+                let modified = std::fs::metadata(path).unwrap().modified().unwrap();
+                let file = std::fs::File::options().write(true).open(&aside).unwrap();
+                file.set_modified(modified).unwrap();
+                std::fs::rename(&aside, path).unwrap();
+            }
+        };
+
+        let in_use = certificate.current.load_full();
+        let other = pair();
+        put(&other);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while Arc::ptr_eq(&certificate.current.load_full(), &in_use) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the other pair looking alike is used"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let in_use = certificate.current.load_full();
+        put(&other);
+        std::thread::sleep(Duration::from_secs(1));
+        assert!(
+            Arc::ptr_eq(&certificate.current.load_full(), &in_use),
+            "the same pair put back is not built again"
+        );
     }
 
     /// 证书的文件有位置监视不上（这里是进得去、列不出的目录，像 inotify 的监视数用完时那样装不上监视）：证书照样用上，

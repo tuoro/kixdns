@@ -205,13 +205,12 @@ impl ConfigWatch {
 
 /// 一个文件的路径、长度、修改时间和改动时间（见 [`Changed`]）：四样都没变，就当内容没变。记下文件读之前什么样：监视
 /// 报来的改动是不是还是读到的那份（见 [`ConfigWatch`]），监视核对时文件换没换样子（见 [`Targets::check`]），MMDB
-/// 换没换（见 `GeoIpManager::use_mmdb`），DoH 的证书和私钥换没换
+/// 换没换（见 `GeoIpManager::use_mmdb`）
 /// A file's path, length, modification time and change time (see [`Changed`]): with all four
 /// unchanged, its content counts as unchanged. It notes what a file looked like before it was
 /// read: whether a change the watch reports is still what was read (see [`ConfigWatch`]),
-/// whether the file looks otherwise when the watch checks itself (see [`Targets::check`]),
-/// whether the MMDB was replaced (see `GeoIpManager::use_mmdb`), and whether the DoH
-/// certificate and key were
+/// whether the file looks otherwise when the watch checks itself (see [`Targets::check`]), and
+/// whether the MMDB was replaced (see `GeoIpManager::use_mmdb`)
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct FileStamp {
     path: PathBuf,
