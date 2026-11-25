@@ -32,6 +32,8 @@ pub mod fair_queue;
 mod fast_path_rule_tests;
 mod geo;
 #[cfg(test)]
+pub(crate) use geo::every_data_warning;
+#[cfg(test)]
 mod geo_reload_tests;
 #[cfg(test)]
 mod geo_update_cache_tests;

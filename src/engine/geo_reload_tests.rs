@@ -238,7 +238,7 @@ async fn a_data_file_whose_directory_appears_later_is_read_by_the_check() {
     let _check = crate::watcher::check_every(CHECKED);
     let engine = engine(geosite_config(&[&dat], "ads"));
     assert_eq!(ask(&engine, "www.ads.test").await, Some(OTHER));
-    let warnings = engine.geo_data_warnings();
+    let warnings = engine.geo_data_words();
     assert_eq!(warnings.len(), 3, "{warnings:?}");
     assert_eq!(
         warnings[0],
@@ -257,7 +257,7 @@ async fn a_data_file_whose_directory_appears_later_is_read_by_the_check() {
     .await;
     wait_for(
         "the status says nothing once it is read and watched",
-        || engine.geo_data_warnings().is_empty(),
+        || engine.geo_data_words().is_empty(),
     )
     .await;
 }
@@ -540,11 +540,11 @@ async fn an_unreadable_mmdb_is_read_again_once_it_changes() {
     let said = format!("GeoIP database {} cannot be read: ", mmdb.display());
     let says_unreadable = |engine: &Engine| {
         engine
-            .geo_data_warnings()
+            .geo_data_words()
             .iter()
             .any(|sentence| sentence.starts_with(&said))
     };
-    assert!(says_unreadable(&engine), "{:?}", engine.geo_data_warnings());
+    assert!(says_unreadable(&engine), "{:?}", engine.geo_data_words());
 
     let entries = r#"{"entries":[{"country_code":"JP","ips":["198.51.100.0/24"]}]}"#;
     std::fs::write(&source, entries).unwrap();
@@ -556,7 +556,7 @@ async fn an_unreadable_mmdb_is_read_again_once_it_changes() {
     })
     .await;
     assert_eq!(ask_from(&engine, "a.test", client).await, Some(MATCHED));
-    assert_eq!(engine.geo_data_warnings(), Vec::<String>::new());
+    assert_eq!(engine.geo_data_words(), Vec::<String>::new());
 
     let in_use = geoip(&engine);
     replace(&mmdb, b"broken again");
@@ -628,7 +628,7 @@ async fn an_empty_geosite_file_keeps_the_tags_in_use() {
     replace(&path, b"");
     let kept = [kept_sentence("GeoSite data file", &path, "testa")];
     wait_for("the status must say the data stays", || {
-        engine.geo_data_warnings() == kept
+        engine.geo_data_words() == kept
     })
     .await;
     keeps_answering(
@@ -648,7 +648,7 @@ async fn an_empty_geosite_file_keeps_the_tags_in_use() {
     })
     .await;
     assert!(!engine.geo().geosite.matches("testa", "x.geo.test"));
-    assert_eq!(engine.geo_data_warnings(), Vec::<String>::new());
+    assert_eq!(engine.geo_data_words(), Vec::<String>::new());
 }
 
 /// 两个数据文件都提供一个标签时排在后面的说了算；它被换成空文件以后，这个标签用前面那个文件的数据，和全部重新读一遍
@@ -684,7 +684,7 @@ async fn an_emptied_geosite_file_hands_a_shared_tag_back() {
         "a tag only the emptied file provided keeps the data in use"
     );
     assert_eq!(
-        engine.geo_data_warnings(),
+        engine.geo_data_words(),
         [kept_sentence("GeoSite data file", &last, "only")]
     );
 }
@@ -722,7 +722,7 @@ async fn a_reload_reading_an_emptied_geosite_file_hands_a_shared_tag_back() {
         "a tag only the emptied file provided keeps the data in use"
     );
     assert_eq!(
-        engine.geo_data_warnings(),
+        engine.geo_data_words(),
         [kept_sentence("GeoSite data file", &last, "only")]
     );
 }
@@ -745,7 +745,7 @@ async fn an_empty_geoip_file_keeps_the_tags_in_use() {
     replace(&path, b"");
     let kept = [kept_sentence("GeoIP data file", &path, "TESTNET")];
     wait_for("the status must say the data stays", || {
-        engine.geo_data_warnings() == kept
+        engine.geo_data_words() == kept
     })
     .await;
     keeps_answering(
@@ -766,7 +766,7 @@ async fn an_empty_geoip_file_keeps_the_tags_in_use() {
             .matches_any_tag("198.51.100.1".parse().unwrap(), &tags)
     })
     .await;
-    assert_eq!(engine.geo_data_warnings(), Vec::<String>::new());
+    assert_eq!(engine.geo_data_words(), Vec::<String>::new());
 }
 
 /// 数据文件已经成了空文件，在用的数据靠监视那一层留着。这时热重载改了要读的 Geo 数据（多了一个文件），所有文件
@@ -803,7 +803,7 @@ async fn a_reload_reading_an_empty_geosite_file_keeps_the_tags_still_in_use() {
         "only tags the rules use are kept"
     );
     assert_eq!(
-        engine.geo_data_warnings(),
+        engine.geo_data_words(),
         [kept_sentence("GeoSite data file", &path, "testa")]
     );
 
@@ -812,7 +812,7 @@ async fn a_reload_reading_an_empty_geosite_file_keeps_the_tags_still_in_use() {
     replace(&path, &geosite_dat(&[("testa", "geo.test")])[..5]);
     engine.reload(geosite_config(&[&other, &path], "testa"));
     assert_eq!(ask(&engine, "third.geo.test").await, Some(MATCHED));
-    let warnings = engine.geo_data_warnings();
+    let warnings = engine.geo_data_words();
     let unreadable = format!("GeoSite data file {} cannot be read: ", path.display());
     assert!(
         warnings.len() == 1 && warnings[0].starts_with(&unreadable),
@@ -850,7 +850,7 @@ async fn a_reload_reading_an_empty_geoip_file_keeps_the_tags_still_in_use() {
     engine.reload(using(&["TESTNET", "ELSEWHERE"]));
     assert_eq!(ask_from(&engine, "second.test", peer).await, Some(MATCHED));
     assert_eq!(
-        engine.geo_data_warnings(),
+        engine.geo_data_words(),
         [
             kept_sentence("GeoIP data file", &path, "TESTNET"),
             "GeoIP tags ELSEWHERE are in no GeoIP data: geoip_country never matches them"
@@ -970,7 +970,7 @@ async fn geo_data_warnings_say_what_is_missing_or_unreadable() {
         json!({ "type": "geo_site_not", "value": "cn" }),
     ));
     assert_eq!(
-        engine.geo_data_warnings(),
+        engine.geo_data_words(),
         [
             format!("GeoSite data file {} does not exist", site.display()),
             "GeoSite tags cn are in no data file: geo_site never matches them and geo_site_not always does".to_string(),
@@ -978,7 +978,7 @@ async fn geo_data_warnings_say_what_is_missing_or_unreadable() {
     );
     replace(&site, &geosite_dat(&[("cn", "cn.test")]));
     wait_for("the GeoSite file is read in", || {
-        engine.geo_data_warnings().is_empty()
+        engine.geo_data_words().is_empty()
     })
     .await;
     assert_eq!(ask(&engine, "a.cn.test").await, Some(OTHER));
@@ -999,7 +999,7 @@ async fn geo_data_warnings_say_what_is_missing_or_unreadable() {
         )
     };
     let engine = self::engine(cfg());
-    let warnings = engine.geo_data_warnings();
+    let warnings = engine.geo_data_words();
     let unreadable =
         |what: &str, path: &Path| format!("{what} {} cannot be read: ", path.display());
     assert_eq!(warnings.len(), 3, "{warnings:?}");
@@ -1021,10 +1021,10 @@ async fn geo_data_warnings_say_what_is_missing_or_unreadable() {
         br#"{"entries":[{"country_code":"TESTNET","ips":["203.0.113.0/24"]}]}"#,
     );
     wait_for("the GeoIP data file is read in", || {
-        engine.geo_data_warnings().len() == 2
+        engine.geo_data_words().len() == 2
     })
     .await;
-    let warnings = engine.geo_data_warnings();
+    let warnings = engine.geo_data_words();
     assert!(
         warnings[0].starts_with(&unreadable("GeoIP database", &mmdb)),
         "{warnings:?}"
@@ -1045,7 +1045,7 @@ async fn geo_data_warnings_say_what_is_missing_or_unreadable() {
     crate::matcher::geoip_converter::convert_dat_to_mmdb(&source, &readable, None).unwrap();
     std::fs::rename(&readable, &mmdb).unwrap();
     wait_for("the watch reads the database in", || {
-        engine.geo_data_warnings().is_empty()
+        engine.geo_data_words().is_empty()
     })
     .await;
 }
@@ -1080,13 +1080,13 @@ async fn a_data_file_leading_where_nothing_can_be_watched_is_reported() {
         std::fs::rename(&tmp, &first).unwrap();
     };
     let engine = engine(geosite_config_any_of(&[&first, &last], &["ads", "cn"]));
-    assert_eq!(engine.geo_data_warnings(), Vec::<String>::new());
+    assert_eq!(engine.geo_data_words(), Vec::<String>::new());
 
     point_at(&dir.path().join("missing").join("first.dat"));
     let said = partly_watched("GeoSite data file", &first);
     let unwatched = || {
         engine
-            .geo_data_warnings()
+            .geo_data_words()
             .iter()
             .any(|sentence| sentence.starts_with(&said))
     };
@@ -1099,11 +1099,11 @@ async fn a_data_file_leading_where_nothing_can_be_watched_is_reported() {
         engine.geo().geosite.matches("cn", "x.cn2.test")
     })
     .await;
-    assert!(unwatched(), "{:?}", engine.geo_data_warnings());
+    assert!(unwatched(), "{:?}", engine.geo_data_words());
 
     point_at(&good.join("first.dat"));
     wait_for("the sentence goes once first.dat is watched again", || {
-        engine.geo_data_warnings().is_empty()
+        engine.geo_data_words().is_empty()
     })
     .await;
     assert!(engine.geo().geosite.matches("ads", "x.first.test"));
@@ -1144,7 +1144,7 @@ async fn a_geosite_file_partly_watched_at_startup_is_read_by_the_check() {
     let target = link_into_a_missing_directory(dir.path(), &site);
     let _check = crate::watcher::check_every(CHECKED);
     let engine = engine(geosite_config(&[&site], "ads"));
-    let warnings = engine.geo_data_warnings();
+    let warnings = engine.geo_data_words();
     assert_eq!(warnings.len(), 3, "{warnings:?}");
     assert_eq!(
         warnings[0],
@@ -1164,7 +1164,7 @@ async fn a_geosite_file_partly_watched_at_startup_is_read_by_the_check() {
     assert_eq!(ask(&engine, "x.ads.test").await, Some(MATCHED));
     wait_for(
         "the status says nothing once it is read and watched",
-        || engine.geo_data_warnings().is_empty(),
+        || engine.geo_data_words().is_empty(),
     )
     .await;
 }
@@ -1187,7 +1187,7 @@ async fn a_geoip_file_partly_watched_at_startup_is_read_by_the_check() {
         json!({ "geoip_dat_path": data.to_str().unwrap() }),
         json!({ "type": "geoip_country", "country_codes": ["TESTNET"] }),
     ));
-    let warnings = engine.geo_data_warnings();
+    let warnings = engine.geo_data_words();
     assert_eq!(warnings.len(), 3, "{warnings:?}");
     assert!(
         warnings[1].starts_with(&partly_watched("GeoIP data file", &data)),
@@ -1209,7 +1209,7 @@ async fn a_geoip_file_partly_watched_at_startup_is_read_by_the_check() {
     assert_eq!(ask_from(&engine, "b.test", client).await, Some(MATCHED));
     wait_for(
         "the status says nothing once it is read and watched",
-        || engine.geo_data_warnings().is_empty(),
+        || engine.geo_data_words().is_empty(),
     )
     .await;
 }
@@ -1228,7 +1228,7 @@ async fn without_notify_the_check_reads_a_replaced_data_file() {
     let _check = crate::watcher::check_every(CHECKED);
     let _notify = crate::watcher::without_notify();
     let engine = engine(geosite_config(&[&site], "ads"));
-    let warnings = engine.geo_data_warnings();
+    let warnings = engine.geo_data_words();
     assert_eq!(warnings.len(), 1, "{warnings:?}");
     assert!(
         warnings[0].starts_with(&partly_watched("GeoSite data file", &site)),
@@ -1274,7 +1274,7 @@ async fn a_data_file_pointed_where_it_is_partly_watched_is_read_by_the_check() {
         "the status says geosite.dat cannot be watched there",
         || {
             engine
-                .geo_data_warnings()
+                .geo_data_words()
                 .iter()
                 .any(|sentence| sentence.starts_with(&said))
         },
@@ -1289,7 +1289,7 @@ async fn a_data_file_pointed_where_it_is_partly_watched_is_read_by_the_check() {
     .await;
     wait_for(
         "the status says nothing once it is read and watched",
-        || engine.geo_data_warnings().is_empty(),
+        || engine.geo_data_words().is_empty(),
     )
     .await;
 }
@@ -1315,7 +1315,7 @@ async fn a_geosite_file_behind_a_dangling_directory_link_is_read_once_the_link_p
     symlink(dir.path().join("missing"), &link).unwrap();
     let site = link.join("geosite.dat");
     let engine = engine(geosite_config(&[&site], "ads"));
-    let warnings = engine.geo_data_warnings();
+    let warnings = engine.geo_data_words();
     assert_eq!(warnings.len(), 3, "{warnings:?}");
     assert_eq!(
         warnings[0],
@@ -1342,7 +1342,7 @@ async fn a_geosite_file_behind_a_dangling_directory_link_is_read_once_the_link_p
     .await;
     wait_for(
         "the status says nothing once it is read and watched",
-        || engine.geo_data_warnings().is_empty(),
+        || engine.geo_data_words().is_empty(),
     )
     .await;
 }
@@ -1367,11 +1367,11 @@ async fn a_geosite_file_partly_watched_at_startup_is_watched_once_its_link_is_ma
     let said = partly_watched("GeoSite data file", &site);
     assert!(
         engine
-            .geo_data_warnings()
+            .geo_data_words()
             .iter()
             .any(|sentence| sentence.starts_with(&said)),
         "{:?}",
-        engine.geo_data_warnings()
+        engine.geo_data_words()
     );
 
     std::fs::create_dir(target.parent().unwrap()).unwrap();
@@ -1386,7 +1386,7 @@ async fn a_geosite_file_partly_watched_at_startup_is_watched_once_its_link_is_ma
     .await;
     wait_for(
         "the status says nothing once it is watched everywhere",
-        || engine.geo_data_warnings().is_empty(),
+        || engine.geo_data_words().is_empty(),
     )
     .await;
 
@@ -1395,7 +1395,7 @@ async fn a_geosite_file_partly_watched_at_startup_is_watched_once_its_link_is_ma
         engine.geo().geosite.matches("ads", "x.second.test")
     })
     .await;
-    assert_eq!(engine.geo_data_warnings(), Vec::<String>::new());
+    assert_eq!(engine.geo_data_words(), Vec::<String>::new());
 }
 
 /// GeoSite 数据文件所在的目录删掉，过一会儿才重建、写进新数据：目录没了以后状态里说它监视不上，在用的数据留着；不用热
@@ -1419,7 +1419,7 @@ async fn a_geosite_directory_removed_and_made_again_later_is_read_by_the_check()
     let said = partly_watched("GeoSite data file", &site);
     wait_for("the status says geosite.dat cannot be watched", || {
         engine
-            .geo_data_warnings()
+            .geo_data_words()
             .iter()
             .any(|sentence| sentence.starts_with(&said))
     })
@@ -1435,7 +1435,7 @@ async fn a_geosite_directory_removed_and_made_again_later_is_read_by_the_check()
     assert_eq!(ask(&engine, "x.second.test").await, Some(MATCHED));
     wait_for(
         "the status says nothing once it is read and watched",
-        || engine.geo_data_warnings().is_empty(),
+        || engine.geo_data_words().is_empty(),
     )
     .await;
 }
@@ -1576,7 +1576,7 @@ async fn a_tag_a_kubernetes_volume_swap_removes_goes() {
     let site = volume.join("site.dat");
     let engine = engine(geosite_config_any_of(&[&site], &["ads", "cn"]));
     assert!(engine.geo().geosite.matches("cn", "x.cn.test"));
-    assert_eq!(engine.geo_data_warnings(), Vec::<String>::new());
+    assert_eq!(engine.geo_data_words(), Vec::<String>::new());
 
     kubernetes_volume(
         volume,
@@ -1588,7 +1588,7 @@ async fn a_tag_a_kubernetes_volume_swap_removes_goes() {
         "GeoSite tags cn are in no data file: geo_site never matches them and geo_site_not always does",
     ];
     wait_for("the status says cn has no data", || {
-        engine.geo_data_warnings() == unprovided
+        engine.geo_data_words() == unprovided
     })
     .await;
     let manager = engine.geo().geosite;
@@ -1624,7 +1624,7 @@ async fn a_geo_directory_swapped_above_is_read_by_the_check() {
         engine.geo().geosite.matches("ads", "x.second.test")
     })
     .await;
-    assert_eq!(engine.geo_data_warnings(), Vec::<String>::new());
+    assert_eq!(engine.geo_data_words(), Vec::<String>::new());
     replace(&site, &geosite_dat(&[("ads", "third.test")]));
     wait_for("the file in the new directory edited is read in", || {
         engine.geo().geosite.matches("ads", "x.third.test")

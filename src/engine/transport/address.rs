@@ -2,11 +2,12 @@
 //! How upstream addresses are read: how each transport gets from an address as configured to the
 //! host, port and TLS server name it connects to; the configuration is checked reading them so
 
-use anyhow::Context;
 use rustls::pki_types::ServerName;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use url::Url;
+
+use crate::notice::Said;
 
 /// DoH 上游 `upstream` 的 URL 和覆盖的 Host（`host` 查询参数，不发给上游）。`upstream` 是去掉前缀的地址
 /// （`dns.example/dns-query`，见 `config::parse_upstream_addr`），一律走 https；后面又写了一个前缀的（`doh://http://…`）
@@ -16,13 +17,16 @@ use url::Url;
 /// `config::parse_upstream_addr`), always over https; one with a second prefix after the first
 /// (`doh://http://…`) is not taken, as it would otherwise go over plain http unseen. With no path
 /// written it is `/dns-query`
-pub(super) fn build_doh_url(upstream: &str) -> anyhow::Result<(Url, Option<String>)> {
+pub(super) fn build_doh_url(upstream: &str) -> Result<(Url, Option<String>), Said> {
     if let Some((scheme, _)) = crate::config::split_scheme(upstream) {
-        anyhow::bail!(
-            "a second prefix \"{scheme}://\" after the first; a DoH upstream always goes over https"
-        );
+        return Err(Said::DohSecondPrefix {
+            prefix: scheme.to_owned(),
+        });
     }
-    let mut url = Url::parse(&format!("https://{upstream}")).context("invalid doh url")?;
+    let mut url =
+        Url::parse(&format!("https://{upstream}")).map_err(|err| Said::DohUrlInvalid {
+            error: err.to_string(),
+        })?;
 
     // Default path for DoH if not provided
     if url.path().is_empty() || url.path() == "/" {
@@ -58,12 +62,14 @@ pub(super) struct DotTarget {
     pub(super) sni: Arc<str>,
 }
 
-pub(super) fn build_server_name(name: &str) -> anyhow::Result<ServerName<'static>> {
+pub(super) fn build_server_name(name: &str) -> Result<ServerName<'static>, Said> {
     if let Ok(ip) = name.parse::<std::net::IpAddr>() {
         let ip = rustls::pki_types::IpAddr::from(ip);
         Ok(ServerName::IpAddress(ip))
     } else {
-        ServerName::try_from(name.to_string()).context("invalid tls server name")
+        ServerName::try_from(name.to_string()).map_err(|err| Said::TlsServerNameInvalid {
+            error: err.to_string(),
+        })
     }
 }
 
@@ -89,24 +95,33 @@ fn host_port(host: &str, port: u16) -> String {
     }
 }
 
-/// 一个上游地址（不带前缀）用 `transport` 读不读得懂，读法和各个客户端连接时一样
-/// Whether `transport` can read one upstream address (prefix removed), read the
-/// way each client reads it when it connects
+/// 一个上游地址（不带前缀）用 `transport` 读不读得懂，读法和各个客户端连接时一样；读不懂时说为什么
+/// Whether `transport` can read one upstream address (prefix removed), read the way each
+/// client reads it when it connects; why not when it cannot
 pub(crate) fn check_upstream_address(
     address: &str,
     transport: crate::config::Transport,
-) -> anyhow::Result<()> {
+) -> Result<(), Said> {
     use crate::config::Transport;
 
+    let port_zero = |port| {
+        if port == 0 {
+            Err(Said::PortZero)
+        } else {
+            Ok(())
+        }
+    };
     // UDP 只认 IP 和端口（见 UdpClient::send）；TCP 也认主机名，由 Bootstrap 解析
     // UDP takes an IP and a port only (see UdpClient::send); TCP takes a host name too,
     // which Bootstrap resolves
-    let socket_address = |address: &str| -> anyhow::Result<()> {
-        let parsed: SocketAddr = address
-            .parse()
-            .context("expected an IP address and a port")?;
-        anyhow::ensure!(parsed.port() != 0, "port 0");
-        Ok(())
+    let socket_address = |address: &str| {
+        let parsed: SocketAddr =
+            address
+                .parse()
+                .map_err(|err: std::net::AddrParseError| Said::AddressNotIpPort {
+                    error: err.to_string(),
+                })?;
+        port_zero(parsed.port())
     };
     match transport {
         Transport::Udp | Transport::TcpUdp => socket_address(address),
@@ -114,18 +129,22 @@ pub(crate) fn check_upstream_address(
             if socket_address(address).is_ok() {
                 return Ok(());
             }
-            let (host, port) = address
-                .rsplit_once(':')
-                .context("expected a host and a port")?;
-            let port: u16 = port.parse().context("invalid port")?;
-            anyhow::ensure!(port != 0, "port 0");
-            anyhow::ensure!(
-                !host.is_empty()
-                    && host
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.'),
-                "invalid host \"{host}\""
-            );
+            let (host, port) = address.rsplit_once(':').ok_or(Said::AddressNotHostPort)?;
+            let port: u16 =
+                port.parse()
+                    .map_err(|err: std::num::ParseIntError| Said::PortInvalid {
+                        error: err.to_string(),
+                    })?;
+            port_zero(port)?;
+            if host.is_empty()
+                || !host
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+            {
+                return Err(Said::HostInvalid {
+                    host: host.to_owned(),
+                });
+            }
             Ok(())
         }
         Transport::Doh => build_doh_url(address).map(drop),
@@ -179,16 +198,20 @@ struct TlsUpstream {
 fn parse_tls_upstream(
     upstream: &str,
     transport: crate::config::Transport,
-) -> anyhow::Result<TlsUpstream> {
+) -> Result<TlsUpstream, Said> {
     let scheme = transport.label();
     if let Some((second, _)) = crate::config::split_scheme(upstream) {
-        anyhow::bail!("a second prefix \"{second}://\" after the first");
+        return Err(Said::SecondPrefix {
+            prefix: second.to_owned(),
+        });
     }
-    let url = Url::parse(&format!("{scheme}://{upstream}"))
-        .with_context(|| format!("invalid {scheme} upstream url"))?;
-    let host = url_host(&url).with_context(|| format!("{scheme} upstream missing host"))?;
+    let url = Url::parse(&format!("{scheme}://{upstream}")).map_err(|err| Said::TlsUrlInvalid {
+        transport: scheme,
+        error: err.to_string(),
+    })?;
+    let host = url_host(&url).ok_or(Said::TlsHostMissing { transport: scheme })?;
     if !url.path().is_empty() && url.path() != "/" {
-        anyhow::bail!("{scheme} upstream should not contain path");
+        return Err(Said::TlsPathGiven { transport: scheme });
     }
     let (mut sni, mut enable_0rtt) = (None, None);
     for (key, value) in url.query_pairs() {
@@ -201,12 +224,18 @@ fn parse_tls_upstream(
             enable_0rtt = Some(match value.to_ascii_lowercase().as_str() {
                 "true" | "1" | "yes" | "on" => true,
                 "false" | "0" | "no" | "off" => false,
-                _ => anyhow::bail!(
-                    "invalid {key} \"{value}\", expected true, false, 1, 0, yes, no, on or off"
-                ),
+                _ => {
+                    return Err(Said::ZeroRttInvalid {
+                        key: key.into_owned(),
+                        value: value.into_owned(),
+                    });
+                }
             });
         } else {
-            anyhow::bail!("{scheme} upstream does not take the parameter \"{key}\"");
+            return Err(Said::TlsParameterUnknown {
+                transport: scheme,
+                key: key.into_owned(),
+            });
         }
     }
     Ok(TlsUpstream {
@@ -217,7 +246,7 @@ fn parse_tls_upstream(
     })
 }
 
-pub(super) fn parse_dot_target(upstream: &str) -> anyhow::Result<DotTarget> {
+pub(super) fn parse_dot_target(upstream: &str) -> Result<DotTarget, Said> {
     let TlsUpstream {
         host, port, sni, ..
     } = parse_tls_upstream(upstream, crate::config::Transport::Dot)?;
@@ -243,7 +272,7 @@ pub(super) struct DoqTarget {
     pub(super) enable_0rtt: Option<bool>,
 }
 
-pub(super) fn parse_doq_target(upstream: &str) -> anyhow::Result<DoqTarget> {
+pub(super) fn parse_doq_target(upstream: &str) -> Result<DoqTarget, Said> {
     let TlsUpstream {
         host,
         port,
@@ -253,9 +282,7 @@ pub(super) fn parse_doq_target(upstream: &str) -> anyhow::Result<DoqTarget> {
 
     let is_ip = host.parse::<std::net::IpAddr>().is_ok();
     if sni.is_none() && is_ip {
-        anyhow::bail!(
-            "doq upstream with IP address requires explicit sni (e.g. doq://223.5.5.5:853?sni=alidns.com)"
-        );
+        return Err(Said::DoqIpNeedsSni);
     }
 
     let sni_value = sni.unwrap_or_else(|| host.clone());

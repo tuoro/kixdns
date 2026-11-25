@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::matcher::RuntimePipelineConfig;
 use crate::matcher::advanced_rule::StaticAnswer;
+use crate::notice::{Notice, Said};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PipelineConfig {
@@ -906,15 +907,16 @@ macro_rules! limited_settings {
             /// starts at the limit (see [`Self::hold_to_limits`]), so a configuration that worked
             /// before there were limits (`tcp_pool_size: 2048`) still starts after an upgrade,
             /// while a reload and a panel save refuse it
-            fn over_limits(&self) -> Vec<String> {
+            fn over_limits(&self) -> Vec<Notice> {
                 let mut over = Vec::new();
                 $(
                     if self.$setting > $most {
-                        over.push(format!(
-                            "settings.{}: {} is more than {most}, the most it may be; startup uses {most} instead",
-                            stringify!($setting),
-                            self.$setting,
-                            most = $most,
+                        over.push(Notice::at(
+                            concat!("settings.", stringify!($setting)),
+                            Said::SettingOverLimit {
+                                value: self.$setting as u64,
+                                most: $most as u64,
+                            },
                         ));
                     }
                 )*
@@ -1035,7 +1037,12 @@ impl GlobalSettings {
     pub fn listeners(&self) -> Result<ListenerConfig, Problems> {
         let address = |setting: &str, value: &str| {
             value.parse::<SocketAddr>().map_err(|err| {
-                format!("settings.{setting}: \"{value}\" is not an IP address and port: {err}")
+                let value = value.to_owned();
+                let error = err.to_string();
+                Notice::at(
+                    format!("settings.{setting}"),
+                    Said::ListenAddressInvalid { value, error },
+                )
             })
         };
         let udp = address("bind_udp", &self.bind_udp);
@@ -1043,8 +1050,10 @@ impl GlobalSettings {
         let doh = self.bind_doh.as_deref().map(|bind_doh| {
             let required = |setting: &str, value: &Option<String>| {
                 value.clone().ok_or_else(|| {
-                    format!(
-                        "settings.{setting}: not set, though settings.bind_doh is \"{bind_doh}\" and DoH needs it"
+                    let bind_doh = bind_doh.to_owned();
+                    Notice::at(
+                        format!("settings.{setting}"),
+                        Said::DohSettingMissing { bind_doh },
                     )
                 })
             };
@@ -1074,12 +1083,12 @@ impl GlobalSettings {
                 let doh = doh
                     .into_iter()
                     .flat_map(|(bind, cert, key)| [bind.err(), cert.err(), key.err()]);
-                Err(Problems(
+                Err(Problems::from(
                     [udp.err(), tcp.err()]
                         .into_iter()
                         .chain(doh)
                         .flatten()
-                        .collect(),
+                        .collect::<Vec<_>>(),
                 ))
             }
         }
@@ -1130,20 +1139,17 @@ impl GlobalSettings {
         let mut found = Vec::new();
         // Validate cache_capacity configuration
         if self.cache_capacity == 0 {
-            found.push(
-                "settings.cache_capacity: 0 leaves the cache no room for any answer; it must be greater than 0"
-                    .to_owned(),
-            );
+            found.push(Notice::at(
+                "settings.cache_capacity",
+                Said::CacheCapacityZero,
+            ));
         }
         // cache_max_ttl = 0 会让每条应答的缓存 TTL 归零，等于静默关掉缓存，
         // 与 cache_capacity = 0 同样不是有效配置。
         // cache_max_ttl = 0 clamps every entry's TTL to zero, silently disabling
         // the cache, which is no more a valid configuration than cache_capacity = 0.
         if self.cache_max_ttl == 0 {
-            found.push(
-                "settings.cache_max_ttl: 0 holds the TTL of every answer cached to 0, leaving the cache unused; it must be greater than 0"
-                    .to_owned(),
-            );
+            found.push(Notice::at("settings.cache_max_ttl", Said::CacheMaxTtlZero));
         }
         // 阈值是条目 TTL 的百分比，刷新条件是剩余 TTL 低于它。取 100 时阈值等于
         // 条目自身的 TTL，任何时间一过就满足，和超过 100 一样每次缓存命中都触发
@@ -1154,9 +1160,11 @@ impl GlobalSettings {
         // above 100, every cache hit triggers a refresh and the upstream carries
         // the client's full load. Use cache_background_refresh to turn it off.
         if self.cache_refresh_threshold_percent >= 100 {
-            found.push(format!(
-                "settings.cache_refresh_threshold_percent: {} makes every cache hit refresh upstream; it must be below 100",
-                self.cache_refresh_threshold_percent
+            found.push(Notice::at(
+                "settings.cache_refresh_threshold_percent",
+                Said::RefreshThresholdTooHigh {
+                    value: self.cache_refresh_threshold_percent,
+                },
             ));
         }
         // upstream_timeout_ms = 0 让每次上游请求在发出的同一刻就超时，任何查询
@@ -1166,10 +1174,10 @@ impl GlobalSettings {
         // is issued, so no query can ever be answered. It does not mean "no
         // limit"; leaving request_timeout_ms unset is what derives a budget.
         if self.upstream_timeout_ms == 0 {
-            found.push(
-                "settings.upstream_timeout_ms: 0 expires every upstream request as it is sent; it must be greater than 0"
-                    .to_owned(),
-            );
+            found.push(Notice::at(
+                "settings.upstream_timeout_ms",
+                Said::UpstreamTimeoutZero,
+            ));
         }
         // 只在启动时读的设置，校验得和建引擎时的前提一致：校验放过了、建引擎时才出错的值，热重载和面板保存都会
         // 收下，到下次重启内核就起不来。DashMap 要求分片数是大于 1 的 2 的幂，不是的从来起不来；分片太多、连接池太大
@@ -1182,16 +1190,21 @@ impl GlobalSettings {
         // `hold_to_limits`)
         let shards = self.dashmap_shards;
         if shards != 0 && !(shards.is_power_of_two() && shards >= 2) {
-            found.push(format!(
-                "settings.dashmap_shards: {shards} is neither 0 (the default) nor a power of two from 2 to {MAX_DASHMAP_SHARDS}"
+            found.push(Notice::at(
+                "settings.dashmap_shards",
+                Said::DashmapShardsInvalid {
+                    value: shards,
+                    most: MAX_DASHMAP_SHARDS,
+                },
             ));
         }
         let doq_idle = self.doq_connection_idle_timeout_seconds;
         if doq_idle > 0
             && quinn::IdleTimeout::try_from(std::time::Duration::from_secs(doq_idle)).is_err()
         {
-            found.push(format!(
-                "settings.doq_connection_idle_timeout_seconds: {doq_idle} is more than QUIC can carry"
+            found.push(Notice::at(
+                "settings.doq_connection_idle_timeout_seconds",
+                Said::DoqIdleTimeoutTooLong { value: doq_idle },
             ));
         }
 
@@ -1200,9 +1213,12 @@ impl GlobalSettings {
         if let Some(request_timeout) = self.request_timeout_ms
             && request_timeout < self.upstream_timeout_ms
         {
-            found.push(format!(
-                "settings.request_timeout_ms: {request_timeout} is less than settings.upstream_timeout_ms ({upstream}); it must be at least that",
-                upstream = self.upstream_timeout_ms
+            found.push(Notice::at(
+                "settings.request_timeout_ms",
+                Said::RequestTimeoutBelowUpstream {
+                    value: request_timeout,
+                    upstream: self.upstream_timeout_ms,
+                },
             ));
         }
         Problems::refuse(found)
@@ -1475,9 +1491,12 @@ pub struct ValidationReport {
     pub pipeline_count: usize,
     /// Total number of rules across all pipelines.
     pub rule_count: usize,
-    /// 照样加载、值得知道的写法（见 [`warnings`]）/ What loads all the same yet is worth
-    /// knowing (see [`warnings`])
+    /// 照样加载、值得知道的写法（见 [`warnings`]），每条一句 / What loads all the same yet is
+    /// worth knowing (see [`warnings`]), a sentence each
     pub warnings: Vec<String>,
+    /// 同样的告警，带着代号和参数（见 [`Notice`]），和 `warnings` 一条对一条 / The same warnings
+    /// with their codes and arguments (see [`Notice`]), one for one with `warnings`
+    pub coded_warnings: Vec<Notice>,
 }
 
 /// 一份配置编译成运行时配置，热重载、面板的校验和试用都走这里。拒掉的是会悄悄做成别的事的写法（见 [`problems`]），
@@ -1513,11 +1532,11 @@ pub fn compile(cfg: PipelineConfig) -> Result<RuntimePipelineConfig> {
 /// gives, the [`problems`] first and all listed at once, as a refused reload lists them
 pub fn compile_at_startup(
     cfg: PipelineConfig,
-) -> Result<(RuntimePipelineConfig, ListenerConfig, Vec<String>)> {
+) -> Result<(RuntimePipelineConfig, ListenerConfig, Vec<Notice>)> {
     let found = problems(&cfg);
     match compile_refusing(cfg, Vec::new()) {
         Ok((runtime, listeners)) => Ok((runtime, listeners, found)),
-        Err(Problems(refused)) => Err(Problems([found, refused].concat()).into()),
+        Err(refused) => Err(Problems::from([found, refused.notices].concat()).into()),
     }
 }
 
@@ -1526,13 +1545,13 @@ pub fn compile_at_startup(
 /// `refused` holds already (see [`Problems`]), refused on any one
 fn compile_refusing(
     cfg: PipelineConfig,
-    mut refused: Vec<String>,
+    mut refused: Vec<Notice>,
 ) -> Result<(RuntimePipelineConfig, ListenerConfig), Problems> {
     let listeners = Problems::gather(&mut refused, cfg.settings.listeners());
     let runtime = Problems::gather(&mut refused, RuntimePipelineConfig::from_config(cfg));
     match (runtime, listeners) {
         (Some(runtime), Some(listeners)) if refused.is_empty() => Ok((runtime, listeners)),
-        _ => Err(Problems(refused)),
+        _ => Err(Problems::from(refused)),
     }
 }
 
@@ -1557,7 +1576,8 @@ pub fn validate(raw: &str) -> Result<ValidationReport> {
         version,
         pipeline_count: runtime.pipelines.len(),
         rule_count: runtime.pipelines.iter().map(|p| p.rules.len()).sum(),
-        warnings: runtime.warnings,
+        warnings: runtime.warnings.iter().map(Notice::to_string).collect(),
+        coded_warnings: runtime.warnings,
     })
 }
 
@@ -1582,25 +1602,29 @@ pub fn validate(raw: &str) -> Result<ValidationReport> {
 /// configuration in use still starts after an upgrade; when another reason stops the kernel,
 /// they are listed with it in the one error (see [`compile_at_startup`]). A reload and the
 /// panel's validation (see [`validate`]) refuse them, so the next change has to fix them.
-pub fn problems(cfg: &PipelineConfig) -> Vec<String> {
+pub fn problems(cfg: &PipelineConfig) -> Vec<Notice> {
     let pipelines: rustc_hash::FxHashSet<&str> =
         cfg.pipelines.iter().map(|p| p.id.as_str()).collect();
     let mut found = Vec::new();
+    let default_upstream = |said| Notice::at("settings.default_upstream", said);
     if !cfg.settings.default_upstream.names_an_address() {
-        found.push(format!("settings.default_upstream: {NO_UPSTREAM}"));
+        found.push(default_upstream(Said::NoUpstream));
     }
     for upstream in cfg.settings.default_upstream.upstreams() {
-        if let Some(problem) = upstream_problem(upstream, Transport::Udp) {
-            found.push(format!("settings.default_upstream: {problem}"));
-        }
+        found.extend(upstream_problem(upstream, Transport::Udp).map(default_upstream));
     }
     // bootstrap 自己就是解析上游名字的，只能写成 IP 和端口，经 UDP 问 / bootstrap is what resolves
     // upstream names, so it is written as an IP and a port only, asked over UDP
     for server in split_upstreams(&cfg.settings.bootstrap) {
-        if let Err(error) = crate::engine::transport::check_upstream_address(server, Transport::Udp)
+        if let Err(reason) =
+            crate::engine::transport::check_upstream_address(server, Transport::Udp)
         {
-            found.push(format!(
-                "settings.bootstrap: server \"{server}\" is not usable: {error:#}"
+            found.push(Notice::at(
+                "settings.bootstrap",
+                Said::BootstrapServerUnusable {
+                    server: server.to_owned(),
+                    reason: Box::new(reason),
+                },
             ));
         }
     }
@@ -1608,9 +1632,11 @@ pub fn problems(cfg: &PipelineConfig) -> Vec<String> {
     // path always starts with `/`, so a doh_path not starting with it matches no request and DoH
     // answers 404 to every one
     if !cfg.settings.doh_path.starts_with('/') {
-        found.push(format!(
-            "settings.doh_path: \"{}\" does not start with \"/\", so it matches no request and DoH answers every query with 404",
-            cfg.settings.doh_path
+        found.push(Notice::at(
+            "settings.doh_path",
+            Said::DohPathWithoutSlash {
+                path: cfg.settings.doh_path.clone(),
+            },
         ));
     }
     found.extend(cfg.settings.over_limits());
@@ -1621,11 +1647,13 @@ pub fn problems(cfg: &PipelineConfig) -> Vec<String> {
         *written.entry(pipeline.id.as_str()).or_default() += 1;
     }
     for (place, entry) in entries(cfg) {
-        let mut report = |problem: String| found.push(format!("{place}: {problem}"));
+        let mut report = |said| found.push(Notice::at(&place, said));
         match entry {
             Entry::Select(select) => {
                 if !pipelines.contains(select.pipeline.as_str()) {
-                    report(format!("no pipeline \"{}\"", select.pipeline));
+                    report(Said::SelectPipelineMissing {
+                        pipeline: select.pipeline.clone(),
+                    });
                 }
                 if let Some(problem) = ignored_negation(
                     "matchers",
@@ -1639,24 +1667,22 @@ pub fn problems(cfg: &PipelineConfig) -> Vec<String> {
                 if let Some(times) = written.remove(pipeline.id.as_str())
                     && times > 1
                 {
-                    report(format!(
-                        "{times} pipelines are written with the id \"{}\"; only the first of them takes effect, and the rules of the others never run; give each pipeline its own id",
-                        pipeline.id
-                    ));
+                    report(Said::PipelineIdRepeated {
+                        times,
+                        id: pipeline.id.clone(),
+                    });
                 }
             }
             Entry::Rule(rule) => rule_problems(rule, &cfg.settings, &pipelines, report),
         }
         for (within, matcher) in entry.matchers() {
             if let Some(problem) = matcher.problem() {
-                found.push(format!("{place}.{within}: {problem}"));
+                found.push(Notice::at(format!("{place}.{within}"), problem));
             }
         }
     }
     for key in cfg.unread_keys.iter().filter(|key| !retired(key)) {
-        found.push(format!(
-            "{key}: the kernel does not read this key, so what it says has no effect; check its spelling and where it is written"
-        ));
+        found.push(Notice::at(key, Said::KeyNotRead));
     }
     found
 }
@@ -1684,21 +1710,24 @@ pub fn problems(cfg: &PipelineConfig) -> Vec<String> {
 /// takes effect. Each starts, as [`problems`] do, with the path of the setting, matcher or rule
 /// it is about. They used to be logged only, out of sight at the default log level, and validation
 /// said nothing of them
-pub fn warnings(cfg: &PipelineConfig) -> Vec<String> {
+pub fn warnings(cfg: &PipelineConfig) -> Vec<Notice> {
     let mut found = Vec::new();
     if cfg.background_refresh_rule.is_some() {
-        found.push("background_refresh_rule: has no effect, as a background refresh replays the original request through its own rules; the entry can be removed".to_owned());
+        found.push(Notice::at(
+            "background_refresh_rule",
+            Said::BackgroundRefreshRuleUnused,
+        ));
     }
     for key in cfg.unread_keys.iter().filter(|key| retired(key)) {
-        found.push(format!(
-            "{key}: no longer read, so it has no effect; the entry can be removed"
-        ));
+        found.push(Notice::at(key, Said::SettingRetired));
     }
     let settings = &cfg.settings;
     if settings.cache_capacity > 1_000_000 {
-        found.push(format!(
-            "settings.cache_capacity: {} is very large and may take a lot of memory",
-            settings.cache_capacity
+        found.push(Notice::at(
+            "settings.cache_capacity",
+            Said::CacheCapacityLarge {
+                value: settings.cache_capacity,
+            },
         ));
     }
     // UDP 转发在三分之一处重发，等满一段上游超时，失败了再用 TCP 等一段：整体超时短过两段半就可能把它们掐断
@@ -1707,15 +1736,18 @@ pub fn warnings(cfg: &PipelineConfig) -> Vec<String> {
     if let Some(request_timeout) = settings.request_timeout_ms
         && request_timeout < settings.default_request_timeout_ms()
     {
-        found.push(format!(
-            "settings.request_timeout_ms: {request_timeout} is under 2.5 times upstream_timeout_ms ({}), which may cut the resend and the TCP fallback short",
-            settings.upstream_timeout_ms
+        found.push(Notice::at(
+            "settings.request_timeout_ms",
+            Said::RequestTimeoutShort {
+                value: request_timeout,
+                upstream: settings.upstream_timeout_ms,
+            },
         ));
     }
     for (place, entry) in entries(cfg) {
         for (within, matcher) in entry.matchers() {
             if let Some(warning) = matcher.warning() {
-                found.push(format!("{place}.{within}: {warning}"));
+                found.push(Notice::at(format!("{place}.{within}"), warning));
             }
         }
     }
@@ -1735,7 +1767,7 @@ pub fn warnings(cfg: &PipelineConfig) -> Vec<String> {
 /// answered SERVFAIL (`response_jump_limit` in the request phase, and as many again from an
 /// answer action's first jump on), and in the answer phase asks an upstream again on every jump
 /// (see [`MAX_JUMP_LIMIT`])
-fn jump_cycles(cfg: &PipelineConfig) -> Vec<String> {
+fn jump_cycles(cfg: &PipelineConfig) -> Vec<Notice> {
     // 一个 id 写了几次时跳转找到第一个，和运行时一样（见 `RuntimePipelineConfig::from_config`）；跳到不存在的
     // pipeline 是一条 [`problems`]，不算在这里 / With an id written several times a jump finds the
     // first, as at run time (see `RuntimePipelineConfig::from_config`); a jump to a pipeline that
@@ -1803,9 +1835,12 @@ fn jump_cycles(cfg: &PipelineConfig) -> Vec<String> {
                     visit[target] = Visit::OnPath;
                     path.push((target, 0));
                 }
-                Visit::OnPath => found.push(format!(
-                    "pipelines[{at}].rules[{rule}]: jumping to \"{}\" comes back round to \"{}\", so a query that keeps going round is answered SERVFAIL once it has made every jump it may (response_jump_limit in the request phase, and as many again from an answer action's first jump on), and in the answer phase asks an upstream again on every jump",
-                    cfg.pipelines[target].id, cfg.pipelines[at].id
+                Visit::OnPath => found.push(Notice::at(
+                    format!("pipelines[{at}].rules[{rule}]"),
+                    Said::JumpCycle {
+                        target: cfg.pipelines[target].id.clone(),
+                        back_to: cfg.pipelines[at].id.clone(),
+                    },
                 )),
                 Visit::Done => {}
             }
@@ -1829,30 +1864,29 @@ pub(crate) fn geo_tags_without_data(
     settings: &GlobalSettings,
     geosite: &[String],
     geoip: &[String],
-) -> Vec<String> {
+) -> Vec<Notice> {
     let mut found = Vec::new();
     if settings.geosite_data_paths.is_empty() && !geosite.is_empty() {
-        found.push(format!(
-            "settings.geosite_data_paths: empty, so the GeoSite tags {} have no data to match against: geo_site never matches them and geo_site_not always does",
-            geosite.join(", ")
+        found.push(Notice::at(
+            "settings.geosite_data_paths",
+            Said::GeositeTagsWithoutData {
+                tags: geosite.to_vec(),
+            },
         ));
     }
-    let unanswered: Vec<&str> = geoip
+    let tags: Vec<String> = geoip
         .iter()
-        .map(String::as_str)
         .filter(|tag| {
             settings.geoip_db_path.is_none() || !crate::matcher::geoip::is_country_tag(tag)
         })
+        .cloned()
         .collect();
-    if settings.geoip_dat_path.is_none() && !unanswered.is_empty() {
-        let mmdb = match settings.geoip_db_path {
-            Some(_) => ", and settings.geoip_db_path answers two-letter country codes alone",
-            None => " and neither is settings.geoip_db_path",
+    if settings.geoip_dat_path.is_none() && !tags.is_empty() {
+        let said = match settings.geoip_db_path {
+            Some(_) => Said::GeoipTagsBeyondMmdb { tags },
+            None => Said::GeoipTagsWithoutData { tags },
         };
-        found.push(format!(
-            "settings.geoip_dat_path: not set{mmdb}, so the GeoIP tags {} have no data to match against: geoip_country never matches them",
-            unanswered.join(", ")
-        ));
+        found.push(Notice::at("settings.geoip_dat_path", said));
     }
     found
 }
@@ -1868,7 +1902,7 @@ pub(crate) fn geo_tags_without_data(
 /// to by its own transport
 pub(crate) fn host_names_without_bootstrap(
     runtime: &crate::matcher::RuntimePipelineConfig,
-) -> Option<String> {
+) -> Option<Notice> {
     if names_an_address(&runtime.settings.bootstrap) {
         return None;
     }
@@ -1876,8 +1910,9 @@ pub(crate) fn host_names_without_bootstrap(
         .into_iter()
         .filter_map(|(address, transport)| crate::engine::transport::host_name(address, transport))
         .min()?;
-    Some(format!(
-        "settings.bootstrap: not set, so upstream host names such as \"{host}\" are resolved by the system resolver; should that be KixDNS itself, resolving one comes back round to KixDNS and the upstream cannot be reached: set bootstrap to plain DNS servers written as IP:port"
+    Some(Notice::at(
+        "settings.bootstrap",
+        Said::HostNamesWithoutBootstrap { host },
     ))
 }
 
@@ -2045,59 +2080,74 @@ impl<'de> Visitor<'de> for Unread<'_> {
 /// 一份配置被拒的原因，每条一句，一次列全（见 [`compile`]），依次是 [`problems`]、监听地址和 DoH 的前提（见
 /// [`GlobalSettings::listeners`]）、说不通的设置（见 [`GlobalSettings::validate`]）、编译不了的匹配器：问题之后是设置的，
 /// 挨在一起，匹配器的在最后。显示成用 `; ` 连起来的一句；要逐条列出的（控制通道校验的回答和 `config` 结果的
-/// `last_reload`）用 [`Problems::of`] 从错误里取出来
+/// `last_reload`）用 [`Problems::of`] 从错误里取出原话、用 [`Problems::coded`] 取出带代号的同样几条
 /// Why a configuration is refused, a sentence each and all of them at once (see [`compile`]), in
 /// turn its [`problems`], the listener addresses and DoH prerequisites (see
 /// [`GlobalSettings::listeners`]), settings that make no sense (see [`GlobalSettings::validate`])
 /// and matchers that do not compile: after the problems come the settings, together, and the
 /// matchers last. It displays as one sentence, the reasons joined by `; `; what lists them one by
 /// one (the control channel's validation answer and the `config` result's `last_reload`) takes
-/// them out of the error with [`Problems::of`]
+/// their words out of the error with [`Problems::of`], and the same reasons with their codes with
+/// [`Problems::coded`]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Problems(pub Vec<String>);
+pub struct Problems {
+    notices: Vec<Notice>,
+    /// 每条的原话，和 `notices` 一条对一条 / The words of each, one for one with `notices`
+    texts: Vec<String>,
+}
 
 impl Problems {
-    /// `error` 是拒掉配置时列出的那些原因，别的错误时为空 / The reasons `error` refused a
-    /// configuration for, empty for any other error
+    /// `error` 是拒掉配置时列出的那些原因，每条一句，别的错误时为空 / The reasons `error` refused a
+    /// configuration for, a sentence each, empty for any other error
     pub fn of(error: &anyhow::Error) -> &[String] {
         error
             .downcast_ref::<Self>()
-            .map(|problems| problems.0.as_slice())
+            .map(|problems| problems.texts.as_slice())
+            .unwrap_or_default()
+    }
+
+    /// 同样的原因，带着代号和参数（见 [`Notice`]），和 [`Self::of`] 一条对一条 / The same reasons
+    /// with their codes and arguments (see [`Notice`]), one for one with [`Self::of`]
+    pub fn coded(error: &anyhow::Error) -> &[Notice] {
+        error
+            .downcast_ref::<Self>()
+            .map(|problems| problems.notices.as_slice())
             .unwrap_or_default()
     }
 
     /// `found` 一条都没有时为 Ok，否则为列着它们的 Err / Ok with nothing `found`, otherwise an
     /// Err listing it all
-    pub(crate) fn refuse(found: Vec<String>) -> Result<(), Self> {
+    pub(crate) fn refuse(found: Vec<Notice>) -> Result<(), Self> {
         if found.is_empty() {
             Ok(())
         } else {
-            Err(Self(found))
+            Err(Self::from(found))
         }
     }
 
     /// `checked` 拒掉的原因记进 `found`，交回它检查出来的东西，拒掉时为 None / Notes the reasons
     /// `checked` was refused for in `found`, handing back what it checked out, None when refused
-    pub(crate) fn gather<T>(found: &mut Vec<String>, checked: Result<T, Self>) -> Option<T> {
-        checked.map_err(|Self(more)| found.extend(more)).ok()
+    pub(crate) fn gather<T>(found: &mut Vec<Notice>, checked: Result<T, Self>) -> Option<T> {
+        checked
+            .map_err(|refused| found.extend(refused.notices))
+            .ok()
+    }
+}
+
+impl From<Vec<Notice>> for Problems {
+    fn from(notices: Vec<Notice>) -> Self {
+        let texts = notices.iter().map(Notice::to_string).collect();
+        Self { notices, texts }
     }
 }
 
 impl std::fmt::Display for Problems {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0.join("; "))
+        f.write_str(&self.texts.join("; "))
     }
 }
 
 impl std::error::Error for Problems {}
-
-/// 一条规则里几个 forward 的 ecs 写得不一样：它们合成一次转发，只能发一个 ECS，所以一个也不发
-/// A rule whose forwards write different ecs: they merge into one forward, which can send
-/// one ECS only, so none is sent
-const MERGED_ECS_DIFFER: &str = "its forward actions are asked together as one forward, which sends one ECS, but their ecs settings differ, so none of them is sent; write the same ecs on each, or split them into separate rules";
-
-/// 一个上游也没写：每个查询都会失败 / Not a single upstream written: every query would fail
-const NO_UPSTREAM: &str = "no upstream is written, so every query it gets would fail";
 
 /// 逗号分隔的上游，转发时就这样拆 / Comma-separated upstreams, split as a forward splits them
 pub(crate) fn split_upstreams(upstreams: &str) -> impl Iterator<Item = &str> {
@@ -2141,18 +2191,22 @@ pub(crate) fn parse_upstream_addr(addr: &str, default_transport: Transport) -> (
 /// 一个上游写得对不对：前缀认识，地址是它的传输读得懂的。说明为什么不对
 /// Whether one upstream is written right: a known prefix, and an address its transport can
 /// read. Says why not
-fn upstream_problem(upstream: &str, default_transport: Transport) -> Option<String> {
+fn upstream_problem(upstream: &str, default_transport: Transport) -> Option<Said> {
     if let Some((scheme, _)) = split_scheme(upstream)
         && Transport::from_label(scheme).is_none()
     {
-        return Some(format!(
-            "upstream \"{upstream}\" starts with an unknown prefix \"{scheme}://\""
-        ));
+        return Some(Said::UpstreamUnknownPrefix {
+            upstream: upstream.to_owned(),
+            prefix: scheme.to_owned(),
+        });
     }
     let (address, transport) = parse_upstream_addr(upstream, default_transport);
     crate::engine::transport::check_upstream_address(address, transport)
         .err()
-        .map(|error| format!("upstream \"{upstream}\" is not usable: {error:#}"))
+        .map(|reason| Said::UpstreamUnusable {
+            upstream: upstream.to_owned(),
+            reason: Box::new(reason),
+        })
 }
 
 /// 作答上游的名字（`udp:1.1.1.1:53`，见 `engine::upstream::upstream_label`）里的传输和地址，传输名照
@@ -2178,7 +2232,7 @@ pub(crate) fn answered_address(name: &str) -> &str {
 }
 
 /// `log` 动作认的级别 / The levels a `log` action takes
-const LOG_LEVELS: [&str; 5] = ["trace", "debug", "info", "warn", "error"];
+pub(crate) const LOG_LEVELS: [&str; 5] = ["trace", "debug", "info", "warn", "error"];
 
 /// 一串匹配器里白写的取反。第一个匹配器是起点，它身上的 `and_not`、`or_not`（`not`）前面没有东西可合，也不把它取反；只有
 /// 一个匹配器时，规则级的取反也只落在它身上，一样白写。以前悄悄当成正向匹配：写着 `not` 的规则整个反过来。要匹配它不成立
@@ -2190,10 +2244,10 @@ const LOG_LEVELS: [&str; 5] = ["trace", "debug", "info", "warn", "error"];
 /// right round. To match what it does not, put an `{"type": "any"}` first. `matchers` is the
 /// chain's key in the configuration
 fn ignored_negation(
-    matchers: &str,
+    matchers: &'static str,
     mut operators: impl ExactSizeIterator<Item = MatchOperator>,
     chain: MatchOperator,
-) -> Option<String> {
+) -> Option<Said> {
     let negation = |operator| match operator {
         MatchOperator::AndNot => Some("and_not"),
         MatchOperator::OrNot => Some("or_not"),
@@ -2206,9 +2260,7 @@ fn ignored_negation(
             .then(|| negation(chain))
             .flatten()
     })?;
-    Some(format!(
-        "{operator} on the first of {matchers} has nothing before it and does not negate it; to match what it does not, put {{\"type\": \"any\"}} first"
-    ))
+    Some(Said::NegationOnFirst { operator, matchers })
 }
 
 /// 配置里按位置排的每一项：pipeline_select 的每一条、每个 pipeline 和它的每条规则，各带着自己的路径，写法和读不懂的键
@@ -2276,7 +2328,7 @@ enum AnyMatcher<'a> {
 impl AnyMatcher<'_> {
     /// 这个匹配器会悄悄做成别的事的写法（见 [`problems`]）/ How this matcher is written to
     /// silently do something else (see [`problems`])
-    fn problem(self) -> Option<String> {
+    fn problem(self) -> Option<Said> {
         if let Some((Weight::Problem, problem)) = self.written_empty() {
             return Some(problem);
         }
@@ -2288,9 +2340,9 @@ impl AnyMatcher<'_> {
                 if !value.eq_ignore_ascii_case("OTHER")
                     && crate::matcher::parse_rcode(value).is_none() =>
             {
-                Some(format!(
-                    "response_rcode \"{value}\" is none of NOERROR, FORMERR, SERVFAIL, NXDOMAIN, NOTIMP, REFUSED, OTHER"
-                ))
+                Some(Said::ResponseRcodeUnknown {
+                    rcode: value.clone(),
+                })
             }
             _ => None,
         }
@@ -2301,7 +2353,7 @@ impl AnyMatcher<'_> {
     /// the same yet is worth knowing (see [`warnings`]): with its value written empty never
     /// matching, or with capitals in a name regex that never match as written (see
     /// `matcher::capitals_warning`)
-    fn warning(self) -> Option<String> {
+    fn warning(self) -> Option<Said> {
         if let Some((weight, warning)) = self.written_empty() {
             return (weight == Weight::Warning).then_some(warning);
         }
@@ -2330,29 +2382,18 @@ impl AnyMatcher<'_> {
     /// counts as empty. None for one that written empty does not compile (a network, a qclass, a
     /// qtype), is checked otherwise (an rcode) or has no value at all. Every kind is listed, so a
     /// new matcher has to be decided on to compile
-    fn written_empty(self) -> Option<(Weight, String)> {
+    fn written_empty(self) -> Option<(Weight, Said)> {
         use crate::matcher::domain_value;
-        let every_name = |kind: &str, value: &str| {
-            (
-                Weight::Problem,
-                format!("{kind} \"{value}\" matches every name"),
-            )
+        let every_name = |matcher, value: &str| {
+            let value = value.to_owned();
+            (Weight::Problem, Said::MatchesEveryName { matcher, value })
         };
-        let root = |kind: &str| {
-            (
-                Weight::Problem,
-                format!("{kind} \"\" matches only the root name; write \".\" to mean the root"),
-            )
+        let root = |matcher| (Weight::Problem, Said::MatchesOnlyRoot { matcher });
+        let never = |matcher, value: &str| {
+            let value = value.to_owned();
+            (Weight::Warning, Said::NeverMatches { matcher, value })
         };
-        let never = |kind: &str, value: &str| {
-            (Weight::Warning, format!("{kind} \"{value}\" never matches"))
-        };
-        let no_country = |kind: &str| {
-            (
-                Weight::Warning,
-                format!("{kind} with no country code never matches"),
-            )
-        };
+        let no_country = |matcher| (Weight::Warning, Said::NoCountryCode { matcher });
         let lists_nothing = |list: &str| split_upstreams(list).next().is_none();
         match self {
             Self::Request(matcher) => match matcher {
@@ -2414,10 +2455,9 @@ impl AnyMatcher<'_> {
                 {
                     Some((
                         Weight::Problem,
-                        format!(
-                            "response_txt_content in {} mode with an empty value matches every answer carrying a TXT record",
-                            mode.to_ascii_lowercase()
-                        ),
+                        Said::TxtEmptyMatchesEveryAnswer {
+                            mode: mode.to_ascii_lowercase(),
+                        },
                     ))
                 }
                 ResponseMatcher::UpstreamEquals { value } if lists_nothing(value) => {
@@ -2469,13 +2509,13 @@ fn rule_problems(
     rule: &Rule,
     settings: &GlobalSettings,
     pipelines: &rustc_hash::FxHashSet<&str>,
-    mut report: impl FnMut(String),
+    mut report: impl FnMut(Said),
 ) {
     // 同一条规则里一模一样的问题只报一次：比如两个经同一传输、都没写上游的 forward，同一个位置报两行一样的没有用
     // The same problem is raised once per rule: two forwards over one transport writing no
     // upstream, say, would give two identical lines at one place to no purpose
     let mut raised = Vec::new();
-    let mut report = |problem: String| {
+    let mut report = |problem: Said| {
         if !raised.contains(&problem) {
             raised.push(problem.clone());
             report(problem);
@@ -2504,7 +2544,7 @@ fn rule_problems(
 
     let merges = rule.merges();
     if merges && rule.shared_forward_ecs(settings).is_err() {
-        report(MERGED_ECS_DIFFER.to_string());
+        report(Said::ForwardEcsDiffer);
     }
     // 几个 forward 合成一次转发、其中有问得到地址的（写了地址的，或者没写、问 `default_upstream` 的）：写成空的那个只是
     // 被跳过，查询照样有上游作答
@@ -2537,9 +2577,7 @@ fn rule_problems(
             ..
         } = action
         {
-            report(format!(
-                "ecs ip \"{ip}\" is not an IP address, so no subnet is set and the client's own ECS, if any, goes upstream"
-            ));
+            report(Said::EcsIpNotIp { ip: ip.clone() });
         }
         match action {
             Action::Forward {
@@ -2548,7 +2586,7 @@ fn rule_problems(
                 ..
             } => {
                 if !upstreams.names_an_address() && !skipped_when_empty {
-                    report(NO_UPSTREAM.to_string());
+                    report(Said::NoUpstream);
                 }
                 for upstream in upstreams.upstreams() {
                     if let Some(problem) =
@@ -2575,27 +2613,27 @@ fn rule_problems(
                     if upstream_problem(upstream, Transport::Udp).is_none()
                         && let Some(problem) = upstream_problem(upstream, *transport)
                     {
-                        report(format!(
-                            "a forward writing no upstream asks settings.default_upstream over {}, and {problem}",
-                            transport.label()
-                        ));
+                        report(Said::DefaultUpstreamOver {
+                            transport: transport.label(),
+                            problem: Box::new(problem),
+                        });
                     }
                 }
             }
             Action::StaticResponse { rcode, .. }
                 if crate::matcher::parse_rcode(rcode).is_none() =>
             {
-                report(format!(
-                    "rcode \"{rcode}\" is none of NOERROR, FORMERR, SERVFAIL, NXDOMAIN, NOTIMP, REFUSED"
-                ));
+                report(Said::RcodeUnknown {
+                    rcode: rcode.clone(),
+                });
             }
             Action::StaticIpResponse { ip, .. } if static_ips(ip).is_none() => {
-                report(format!(
-                    "ip \"{ip}\" is not a comma-separated list of IP addresses"
-                ));
+                report(Said::StaticIpInvalid { ip: ip.clone() });
             }
             Action::StaticCnameResponse { target, .. } if static_cname_target(target).is_none() => {
-                report(format!("cname target \"{target}\" is not a domain name"));
+                report(Said::CnameTargetInvalid {
+                    target: target.clone(),
+                });
             }
             Action::StaticTxtResponse { text, .. } | Action::ReplaceTxtResponse { text, .. } => {
                 // 按最长的名字算（见 `txt_problem`）/ Reckoned with the longest name (see
@@ -2607,15 +2645,14 @@ fn rule_problems(
             // 以前写错的级别（比如大写的 `WARN`）悄悄当成 info / A misspelt level (an uppercase
             // `WARN`, say) used to pass for info
             Action::Log { level: Some(level) } if !LOG_LEVELS.contains(&level.as_str()) => {
-                report(format!(
-                    "log level \"{level}\" is none of {}",
-                    LOG_LEVELS.join(", ")
-                ));
+                report(Said::LogLevelUnknown {
+                    level: level.clone(),
+                });
             }
             Action::JumpToPipeline { pipeline } if !pipelines.contains(&**pipeline) => {
-                report(format!(
-                    "jump to pipeline \"{pipeline}\", which does not exist"
-                ));
+                report(Said::JumpTargetMissing {
+                    pipeline: pipeline.to_string(),
+                });
             }
             _ => {}
         }
@@ -3101,7 +3138,9 @@ mod validation_tests {
     }
 
     fn problems_of(config: serde_json::Value) -> Vec<String> {
-        super::problems(&super::parse_config(&config.to_string()).expect("parses"))
+        crate::notice::texts(&super::problems(
+            &super::parse_config(&config.to_string()).expect("parses"),
+        ))
     }
 
     /// 没设 bootstrap 时，写成主机名的 TCP、DoT、DoH、DoQ 上游算一条 warning：默认上游、请求和回答阶段的 forward 都算，
@@ -3125,7 +3164,11 @@ mod validation_tests {
                 .expect("compiles")
                 .warnings
                 .iter()
-                .any(|warning| warning.starts_with("settings.bootstrap: not set"))
+                .any(|warning| {
+                    warning
+                        .to_string()
+                        .starts_with("settings.bootstrap: not set")
+                })
         };
         let udp = serde_json::json!({ "default_upstream": "1.1.1.1:53" });
         let forward =
@@ -3195,7 +3238,9 @@ mod validation_tests {
                 }
             ] }]
         });
-        let warned = super::warnings(&super::parse_config(&config.to_string()).expect("parses"));
+        let warned = crate::notice::texts(&super::warnings(
+            &super::parse_config(&config.to_string()).expect("parses"),
+        ));
         assert_eq!(
             warned,
             [
@@ -3336,7 +3381,7 @@ mod validation_tests {
         assert!(
             !super::warnings(&parsed)
                 .iter()
-                .any(|warning| warning.contains("comes back round")),
+                .any(|warning| warning.to_string().contains("comes back round")),
             "a jump to a pipeline that does not exist is a problem, not a circle"
         );
     }
@@ -3366,7 +3411,7 @@ mod validation_tests {
             });
             super::warnings(&super::parse_config(&config.to_string()).expect("parses"))
                 .into_iter()
-                .filter(|warning| warning.contains("comes back round"))
+                .filter(|warning| warning.to_string().contains("comes back round"))
                 .count()
         };
         let any = serde_json::json!([{ "type": "any" }]);
@@ -3461,6 +3506,7 @@ mod validation_tests {
             });
             super::warnings(&super::parse_config(&config.to_string()).expect("parses"))
                 .into_iter()
+                .map(|warning| warning.to_string())
                 .filter(|warning| warning.contains("comes back round"))
                 .collect::<Vec<_>>()
         };
@@ -3770,9 +3816,11 @@ mod validation_tests {
                 settings: settings(u64::MAX, Some(request_timeout_ms)),
                 ..serde_json::from_value::<super::PipelineConfig>(serde_json::json!({})).unwrap()
             };
-            super::warnings(&config)
-                .iter()
-                .any(|warning| warning.starts_with("settings.request_timeout_ms:"))
+            super::warnings(&config).iter().any(|warning| {
+                warning
+                    .to_string()
+                    .starts_with("settings.request_timeout_ms:")
+            })
         };
         assert!(warned(u64::MAX - 1));
         assert!(!warned(u64::MAX));
@@ -4008,7 +4056,7 @@ mod validation_tests {
         });
         let parsed = super::parse_config(&config.to_string()).expect("parses");
         assert_eq!(
-            super::problems(&parsed),
+            crate::notice::texts(&super::problems(&parsed)),
             [
                 "pipeline_select[0].matchers[1]: geo_site_not \"\" matches every name",
                 "pipelines[0].rules[0].matchers[1]: domain_suffix \".\" matches every name",
@@ -4018,7 +4066,7 @@ mod validation_tests {
             ]
         );
         assert_eq!(
-            super::warnings(&parsed),
+            crate::notice::texts(&super::warnings(&parsed)),
             [
                 "pipeline_select[0].matchers[0]: listener_label \"\" never matches",
                 "pipelines[0].rules[0].matchers[0]: geo_site \"\" never matches",
@@ -4129,7 +4177,7 @@ mod validation_tests {
             });
             let parsed = super::parse_config(&config.to_string()).expect("parses");
             assert_eq!(
-                super::problems(&parsed),
+                crate::notice::texts(&super::problems(&parsed)),
                 [format!(
                     "settings.{setting}: {over} is more than {most}, the most it may be; startup uses {most} instead"
                 )]
@@ -4245,7 +4293,10 @@ mod validation_tests {
             parsed.pipelines[0].rules[0].actions[0],
             super::Action::Forward { upstream: None, .. }
         ));
-        assert_eq!(super::problems(&parsed), Vec::<String>::new());
+        assert_eq!(
+            crate::notice::texts(&super::problems(&parsed)),
+            Vec::<String>::new()
+        );
 
         let engine = crate::engine::test_support::engine_from(config);
         let mut query = hickory_proto::op::Message::new(
@@ -4430,7 +4481,10 @@ mod validation_tests {
                 { "type": "forward", "upstream": "" },
                 { "type": "forward" }
             ]))),
-            [format!("pipelines[0].rules[0]: {}", super::NO_UPSTREAM)]
+            [format!(
+                "pipelines[0].rules[0]: {}",
+                super::Said::NoUpstream
+            )]
         );
     }
 
@@ -4979,7 +5033,9 @@ mod validation_tests {
         );
         assert_eq!(
             super::Problems::of(&err),
-            super::problems(&super::parse_config(&config.to_string()).unwrap())
+            crate::notice::texts(&super::problems(
+                &super::parse_config(&config.to_string()).unwrap()
+            ))
         );
         assert_eq!(super::Problems::of(&err).len(), 2);
     }
@@ -5076,12 +5132,12 @@ mod validation_tests {
         });
         let parsed = super::parse_config(&config.to_string()).expect("parses");
         assert_eq!(
-            super::problems(&parsed),
+            crate::notice::texts(&super::problems(&parsed)),
             ["pipelines[0].rules[0].matchers[0]: geo_site_not \"\" matches every name"]
         );
         let runtime = crate::matcher::RuntimePipelineConfig::from_config(parsed).expect("compiles");
         assert_eq!(
-            runtime.warnings,
+            crate::notice::texts(&runtime.warnings),
             [
                 "settings.geosite_data_paths: empty, so the GeoSite tags cn have no data to match against: geo_site never matches them and geo_site_not always does"
             ]

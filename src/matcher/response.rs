@@ -102,7 +102,7 @@ fn try_parse_upstream_ip(upstream: &str) -> Option<IpAddr> {
 }
 
 impl RuntimeResponseMatcher {
-    pub fn from_config(m: config::ResponseMatcher) -> anyhow::Result<Self> {
+    pub fn from_config(m: config::ResponseMatcher) -> Result<Self, Said> {
         Ok(match m {
             config::ResponseMatcher::UpstreamEquals { value } => {
                 RuntimeResponseMatcher::UpstreamEquals {
@@ -192,10 +192,9 @@ impl RuntimeResponseMatcher {
                         // so it compiles as written
                         const MAX_TXT_REGEX_LEN: usize = 1000;
                         regex_within(&value, MAX_TXT_REGEX_LEN)?;
-                        Some(
-                            limited_regex(&value)
-                                .map_err(|e| anyhow::anyhow!("invalid regex: {}", e))?,
-                        )
+                        Some(limited_regex(&value).map_err(|err| Said::TxtRegexInvalid {
+                            error: err.to_string(),
+                        })?)
                     }
                     _ => None,
                 };
@@ -440,7 +439,7 @@ mod txt_regex_tests {
     use super::RuntimeResponseMatcher;
     use crate::matcher::{GeoManagers, RequestFacts};
 
-    fn built(pattern: &str) -> anyhow::Result<RuntimeResponseMatcher> {
+    fn built(pattern: &str) -> Result<RuntimeResponseMatcher, crate::notice::Said> {
         RuntimeResponseMatcher::from_config(crate::config::ResponseMatcher::ResponseTxtContent {
             mode: "regex".to_string(),
             value: pattern.to_string(),

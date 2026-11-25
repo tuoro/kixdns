@@ -505,7 +505,7 @@ impl Engine {
             observer.config_reload_failed(&ConfigReloadFailed {
                 path,
                 error: &format!("{error:#}"),
-                problems: crate::config::Problems::of(error),
+                problems: crate::config::Problems::coded(error),
             });
         }
     }

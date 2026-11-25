@@ -126,7 +126,7 @@ fn txt_problem_counts_length_bytes_against_the_whole_message() {
     assert_eq!(txt_problem(&text_of_rdata(ROOM)), None);
     assert!(txt_problem(&text_of_rdata(ROOM + 1)).is_some());
     assert!(txt_problem(&vec!["a".repeat(255); 256]).is_some());
-    let long_segment = txt_problem(&["a".repeat(256)]).unwrap();
+    let long_segment = txt_problem(&["a".repeat(256)]).unwrap().to_string();
     assert!(
         long_segment.contains("segment of 256 bytes"),
         "{long_segment}"
@@ -142,7 +142,7 @@ fn txt_problem_counts_length_bytes_against_the_whole_message() {
 #[test]
 fn the_configuration_check_names_a_txt_some_answer_cannot_hold() {
     let problems = |text: Vec<String>| {
-        crate::config::problems(
+        crate::notice::texts(&crate::config::problems(
             &serde_json::from_value(json!({
                 "settings": { "default_upstream": "192.0.2.53:53" },
                 "pipelines": [{ "id": "main", "rules": [
@@ -160,7 +160,7 @@ fn the_configuration_check_names_a_txt_some_answer_cannot_hold() {
                 ]}]
             }))
             .unwrap(),
-        )
+        ))
     };
     assert_eq!(problems(text_of_rdata(ROOM)), Vec::<String>::new());
     for text in [text_of_rdata(ROOM + 1), vec!["a".repeat(255); 256]] {
@@ -343,13 +343,13 @@ async fn a_txt_with_no_string_is_a_problem_and_servfail() {
         ])
     };
     let problems = |text: Value| {
-        crate::config::problems(
+        crate::notice::texts(&crate::config::problems(
             &serde_json::from_value(json!({
                 "settings": { "default_upstream": "192.0.2.53:53" },
                 "pipelines": [{ "id": "main", "rules": rules(text) }]
             }))
             .unwrap(),
-        )
+        ))
     };
     let said =
         r#"text names no string; a TXT record holds at least one, write "" for an empty one"#;

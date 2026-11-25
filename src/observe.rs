@@ -632,9 +632,11 @@ pub struct ConfigLoaded<'a> {
     /// [`crate::config::GlobalSettings::restart_pending`]）；初始配置时为空。
     pub restart_pending: &'a [&'static str],
     /// What this configuration writes that loads all the same yet is worth knowing,
-    /// such as settings no longer in effect (see [`crate::config::warnings`]).
-    /// 这份配置照样加载、值得知道的写法，比如不再起作用的设置（见 [`crate::config::warnings`]）。
-    pub warnings: &'a [String],
+    /// such as settings no longer in effect (see [`crate::config::warnings`]), each with its
+    /// code (see [`crate::notice::Notice`]).
+    /// 这份配置照样加载、值得知道的写法，比如不再起作用的设置（见 [`crate::config::warnings`]），各带代号（见
+    /// [`crate::notice::Notice`]）。
+    pub warnings: &'a [crate::notice::Notice],
     /// The pipelines of this configuration, by id as
     /// [`EngineObserver::pipeline_selected`] names them: `default` alone for one
     /// with no pipelines. With [`Self::rules`] and [`Self::upstreams`] it lets an
@@ -665,12 +667,12 @@ pub struct ConfigReloadFailed<'a> {
     pub error: &'a str,
     /// What the reload refused the configuration for (its problems, the
     /// listener addresses and DoH prerequisites, settings that make no sense,
-    /// matchers that do not compile), a sentence each, all of them (see
-    /// `config::Problems`); `error` holds them joined. Empty when the reload
+    /// matchers that do not compile), a sentence each with its code, all of them
+    /// (see `config::Problems`); `error` holds them joined. Empty when the reload
     /// failed for another reason (the file unreadable, say).
-    /// 重载拒掉配置的原因（配置问题、监听地址和 DoH 的前提、说不通的设置、编译不了的匹配器），每条一句，一条不落
-    /// （见 `config::Problems`）；`error` 是它们连起来的一句。因为别的原因失败时（比如文件读不了）为空。
-    pub problems: &'a [String],
+    /// 重载拒掉配置的原因（配置问题、监听地址和 DoH 的前提、说不通的设置、编译不了的匹配器），每条一句，各带代号，一条
+    /// 不落（见 `config::Problems`）；`error` 是它们连起来的一句。因为别的原因失败时（比如文件读不了）为空。
+    pub problems: &'a [crate::notice::Notice],
 }
 
 /// Observer that ignores every event. Installing it is equivalent to

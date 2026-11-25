@@ -18,7 +18,6 @@ use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-use anyhow::Context;
 use hickory_proto::op::{Message, ResponseCode};
 use hickory_proto::rr::{DNSClass, RecordType};
 use ipnet::IpNet;
@@ -26,6 +25,7 @@ use regex::{Regex, RegexBuilder};
 use rustc_hash::FxHashMap;
 
 use crate::config::{self, Action, MatchOperator, PipelineConfig};
+use crate::notice::{Notice, Said};
 
 // ============================================================================
 // TXT Match Mode / TXT 匹配模式
@@ -45,15 +45,12 @@ pub enum TxtMatchMode {
 impl TxtMatchMode {
     /// 从字符串解析匹配模式 / Parse match mode from string
     #[allow(clippy::should_implement_trait)]
-    pub fn from_str(s: &str) -> anyhow::Result<Self> {
+    pub fn from_str(s: &str) -> Result<Self, Said> {
         match s.to_lowercase().as_str() {
             "exact" => Ok(TxtMatchMode::Exact),
             "prefix" => Ok(TxtMatchMode::Prefix),
             "regex" => Ok(TxtMatchMode::Regex),
-            _ => anyhow::bail!(
-                "invalid TXT match mode: {}, must be one of: exact, prefix, regex",
-                s
-            ),
+            _ => Err(Said::TxtModeUnknown { mode: s.to_owned() }),
         }
     }
 }
@@ -239,7 +236,7 @@ pub struct RuntimePipelineConfig {
     /// What this configuration writes that loads all the same yet is worth knowing (see
     /// [`config::warnings`]), found as it compiles: the validation answer, the log as it takes
     /// effect and `ConfigLoaded` all take them from here
-    pub warnings: Vec<String>,
+    pub warnings: Vec<Notice>,
 }
 
 #[derive(Debug, Clone)]
@@ -494,16 +491,16 @@ pub struct RuntimePipelineSelectorMatcherWithOp {
     pub matcher: RuntimePipelineSelectorMatcher,
 }
 
-/// 编好的 `compiled`；编不了时为 None，`refused` 记一条开头写着它在哪（`place`）的错误
-/// What `compiled` holds; None when it could not be compiled, `refused` noting an error starting
-/// with where it is (`place`)
+/// 编好的 `compiled`；编不了时为 None，`refused` 记一条说它在哪（`place`）、为什么编不了的问题
+/// What `compiled` holds; None when it could not be compiled, `refused` noting a problem saying
+/// where it is (`place`) and why it does not compile
 fn compiled<T>(
-    refused: &mut Vec<String>,
+    refused: &mut Vec<Notice>,
     place: std::fmt::Arguments<'_>,
-    compiled: anyhow::Result<T>,
+    compiled: Result<T, Said>,
 ) -> Option<T> {
     compiled
-        .map_err(|err| refused.push(format!("{place}: {err:#}")))
+        .map_err(|said| refused.push(Notice::at(place.to_string(), said)))
         .ok()
 }
 
@@ -776,7 +773,7 @@ pub(crate) const MAX_REGEX_LEN: usize = 16 * 1024;
 
 /// 逗号分隔的 CIDR 列表，空项跳过，每项按 [`canonical_net`] 读
 /// A comma-separated CIDR list, empty items skipped, each read by [`canonical_net`]
-fn cidr_list(cidr: &str) -> anyhow::Result<Vec<IpNet>> {
+fn cidr_list(cidr: &str) -> Result<Vec<IpNet>, Said> {
     cidr.split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -793,10 +790,13 @@ fn cidr_list(cidr: &str) -> anyhow::Result<Vec<IpNet>> {
 /// answer or of the answering upstream by the IPv4 address it names (see `matcher_helpers`),
 /// so a network written in the IPv4-mapped form (`::ffff:a.b.c.d/n`, n of 96 or more)
 /// becomes the IPv4 network it names.
-fn canonical_net(cidr: &str) -> anyhow::Result<IpNet> {
+fn canonical_net(cidr: &str) -> Result<IpNet, Said> {
     let net: IpNet = cidr
         .parse()
-        .with_context(|| format!("\"{cidr}\" is not an IP network"))?;
+        .map_err(|err: ipnet::AddrParseError| Said::NetworkInvalid {
+            value: cidr.to_owned(),
+            error: err.to_string(),
+        })?;
     if let IpNet::V6(v6) = net
         && let Some(v4) = v6.network().to_ipv4_mapped()
         && let Some(prefix) = v6.prefix_len().checked_sub(96)
@@ -808,13 +808,11 @@ fn canonical_net(cidr: &str) -> anyhow::Result<IpNet> {
 }
 
 impl RuntimeMatcher {
-    fn from_config(m: config::Matcher) -> anyhow::Result<Self> {
+    fn from_config(m: config::Matcher) -> Result<Self, Said> {
         Ok(match m {
             config::Matcher::Any => RuntimeMatcher::Any,
             // 规则看不到是哪个入口收的查询 / A rule does not see which entry took the query
-            config::Matcher::ListenerLabel { .. } => {
-                anyhow::bail!("listener_label works in pipeline_select only")
-            }
+            config::Matcher::ListenerLabel { .. } => return Err(Said::ListenerLabelOutsideSelect),
             config::Matcher::DomainSuffix { value } => RuntimeMatcher::DomainSuffix {
                 value: domain_value(&value),
             },
@@ -978,7 +976,7 @@ impl GeoManagers {
 }
 
 impl RuntimePipelineSelectorMatcher {
-    fn from_config(m: config::Matcher) -> anyhow::Result<Self> {
+    fn from_config(m: config::Matcher) -> Result<Self, Said> {
         match m {
             config::Matcher::ListenerLabel { value } => Ok(Self::ListenerLabel {
                 value: Arc::from(value),
@@ -1043,13 +1041,13 @@ pub fn eval_match_chain<T>(
     acc
 }
 
-fn parse_dns_class(v: &str) -> anyhow::Result<DNSClass> {
+fn parse_dns_class(v: &str) -> Result<DNSClass, Said> {
     let upper = v.to_ascii_uppercase();
     let parsed = match upper.as_str() {
         "IN" => DNSClass::IN,
         "CH" | "CHAOS" => DNSClass::CH,
         "HS" => DNSClass::HS,
-        _ => anyhow::bail!("unsupported qclass: {upper}"),
+        _ => return Err(Said::QclassUnknown { qclass: upper }),
     };
     Ok(parsed)
 }
@@ -1097,7 +1095,7 @@ pub(crate) fn static_cname_target(target: &str) -> Option<hickory_proto::rr::Nam
 /// rule like "answer HTTPS queries with NODATA" could not be written and the whole
 /// configuration was refused; going over to `from_str` then lost OPT, one of those ten, and a
 /// configuration writing it failed to start after the upgrade
-fn parse_dns_type(v: &str) -> anyhow::Result<RecordType> {
+fn parse_dns_type(v: &str) -> Result<RecordType, Said> {
     let upper = v.to_ascii_uppercase();
     if let Some(code) = upper
         .strip_prefix("TYPE")
@@ -1112,7 +1110,7 @@ fn parse_dns_type(v: &str) -> anyhow::Result<RecordType> {
                 !matches!(known, RecordType::Unknown(_)) && <&str>::from(*known) == upper
             })
         })
-        .ok_or_else(|| anyhow::anyhow!("unsupported qtype: {upper}"))
+        .ok_or(Said::QtypeUnknown { qtype: upper })
 }
 
 #[cfg(test)]
@@ -1340,7 +1338,7 @@ mod tests {
             all.as_object_mut()
                 .unwrap()
                 .extend(settings.as_object().unwrap().clone());
-            runtime_of(serde_json::json!({
+            let runtime = runtime_of(serde_json::json!({
                 "settings": all,
                 "pipeline_select": [{
                     "pipeline": "main",
@@ -1354,8 +1352,8 @@ mod tests {
                     "response_actions_on_match": [{ "type": "allow" }]
                 }] }]
             }))
-            .expect("build runtime config")
-            .warnings
+            .expect("build runtime config");
+            crate::notice::texts(&runtime.warnings)
         };
         let geosite = "settings.geosite_data_paths: empty, so the GeoSite tags ads, cn have no data to match against: geo_site never matches them and geo_site_not always does";
         assert_eq!(
@@ -1876,7 +1874,7 @@ mod tests {
         ] {
             assert_eq!(domain_regex_matchers(pattern)("ads.example"), [false; 3]);
             for (config, (place, kind)) in domain_regex_configs(pattern).into_iter().zip(places) {
-                let warnings = runtime_of(config).unwrap().warnings;
+                let warnings = crate::notice::texts(&runtime_of(config).unwrap().warnings);
                 assert_eq!(
                     warnings,
                     [format!(

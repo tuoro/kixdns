@@ -8,6 +8,7 @@ use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
 use std::net::IpAddr;
 
 use crate::matcher::advanced_rule::{StaticAnswer, StaticRecords};
+use crate::notice::Said;
 use crate::proto_utils::received_ttl;
 
 /// 照查询 `packet`（问 `qname` 的 `qtype`、`qclass`）写的静态应答，RCODE 为 `rcode`、带着 `answers`：先照线上格式写（见
@@ -240,26 +241,22 @@ const TXT_ROOM: usize = MAX_MESSAGE - (12 + MAX_NAME + 4 + 2 + 10 + 11 + 24);
 /// length byte) is over [`TXT_ROOM`]. The configuration check reports it (see
 /// `config::problems`) and the answer is compiled to SERVFAIL (see `StaticAnswer::txt`), so a
 /// TXT compiled fits and reads whatever is asked
-pub(crate) fn txt_problem(text: &[String]) -> Option<String> {
+pub(crate) fn txt_problem(text: &[String]) -> Option<Said> {
     if text.is_empty() {
-        return Some(
-            r#"text names no string; a TXT record holds at least one, write "" for an empty one"#
-                .to_owned(),
-        );
+        return Some(Said::TxtNoString);
     }
     if let Some(segment) = text.iter().find(|segment| segment.len() > MAX_TXT_SEGMENT) {
-        return Some(format!(
-            "a TXT segment of {} bytes is longer than {MAX_TXT_SEGMENT}",
-            segment.len()
-        ));
+        return Some(Said::TxtSegmentTooLong {
+            bytes: segment.len(),
+            most: MAX_TXT_SEGMENT,
+        });
     }
     let rdata = text.iter().fold(0usize, |total, segment| {
         total.saturating_add(segment.len() + 1)
     });
-    (rdata > TXT_ROOM).then(|| {
-        format!(
-            "TXT content takes {rdata} bytes in its record (one length byte per segment), more than the {TXT_ROOM} that fit in an answer"
-        )
+    (rdata > TXT_ROOM).then_some(Said::TxtTooLong {
+        bytes: rdata,
+        most: TXT_ROOM,
     })
 }
 
