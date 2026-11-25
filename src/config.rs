@@ -32,11 +32,12 @@ pub struct PipelineConfig {
     pub background_refresh_rule: Option<Rule>,
 
     /// 配置里写了、内核却不读的键，解析时找出来（见 [`unread_keys`]），写成 `pipelines[0].rules[2].matcher`、
-    /// `pipelines[0].rules[2].actions[0].upstrem` 这样的路径，按写的顺序排。退役的旧设置（见 [`RETIRED_SETTINGS`]）只记
-    /// warn，其余的算 [`problems`]
+    /// `pipelines[0].rules[2].actions[0].upstrem` 这样的路径，按写的顺序排；顶层留给面板的块（见 [`PANEL_BLOCK`]）不在内。
+    /// 退役的旧设置（见 [`RETIRED_SETTINGS`]）只记 warn，其余的算 [`problems`]
     /// The keys a configuration writes that the kernel does not read, found while parsing (see
     /// [`unread_keys`]), as paths like `pipelines[0].rules[2].matcher` and
-    /// `pipelines[0].rules[2].actions[0].upstrem`, in the order written. Retired settings (see
+    /// `pipelines[0].rules[2].actions[0].upstrem`, in the order written; the top-level block kept
+    /// for the panel (see [`PANEL_BLOCK`]) is not among them. Retired settings (see
     /// [`RETIRED_SETTINGS`]) only get a warn, and the rest count among [`problems`]
     #[serde(skip)]
     pub unread_keys: Vec<String>,
@@ -1932,8 +1933,22 @@ fn unread_keys(raw: &str, read: &serde_json::Value) -> serde_json::Result<Vec<St
         found: &mut found,
     }
     .deserialize(&mut serde_json::Deserializer::from_str(raw))?;
+    // 路径正好是它的只有顶层那个键，别处的同名键前面带着上一层的路径 / Only the top-level key has
+    // exactly this path, one of the same name elsewhere being led by the path above it
+    found.retain(|key| key != PANEL_BLOCK);
     Ok(found)
 }
+
+/// 配置顶层留给面板的块：KixDNS 面板把自己的界面模型存在这个键下，和配置写在同一个文件里。内核不读它，不算不读的键（见
+/// [`unread_keys`]），也就不算 [`problems`]、[`warnings`]；它也不进缓存的命名空间，只改了它的保存照常重载（配置的
+/// sha256 跟着变），缓存不换代。只有顶层的算，写在别处的同名键照旧是不读的键
+/// The top-level block kept for the panel: the KixDNS panel keeps its own interface model under
+/// this key, in the same file as the configuration. The kernel does not read it, nor count it
+/// among the keys not read (see [`unread_keys`]), so it is in neither [`problems`] nor
+/// [`warnings`]; nor does it go into any cache namespace, a save changing it alone reloading as
+/// usual (the configuration's sha256 following) with the caches kept. Only the top level's
+/// counts, a key of that name anywhere else still being one not read
+const PANEL_BLOCK: &str = "panel";
 
 /// 照着读出来的配置里对应的那一块（`read`）走一遍写下的一个值，`path` 是它的路径：对象的键用点隔开，数组的下标写在
 /// 方括号里（从 0 数）
@@ -3856,6 +3871,56 @@ mod validation_tests {
                 "pipelines[0].rules[0].response_matchers[0].values",
                 "pipelines[0].rules[0].response_actions_on_match[0].upstream",
             ]
+        );
+    }
+
+    /// 顶层的 `panel` 留给面板（见 [`super::PANEL_BLOCK`]）：校验照收，不算问题、也不算 warning，缓存的命名空间和没写它时
+    /// 一样；写在别处的 `panel` 照旧是不读的键。以前顶层的也算一条问题，面板的每次保存都被拒
+    /// The top-level `panel` is kept for the panel (see [`super::PANEL_BLOCK`]): validation takes
+    /// it, as neither a problem nor a warning, and the cache namespaces are those without it; a
+    /// `panel` written anywhere else is still a key not read. The top-level one used to count as
+    /// a problem too, every save from the panel refused
+    #[test]
+    fn the_top_level_panel_block_is_left_to_the_panel() {
+        let without = serde_json::json!({
+            "settings": { "default_upstream": "1.1.1.1:53" },
+            "pipelines": [{ "id": "main", "rules": [
+                rule("r", serde_json::json!([{ "type": "any" }]), serde_json::json!([{ "type": "allow" }]))
+            ]}]
+        });
+        let mut with = without.clone();
+        with["panel"] = serde_json::json!({
+            "schema": 1,
+            "settings": { "bind_udp": 53, "upstrem": "x" },
+            "rules": [{ "name": "r", "panel": true }]
+        });
+        let report = validate(&with.to_string()).expect("the panel's block is taken");
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        assert!(problems_of(with.clone()).is_empty());
+        let namespaces = |config: &serde_json::Value| {
+            let parsed = super::parse_config(&config.to_string()).expect("parses");
+            crate::engine::types::build_cache_namespaces(&super::compile(parsed).expect("compiles"))
+        };
+        assert_eq!(namespaces(&with), namespaces(&without));
+
+        let mut nested = with;
+        nested["settings"]["panel"] = serde_json::json!({});
+        nested["pipelines"][0]["panel"] = serde_json::json!({});
+        nested["pipelines"][0]["rules"][0]["panel"] = serde_json::json!(true);
+        let found = problems_of(nested);
+        let unread: Vec<&str> = found
+            .iter()
+            .filter_map(|problem| problem.split_once(": the kernel does not read this key"))
+            .map(|(key, _)| key)
+            .collect();
+        assert_eq!(
+            unread,
+            [
+                "pipelines[0].panel",
+                "pipelines[0].rules[0].panel",
+                "settings.panel"
+            ],
+            "{found:#?}"
         );
     }
 

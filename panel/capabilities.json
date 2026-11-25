@@ -2,6 +2,7 @@
   "schema_version": 1,
   "config_capabilities": [
     "config_query_stats_v1",
-    "config_static_cname_response_v1"
+    "config_static_cname_response_v1",
+    "config_panel_block_v1"
   ]
 }
