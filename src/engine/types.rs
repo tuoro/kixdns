@@ -4,7 +4,7 @@ use crate::ecs::EcsKey;
 use crate::engine::Engine;
 use crate::matcher::{
     GeoManagers, Requester, RequesterKey, ResponsePhase, RuntimeMatcher, RuntimePipeline,
-    RuntimePipelineConfig, RuntimeResponseMatcher,
+    RuntimePipelineConfig, RuntimeResponseMatcher, RuntimeRule,
 };
 use crate::proto_utils::QueryFlags;
 use bytes::Bytes;
@@ -595,21 +595,45 @@ fn hash_global_settings_semantics(settings: &GlobalSettings, hasher: &mut impl H
 /// leaves the caches alone. Both used to count on their own, so changing an `ecs` that did
 /// nothing dropped the whole cache
 fn hash_pipeline_semantics(pipeline: &RuntimePipeline, hasher: &mut impl Hasher) {
-    pipeline.id.hash(hasher);
-    pipeline.rules.len().hash(hasher);
-    for rule in &pipeline.rules {
-        rule.name.hash(hasher);
-        rule.matchers.len().hash(hasher);
-        for matcher in rule.matchers.iter() {
+    let RuntimePipeline {
+        id,
+        rules,
+        // 都由规则得出：这个 pipeline 的，和 `answered_through` 里的 pipeline 的（那些另算进来，见
+        // `build_cache_namespaces`），算了规则就算了它们
+        // All derive from rules, this pipeline's and those of the pipelines in
+        // `answered_through` (which count on their own, see `build_cache_namespaces`), and
+        // count through them
+        index: _,
+        last_precomputed: _,
+        requester: _,
+        rule_requester: _,
+        matches_regex: _,
+        geo_data: _,
+        answered_through: _,
+    } = pipeline;
+    id.hash(hasher);
+    rules.len().hash(hasher);
+    for rule in rules {
+        let RuntimeRule {
+            name,
+            matchers,
+            actions,
+            response_phase,
+            // 由 `actions` 得出 / Derives from `actions`
+            merged_forward: _,
+        } = rule;
+        name.hash(hasher);
+        matchers.len().hash(hasher);
+        for matcher in matchers {
             hash_match_operator(matcher.operator, hasher);
             hash_runtime_matcher(&matcher.matcher, hasher);
         }
-        rule.actions.len().hash(hasher);
-        for action in &rule.actions {
+        actions.len().hash(hasher);
+        for action in actions {
             hash_action(action, hasher);
         }
         let (response_matchers, on_match, on_miss) =
-            ResponsePhase::parts(rule.response_phase.as_deref());
+            ResponsePhase::parts(response_phase.as_deref());
         response_matchers.len().hash(hasher);
         for matcher in response_matchers {
             hash_match_operator(matcher.operator, hasher);
@@ -652,11 +676,15 @@ fn hash_ecs_mode(mode: Option<&EcsMode>, hasher: &mut impl Hasher) {
     }
 }
 
-/// 每个动作的字段都写全：新加的字段不说清进不进命名空间就编不过。编好的应答（`answer`）是由写出来的那几项得出的，
-/// 算了那几项就算了它
-/// Every action's fields are spelled out, so a field added later does not compile without
-/// saying whether it enters the namespace. The compiled answer (`answer`) derives from the
-/// fields written, and counts through them
+/// 这个和后面的 `hash_runtime_matcher`、`hash_runtime_response_matcher` 都把每个变体的字段写全：新加的字段不说清进不进
+/// 命名空间就编不过。编好的部分由写出来的那几项得出，算了那几项就算了它们：动作编好的应答（`answer`），`upstream_equals`
+/// 拆好的地址（`addresses`，由 `value` 得出），`response_txt_content` 编好的正则（`regex`，由 `mode` 和 `value` 得出）
+/// This and `hash_runtime_matcher` and `hash_runtime_response_matcher` after it spell out
+/// every variant's fields, so a field added later does not compile without saying whether it
+/// enters the namespace. What is compiled derives from the fields written and counts through
+/// them: an action's compiled answer (`answer`), the addresses `upstream_equals` splits
+/// (`addresses`, from `value`), the regex `response_txt_content` compiles (`regex`, from
+/// `mode` and `value`)
 fn hash_action(action: &Action, hasher: &mut impl Hasher) {
     discriminant(action).hash(hasher);
     match action {
@@ -716,7 +744,10 @@ fn hash_runtime_matcher(matcher: &RuntimeMatcher, hasher: &mut impl Hasher) {
 fn hash_runtime_response_matcher(matcher: &RuntimeResponseMatcher, hasher: &mut impl Hasher) {
     discriminant(matcher).hash(hasher);
     match matcher {
-        RuntimeResponseMatcher::UpstreamEquals { value, .. }
+        RuntimeResponseMatcher::UpstreamEquals {
+            value,
+            addresses: _,
+        }
         | RuntimeResponseMatcher::RequestDomainSuffix { value }
         | RuntimeResponseMatcher::RequestDomainExact { value }
         | RuntimeResponseMatcher::ResponseRequestDomainGeoSite { value }
@@ -732,7 +763,11 @@ fn hash_runtime_response_matcher(matcher: &RuntimeResponseMatcher, hasher: &mut 
         RuntimeResponseMatcher::ResponseAnswerIpGeoipCountry { country_codes } => {
             country_codes.hash(hasher)
         }
-        RuntimeResponseMatcher::ResponseTxtContent { mode, value, .. } => {
+        RuntimeResponseMatcher::ResponseTxtContent {
+            mode,
+            value,
+            regex: _,
+        } => {
             discriminant(mode).hash(hasher);
             value.hash(hasher);
         }
@@ -784,6 +819,105 @@ mod tests {
         });
         let config: PipelineConfig = serde_json::from_value(raw).expect("parse config");
         RuntimePipelineConfig::from_config(config).expect("build runtime config")
+    }
+
+    /// 一份写了每种请求匹配器、回答匹配器和动作，合并转发和回答检查跳转的配置，命名空间钉成定值：只改哈希的写法、不改算进
+    /// 去什么的改动（比如把字段写全）不能让它们变。长度按本机字节序的 usize 算进去，这两个数只对 64 位小端成立；换了 Rust
+    /// 或依赖的版本，`DefaultHasher` 和各类型的 `Hash` 也可能算出别的数，核对过只是这个缘故再改
+    /// A configuration writing every kind of request matcher, response matcher and action, a
+    /// merged forward and an answer check's jump has its namespaces pinned: a change to how the
+    /// hashing is written that leaves what goes into it alone (spelling the fields out, say)
+    /// cannot move them. Lengths go in as native-endian usizes, so the two numbers hold on
+    /// 64-bit little-endian targets alone; another Rust or dependency version may give other
+    /// numbers through `DefaultHasher` and the types' `Hash` too, and once that is checked to be
+    /// the only cause they change
+    #[cfg(all(target_pointer_width = "64", target_endian = "little"))]
+    #[test]
+    fn the_namespaces_of_a_configuration_writing_everything_are_pinned() {
+        let config: PipelineConfig = serde_json::from_value(serde_json::json!({
+            "settings": { "default_upstream": "1.1.1.1:53", "min_ttl": 30 },
+            "pipelines": [
+                { "id": "main", "rules": [
+                    {
+                        "name": "request",
+                        "matchers": [
+                            { "type": "any" },
+                            { "type": "domain_suffix", "value": "example.com" },
+                            { "type": "domain_exact", "value": "www.example.com" },
+                            { "type": "domain_regex", "value": "^api[0-9]+\\.example\\.com$" },
+                            { "type": "client_ip", "cidr": "192.0.2.0/24", "operator": "or" },
+                            { "type": "geoip_country", "country_codes": ["CN", "US"] },
+                            { "type": "geoip_private", "expect": true },
+                            { "type": "qclass", "value": "IN" },
+                            { "type": "edns_present", "expect": false, "operator": "not" },
+                            { "type": "geo_site", "value": "cn" },
+                            { "type": "geo_site_not", "value": "ads" },
+                            { "type": "qtype", "value": "AAAA" }
+                        ],
+                        "matcher_operator": "and",
+                        "actions": [
+                            { "type": "log", "level": "info" },
+                            { "type": "replace_txt_response", "text": "t" },
+                            { "type": "forward", "upstream": "8.8.8.8:53, tcp://8.8.4.4:53", "transport": "tcp_udp",
+                              "ecs": { "mode": "from_client_ip", "prefix_v4": 24, "prefix_v6": 56 } },
+                            { "type": "forward", "upstream": "doh://dns.example/dns-query",
+                              "ecs": { "mode": "static", "ip": "198.51.100.0", "prefix": 24 } }
+                        ],
+                        "response_matchers": [
+                            { "type": "upstream_equals", "value": "udp:8.8.8.8:53, 8.8.4.4:53" },
+                            { "type": "request_domain_suffix", "value": "example.com" },
+                            { "type": "request_domain_exact", "value": "www.example.com" },
+                            { "type": "request_domain_regex", "value": "^www\\." },
+                            { "type": "response_upstream_ip", "cidr": "8.8.8.0/24" },
+                            { "type": "response_answer_ip", "cidr": "203.0.113.0/24" },
+                            { "type": "response_type", "value": "A" },
+                            { "type": "response_rcode", "value": "NXDOMAIN" },
+                            { "type": "response_qclass", "value": "IN" },
+                            { "type": "response_edns_present", "expect": true },
+                            { "type": "response_answer_ip_geoip_country", "country_codes": "CN" },
+                            { "type": "response_answer_ip_geoip_private", "expect": false },
+                            { "type": "response_request_domain_geo_site", "value": "cn" },
+                            { "type": "response_request_domain_geo_site_not", "value": "ads" },
+                            { "type": "response_txt_content", "mode": "regex", "value": "^v=spf1" },
+                            { "type": "response_txt_content", "mode": "prefix", "value": "v=" }
+                        ],
+                        "response_matcher_operator": "or",
+                        "response_actions_on_match": [
+                            { "type": "static_txt_response", "text": ["a", "b"], "ttl": 60 },
+                            { "type": "static_cname_response", "target": "cname.example.com" }
+                        ],
+                        "response_actions_on_miss": [
+                            { "type": "forward", "upstream": "dot://9.9.9.9:853", "ecs": { "mode": "clear" } },
+                            { "type": "jump_to_pipeline", "pipeline": "after" }
+                        ]
+                    },
+                    { "name": "static", "matchers": [{ "type": "domain_exact", "value": "a.example" }],
+                      "actions": [{ "type": "static_ip_response", "ip": "192.0.2.1" }] },
+                    { "name": "rcode", "matchers": [{ "type": "domain_exact", "value": "b.example" }],
+                      "actions": [{ "type": "static_response", "rcode": "REFUSED" }] },
+                    { "name": "verdicts", "matchers": [{ "type": "domain_exact", "value": "c.example" }],
+                      "actions": [{ "type": "continue" }, { "type": "allow" }, { "type": "deny" }] }
+                ]},
+                { "id": "after", "rules": [{
+                    "name": "forward",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "forward", "upstream": "doq://9.9.9.9:853" }]
+                }]}
+            ]
+        }))
+        .expect("parse config");
+        let runtime = RuntimePipelineConfig::from_config(config).expect("build");
+        let main = &runtime.pipelines[0];
+        assert!(main.rules[0].merged_forward.is_some(), "the forwards merge");
+        assert_eq!(
+            main.answered_through,
+            [1],
+            "the answer check jumps to after"
+        );
+        let namespaces = build_cache_namespaces(&runtime);
+        assert_eq!(namespaces.len(), 2);
+        assert_eq!(namespaces["main"], 14325266183221512296, "main");
+        assert_eq!(namespaces["after"], 15712173784525755426, "after");
     }
 
     #[test]
