@@ -3,6 +3,9 @@
   "config_capabilities": [
     "config_query_stats_v1",
     "config_static_cname_response_v1",
-    "config_panel_block_v1"
+    "config_panel_block_v1",
+    "config_bootstrap_v1",
+    "config_qtype_names_v1",
+    "config_serve_stale_ttl_reset_v2"
   ]
 }
