@@ -1632,7 +1632,7 @@ pub fn problems(cfg: &PipelineConfig) -> Vec<String> {
                     && times > 1
                 {
                     report(format!(
-                        "{times} pipelines are written with the id \"{}\"; a jump or pipeline_select finds only one of them by it, and the rules of the others do not run as written; give each pipeline its own id",
+                        "{times} pipelines are written with the id \"{}\"; only the first of them takes effect, and the rules of the others never run; give each pipeline its own id",
                         pipeline.id
                     ));
                 }
@@ -4631,11 +4631,11 @@ mod validation_tests {
         assert_eq!(problems_of(config), Vec::<String>::new());
     }
 
-    /// 两个规则组写了同一个 id：跳转和 pipeline_select 按 id 只找得到其中一个，另一个里的规则不会照写的执行。
-    /// 这是一条配置问题，每个重复的 id 报一次
-    /// Two pipelines written with one id: a jump or pipeline_select finds only one of them by
-    /// the id, and the rules of the other do not run as written. A configuration problem,
-    /// raised once for each id written more than once
+    /// 两个规则组写了同一个 id：只有第一个生效，另一个里的规则从不执行（见 `RuntimePipelineConfig::from_config`）。
+    /// 这是一条配置问题，每个重复的 id 报一次，写明只有第一个生效
+    /// Two pipelines written with one id: only the first takes effect, the rules of the other
+    /// never running (see `RuntimePipelineConfig::from_config`). A configuration problem,
+    /// raised once for each id written more than once, saying only the first takes effect
     #[test]
     fn pipelines_sharing_an_id_are_a_problem() {
         let pipeline = |id: &str| serde_json::json!({ "id": id, "rules": [] });
@@ -4647,7 +4647,8 @@ mod validation_tests {
         assert_eq!(found.len(), 2, "{found:#?}");
         assert!(
             found[0].starts_with("pipelines[0]: ")
-                && found[0].contains("3 pipelines are written with the id \"main\""),
+                && found[0].contains("3 pipelines are written with the id \"main\"")
+                && found[0].contains("only the first of them takes effect"),
             "{found:#?}"
         );
         assert!(

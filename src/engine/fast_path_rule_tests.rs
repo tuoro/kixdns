@@ -11,7 +11,9 @@ use hickory_proto::rr::{Name, RecordType};
 use serde_json::{Value, json};
 
 use crate::engine::rules::Decision;
-use crate::engine::test_support::{counting_settings, engine_from, peer};
+use crate::engine::test_support::{
+    ask, ask_fast_path_first, counting_settings, engine_from, first_a, peer,
+};
 use crate::engine::{Engine, FastPathResponse};
 use crate::matcher::RequestFacts;
 use crate::matcher::geosite::GeoSiteManager;
@@ -105,4 +107,49 @@ async fn a_decision_in_the_rule_cache_is_taken_without_evaluating_the_rules() {
         Some(ResponseCode::Refused),
         "the jump kept in the rule cache was followed"
     );
+}
+
+/// 几个 pipeline 写了同一个 id 时只有第一个生效：没有 pipeline_select 命中时选的、pipeline_select 和跳转按 id 找到的都是
+/// 它，快速路径和完整路径答的一样（各用一个引擎，谁也不读对方留下的缓存）
+/// Of several pipelines written with one id only the first takes effect: it is what is picked
+/// with no pipeline_select matching and what pipeline_select and a jump find by the id, the
+/// fast and the full path answering alike (on an engine each, neither reading what the other
+/// cached)
+#[tokio::test]
+async fn of_pipelines_sharing_an_id_the_first_answers_on_either_path() {
+    let fixed = |ip: &str| {
+        json!({ "id": "main", "rules": [{
+            "name": "fixed", "matchers": [{ "type": "any" }],
+            "actions": [{ "type": "static_ip_response", "ip": ip }]
+        }]})
+    };
+    let first = std::net::Ipv4Addr::new(192, 0, 2, 1);
+    let entry = |rules: Value| json!({ "id": "entry", "rules": rules });
+    let jump = json!([{
+        "name": "on", "matchers": [{ "type": "any" }],
+        "actions": [{ "type": "jump_to_pipeline", "pipeline": "main" }]
+    }]);
+    let select = json!([{ "pipeline": "main", "matchers": [{ "type": "any" }] }]);
+    for (how, pipeline_select, before) in [
+        ("picked first", json!([]), None),
+        ("pipeline_select", select, Some(entry(json!([])))),
+        ("jump", json!([]), Some(entry(jump))),
+    ] {
+        let pipelines: Vec<Value> = before
+            .into_iter()
+            .chain([fixed(&first.to_string()), fixed("192.0.2.2")])
+            .collect();
+        let engine = || {
+            engine_from(json!({
+                "settings": counting_settings(json!({})),
+                "pipeline_select": pipeline_select,
+                "pipelines": pipelines
+            }))
+        };
+        let fast = ask_fast_path_first(&engine(), &query("name.test."), peer())
+            .await
+            .expect("a readable query");
+        let full = ask(&engine(), &query("name.test."), peer()).await;
+        assert_eq!([first_a(&fast), first_a(&full)], [Some(first); 2], "{how}");
+    }
 }
