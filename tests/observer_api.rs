@@ -2912,6 +2912,52 @@ async fn a_change_of_the_same_length_and_time_after_the_read_is_reloaded() {
     );
 }
 
+/// 跳过只管头一次重载之前：重载过以后文件又变回启动时读之前的样子（`cp -p` 从备份还原：内容、长度、修改时间都和那时
+/// 一样），照样重载。不然内核一直跑着改过的那份，文件却已经还原了
+/// The skip holds only until the first reload: once reloaded, the file put back as it was
+/// before startup read it (restored from a backup with `cp -p`: content, length and
+/// modification time all as then) is reloaded all the same. Else the kernel would keep
+/// running the changed configuration with the file already restored
+#[tokio::test]
+async fn the_config_restored_as_read_at_startup_after_a_reload_is_reloaded() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pipeline.json");
+    let (v1, v2) = (static_config("192.0.2.1"), static_config("192.0.2.2"));
+    let (_engine, recorder, _watching) = watch_started_after(&path, &v1, |_| {});
+    /// 重载到了第 `at_least` 代以后、读的是 `wanted` / Reloaded to generation `at_least` or later, reading `wanted`
+    fn loaded(at_least: u64, wanted: &str) -> impl Fn(&[Event]) -> bool + '_ {
+        move |events| {
+            events.iter().any(|event| {
+                matches!(
+                    event,
+                    Event::ConfigLoaded { generation, source, .. }
+                        if *generation >= at_least && source.as_deref() == Some(wanted)
+                )
+            })
+        }
+    }
+
+    let before_read = std::fs::metadata(&path).unwrap().modified().unwrap();
+    write_modified_at(&path, &v2, before_read + Duration::from_secs(1));
+    assert!(
+        recorder
+            .wait_for(Duration::from_secs(5), loaded(2, &v2))
+            .await,
+        "the change must be reloaded: {:#?}",
+        recorder.events()
+    );
+    let backup = dir.path().join("pipeline.json.bak");
+    write_modified_at(&backup, &v1, before_read);
+    std::fs::rename(&backup, &path).unwrap();
+    assert!(
+        recorder
+            .wait_for(Duration::from_secs(5), loaded(3, &v1))
+            .await,
+        "the restored config must be reloaded: {:#?}",
+        recorder.events()
+    );
+}
+
 #[tokio::test]
 async fn hot_reload_reports_success_and_failure() {
     let dir = tempfile::tempdir().unwrap();

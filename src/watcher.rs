@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use notify::event::{AccessKind, AccessMode, EventKind, ModifyKind, RenameMode};
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher, WatcherKind};
@@ -10,7 +10,6 @@ use tracing::{debug, error, info};
 
 use crate::config;
 use crate::engine::Engine;
-use crate::matcher::geoip::FileStamp;
 
 /// 文件写完以后（写的一方关上了它，或者改名到了位）再等这么久，把同一次保存的其它事件收齐：改名盖过目标文件时
 /// notify 报一个「改名到这里」，再报一个同时列出两端的「改名」；证书和私钥前后脚换。
@@ -125,6 +124,36 @@ impl ConfigWatch {
                 }
             }, move |_, watched| on_watch(watched))
             .map_err(notify::Error::io)
+    }
+}
+
+/// 一个文件的路径、长度和修改时间：三样都没变，就当内容没变。记下文件读之前什么样：监视报来的改动是不是还是读到的那份
+/// （见 [`ConfigWatch`]），监视看不全的文件（MMDB、有位置监视不上的 Geo 数据文件）换没换样子
+/// A file's path, length and modification time: with all three unchanged, its content counts
+/// as unchanged. It notes what a file looked like before it was read: whether a change the
+/// watch reports is still what was read (see [`ConfigWatch`]), and whether a file the watch
+/// does not wholly see (the MMDB, Geo data files with places that cannot be watched) looks
+/// otherwise
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct FileStamp {
+    path: PathBuf,
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+impl FileStamp {
+    pub(crate) fn of(path: &Path) -> std::io::Result<Self> {
+        let meta = std::fs::metadata(path)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            len: meta.len(),
+            modified: meta.modified().ok(),
+        })
+    }
+
+    /// 是哪个文件 / Which file it is
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
     }
 }
 

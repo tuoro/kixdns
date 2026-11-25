@@ -114,12 +114,14 @@ pub struct DohCertificate {
 
 impl DohCertificate {
     /// 读 `cert_path` 和 `key_path`，读之前先装好监视（见 `watcher::PendingWatch`）：读的时候证书续期了，这次改动排着队，
-    /// 照样换上。以前先读后监视，中间续期的证书要等下一次改动才用上。监视不了只记错误，证书照用
+    /// 照样换上。以前先读后监视，中间续期的证书要等下一次改动才用上。监视不了，或者哪个文件有位置监视不上（见
+    /// `watcher::PendingWatch::uncovered`），只记错误、说那里续期的证书要重启才用上，证书照用
     /// Reads `cert_path` and `key_path`, watching them before they are read (see
     /// `watcher::PendingWatch`): a renewal made while they are read waits in line and is brought
     /// in all the same. They used to be read before being watched, and a renewal in between was
-    /// used only after the next change. When they cannot be watched an error is logged and the
-    /// certificate used as read
+    /// used only after the next change. When they cannot be watched, or a file has places that
+    /// cannot be (see `watcher::PendingWatch::uncovered`), an error is logged, saying a renewal
+    /// there is not used until restart, and the certificate is used as read
     pub fn load(cert_path: &str, key_path: &str) -> anyhow::Result<Arc<Self>> {
         let pending =
             watcher::PendingWatch::new(&[PathBuf::from(cert_path), PathBuf::from(key_path)]);
@@ -127,6 +129,11 @@ impl DohCertificate {
             cert_path, key_path,
         )?));
         let watch = pending
+            .inspect(|pending| {
+                for (path, err) in pending.uncovered() {
+                    error!(path = %path.display(), error = %err, "cannot watch the DoH certificate file everywhere it leads, a renewal there is not used until restart");
+                }
+            })
             .and_then(|pending| {
                 let reloaded = Arc::clone(&current);
                 let (cert, key) = (cert_path.to_owned(), key_path.to_owned());
@@ -1431,6 +1438,45 @@ mod tests {
         })
         .await
         .expect("the renewed certificate is used");
+    }
+
+    /// 证书的文件有位置监视不上（这里是进得去、列不出的目录，像 inotify 的监视数用完时那样装不上监视）：证书照样用上，
+    /// 日志里每个这样的文件记一条错误，说那里续期的证书要重启才用上。以前只有整个监视装不上时才这么说，有位置监视不上时
+    /// 只有一条不提后果的。root 列得出这样的目录，也监视得上，没有要看的
+    /// The certificate's files have places that cannot be watched (here a directory that can
+    /// be entered, not listed, refusing a watch as when inotify's watches run out): the
+    /// certificate is used all the same, and an error is logged for each such file, saying a
+    /// renewal there is not used until restart. Only a watch failing as a whole used to say so,
+    /// places that could not be watched getting a line that named no consequence. root lists
+    /// such a directory and watches it, with nothing to see
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_certificate_that_cannot_be_watched_says_a_renewal_waits_for_a_restart() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, key) = crate::engine::test_support::write_certificate(dir.path());
+        let mode = |mode| {
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        mode(0o300);
+        if std::fs::read_dir(dir.path()).is_ok() {
+            mode(0o700);
+            return;
+        }
+        let (warnings, guard) = crate::engine::test_support::Warnings::capture();
+        let certificate = DohCertificate::load(&cert, &key);
+        drop(guard);
+        mode(0o700);
+        assert!(certificate.is_ok(), "the certificate is used as read");
+        let lines = warnings.lines();
+        for file in [&cert, &key] {
+            assert!(
+                lines.iter().any(|line| line.contains(
+                    "cannot watch the DoH certificate file everywhere it leads, a renewal there is not used until restart"
+                ) && line.contains(&format!("path={file}"))),
+                "{file}: {lines:#?}"
+            );
+        }
     }
 
     /// 最后一个监听口停下时证书的监视也停下：监视线程结束，放下它手里的证书。以前这个线程谁也停不了，进程活着它就一直在

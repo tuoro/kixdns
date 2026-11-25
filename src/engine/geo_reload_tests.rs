@@ -1377,10 +1377,11 @@ async fn a_geosite_directory_removed_and_made_again_later_is_read_by_a_reload() 
 }
 
 /// 配置了却不存在、读不了的 Geo 数据文件和 MMDB 记成错误：默认日志级别是 error，记成 warn 的话没开面板时谁也看不到。
-/// 以前都记成 warn
+/// 以前都记成 warn。MMDB 那条说它改了以后由下一次热重载读：它不被监视
 /// Geo data files and an MMDB that are configured yet not there or unreadable are logged as
 /// errors: the default log level is error, and logged as warns they went unseen without the
-/// panel. They used to be logged as warns
+/// panel. They used to be logged as warns. The MMDB's says the next hot reload reads it once
+/// it changes: it is not watched
 #[tokio::test]
 async fn missing_and_unreadable_geo_files_are_logged_as_errors() {
     let dir = tempfile::tempdir().unwrap();
@@ -1420,7 +1421,8 @@ async fn missing_and_unreadable_geo_files_are_logged_as_errors() {
         .collect();
     for wanted in [
         "GeoSite data file not found",
-        "GeoIP database",
+        // MMDB 不被监视，等的是热重载 / The MMDB is not watched, and what it waits for is a hot reload
+        "failed to open GeoIP database, read again by the next configuration reload once it changes",
         "GeoIP data",
     ] {
         assert!(
