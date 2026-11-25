@@ -228,7 +228,11 @@ pub struct RuntimePipelineConfig {
     pub settings: config::GlobalSettings,
     pub pipeline_select: Vec<RuntimePipelineSelectRule>,
     pub pipelines: Vec<RuntimePipeline>,
-    /// O(1) pipeline lookup index: pipeline_id -> index in pipelines / O(1) 管道查找索引：pipeline_id -> pipelines 中的索引
+    /// O(1) 管道查找索引：pipeline_id -> pipelines 中的索引。`pipelines` 里的 id 各不相同，一个 id 写了几次时只留第一个
+    /// （见 [`Self::from_config`]）
+    /// O(1) pipeline lookup index: pipeline_id -> index in pipelines. The ids in `pipelines` are
+    /// all different, only the first pipeline written with an id kept (see
+    /// [`Self::from_config`])
     pub pipeline_id_index: FxHashMap<Arc<str>, usize>,
     /// 这份配置照样加载、值得知道的写法（见 [`config::warnings`]），编译时找出来：校验的回答、配置生效时的日志和
     /// `ConfigLoaded` 都从这里拿
@@ -435,9 +439,14 @@ impl ResponsePhase {
     /// 匹配器和两种结果下的动作；没有响应阶段时都是空的
     /// The matchers and the actions for either result, all empty without a response phase
     pub fn parts(phase: Option<&Self>) -> (&[RuntimeResponseMatcherWithOp], &[Action], &[Action]) {
-        phase.map_or((&[], &[], &[]), |phase| {
-            (&phase.matchers, &phase.on_match, &phase.on_miss)
-        })
+        phase.map_or(
+            (&[], &[], &[]),
+            |Self {
+                 matchers,
+                 on_match,
+                 on_miss,
+             }| (matchers, on_match, on_miss),
+        )
     }
 }
 
@@ -516,12 +525,13 @@ impl RuntimePipelineConfig {
         let warnings = config::warnings(&cfg);
 
         let mut pipelines = Vec::new();
+        let mut pipeline_id_index: FxHashMap<Arc<str>, usize> = FxHashMap::default();
         // What each pipeline's rules tell requesters apart by / 每个 pipeline 的规则区分请求方的依据
         let mut reads = Vec::new();
         for (i, p) in cfg.pipelines.into_iter().enumerate() {
             let mut rules = Vec::new();
             for (j, r) in p.rules.into_iter().enumerate() {
-                let merged_forward = r.merged_forward();
+                let merged_forward = r.merged_forward(&cfg.settings);
                 let mut matchers: Vec<_> = r
                     .matchers
                     .into_iter()
@@ -585,13 +595,24 @@ impl RuntimePipelineConfig {
                 });
             }
 
+            // 一个 id 写了几次时只有第一个生效（`config::problems` 报一条）：后面的照样编译（编译不了的和别的一起列出来），
+            // 然后丢掉；选 pipeline、跳转、快速路径和完整路径、缓存的命名空间就都只认得第一个
+            // With an id written several times only the first takes effect (`config::problems`
+            // raising it): those after are compiled all the same (any that cannot be listed with
+            // the rest) and then left out, so picking a pipeline, jumps, the fast and the full
+            // path and the cache namespaces all know the first alone
+            let id: Arc<str> = Arc::from(p.id);
+            if pipeline_id_index.contains_key(&id) {
+                continue;
+            }
+            pipeline_id_index.insert(Arc::clone(&id), pipelines.len());
             reads.push(RuleReads::of(&rules));
             let matches_regex = rules
                 .iter()
                 .flat_map(|rule| rule.matchers.iter())
                 .any(|m| matches!(m.matcher, RuntimeMatcher::DomainRegex { .. }));
             pipelines.push(RuntimePipeline {
-                id: Arc::from(p.id),
+                id,
                 index: advanced_rule::RuleIndex::of(&rules),
                 last_precomputed: rules.iter().rposition(|rule| rule.precomputed().is_some()),
                 rules,
@@ -630,13 +651,6 @@ impl RuntimePipelineConfig {
         }
 
         config::Problems::refuse(refused)?;
-
-        // Build O(1) pipeline id lookup index / 构建 O(1) pipeline id 查找索引
-        let pipeline_id_index: FxHashMap<Arc<str>, usize> = pipelines
-            .iter()
-            .enumerate()
-            .map(|(i, p)| (p.id.clone(), i))
-            .collect();
 
         fill_requester_scopes(&mut pipelines, &reads, &pipeline_id_index);
 
