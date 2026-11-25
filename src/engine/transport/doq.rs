@@ -14,6 +14,8 @@ use crate::engine::doh_h2;
 use anyhow::Context;
 use arc_swap::ArcSwapOption;
 use bytes::Bytes;
+use futures::FutureExt;
+use futures::future::Shared;
 use quinn::crypto::rustls::QuicClientConfig;
 use quinn::{
     Connection as QuicConnection, Endpoint as QuicEndpoint, TransportConfig as QuicTransportConfig,
@@ -22,6 +24,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
+use tokio::sync::watch;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -186,10 +189,12 @@ fn answer_within(rtt: Duration) -> Duration {
     (2 * ATTEMPT_DELAY).max(3 * rtt)
 }
 
-/// 新建的一条 DoQ 连接，和它有没有用 0-RTT / A DoQ connection newly made, and whether it used 0-RTT
+/// 新建的一条 DoQ 连接；用了 0-RTT 的，带着 quinn 在握手完时决出 0-RTT 被接受没有的那个 future / A DoQ
+/// connection newly made; one made with 0-RTT carries the future by which quinn tells, once the
+/// handshake is through, whether 0-RTT was accepted
 struct NewDoqConn {
     conn: QuicConnection,
-    used_0rtt: bool,
+    accepted: Option<quinn::ZeroRttAccepted>,
 }
 
 /// 发查询用的连接，和它是怎么来的 / The connection to send on, and how it came
@@ -202,8 +207,9 @@ struct DoqConnected {
 /// 池里的一条 QUIC 连接 / One pooled QUIC connection
 struct DoqConn {
     conn: QuicConnection,
-    /// 建它时用了 0-RTT / Made with 0-RTT
-    used_0rtt: bool,
+    /// 建它时用了 0-RTT 的，0-RTT 期间开出的流（见 [`EarlyStreams`]）；没用的为 None / Made with
+    /// 0-RTT, the streams opened during 0-RTT (see [`EarlyStreams`]); None when made without
+    early: Option<EarlyStreams>,
     /// 用它的查询都记上自己的期限，它的看守任务按它老化（见 [`DoqMuxClient::watch`]）/ Every query using it
     /// notes its deadline here, and its watching task ages it by this (see [`DoqMuxClient::watch`])
     wear: Wear,
@@ -214,6 +220,11 @@ struct DoqConn {
 }
 
 impl DoqConn {
+    /// 建它时用了 0-RTT / Made with 0-RTT
+    fn used_0rtt(&self) -> bool {
+        self.early.is_some()
+    }
+
     /// 用了 0-RTT，上游却没回握手：连接还开着，或者没等回就关了（到期关的、QUIC 的空闲超时先到、上游没回握手就关掉，比如
     /// 拒绝新连接）。都是这个地址的事，和 0-RTT 无关：上游不收早期数据时照样回握手（见 [`DoqMuxClient::early_data_refused`]）
     /// Made with 0-RTT, and the handshake unanswered by the upstream: the connection still open,
@@ -222,7 +233,7 @@ impl DoqConn {
     /// matter and says nothing about 0-RTT: an upstream taking no early data answers the handshake
     /// all the same (see [`DoqMuxClient::early_data_refused`])
     fn unanswered(&self) -> bool {
-        self.used_0rtt && self.conn.handshake_data().is_none()
+        self.used_0rtt() && self.conn.handshake_data().is_none()
     }
 
     /// 握手没回的这条连接上查询为什么失败：连的哪个地址；上游没回握手就关掉了连接的，带上上游给的原因
@@ -250,6 +261,84 @@ impl DoqConn {
         if self.conn.close_reason().is_none() {
             self.conn.close(DOQ_NO_ERROR, b"");
         }
+    }
+}
+
+/// 一条用了 0-RTT 的连接上，0-RTT 期间开出、quinn 的句柄还没丢的流，和 0-RTT 被拒了没有。
+///
+/// 这是在绕开 quinn 0.11.11 的一个行为：0-RTT 被拒时 quinn-proto 把流号从 0 重新数起，而 quinn 的 `SendStream`、
+/// `RecvStream` 丢掉时先按流号删掉登记着的唤醒器，再看自己是不是被拒的 0-RTT 流。于是 0-RTT 期间开出的旧流的句柄丢掉时，
+/// 会删掉握手完以后开出的同号新流登记的唤醒器：新流上的回答到了，没人叫醒等它的查询，要等满预算。所以握手完以后开出的流，
+/// 0-RTT 被拒而旧流还有句柄没丢时，等它们丢完再用（见 [`Self::enter`]）：被拒那一刻 quinn 叫醒所有旧流，它们马上报
+/// `ZeroRttRejected`，等的只是那几个任务跑一下，不花往返。0-RTT 被接受时旧流的流号不变，撞不上，谁都不等。quinn 的这两处
+/// Drop 改成先看是不是被拒的 0-RTT 流、再删唤醒器以后，这个类型整个可以删掉
+///
+/// On a connection made with 0-RTT, the streams opened during 0-RTT whose quinn handles are still
+/// held, and whether 0-RTT was rejected.
+///
+/// This works around a behaviour of quinn 0.11.11: with 0-RTT rejected, quinn-proto numbers the
+/// streams from 0 again, while quinn's `SendStream` and `RecvStream` on being dropped first remove
+/// the waker registered under their stream number and only then look whether they are a rejected
+/// 0-RTT stream. So the handle of an old stream opened during 0-RTT, dropped, removes the waker
+/// registered by the stream of the same number opened once the handshake is through: the answer
+/// arrives on the new stream and nobody wakes the query waiting for it, which sits out its
+/// budget. A stream opened once the handshake is through therefore, with 0-RTT rejected and
+/// handles of old streams still held, waits for them to be dropped before it is used (see
+/// [`Self::enter`]): quinn wakes every old stream the moment it rejects them, and they are told
+/// `ZeroRttRejected` at once, so the wait is for those few tasks to run, no round trip. With
+/// 0-RTT accepted the old streams keep their numbers, nothing collides, and nobody waits. Once
+/// quinn's two Drops look whether they are a rejected 0-RTT stream before removing the waker,
+/// this type can go altogether
+struct EarlyStreams {
+    /// 0-RTT 被接受没有：quinn 在握手完时决出（见 [`quinn::Connecting::into_0rtt`]），和它叫醒被拒的旧流是同一刻、在同一把
+    /// 连接锁里 / Whether 0-RTT was accepted: settled by quinn once the handshake is through (see
+    /// [`quinn::Connecting::into_0rtt`]), in the same moment and under the same connection lock as
+    /// it wakes the old streams rejected
+    accepted: Shared<quinn::ZeroRttAccepted>,
+    /// 0-RTT 期间开出、句柄还没丢的流数 / Streams opened during 0-RTT with their handles still held
+    held: watch::Sender<usize>,
+}
+
+impl EarlyStreams {
+    fn new(accepted: quinn::ZeroRttAccepted) -> Self {
+        Self {
+            accepted: accepted.shared(),
+            held: watch::Sender::new(0),
+        }
+    }
+
+    /// 刚开出 `recv` 所在的这个流：0-RTT 期间开出的记上数，给出它的计数，丢掉时减一；握手完以后开出的，0-RTT 被拒而旧流还有
+    /// 句柄没丢时，等它们丢完。握手完以后开出的流不是 `is_0rtt`，quinn 判它的时候已经决出 `accepted`（开流也在那把连接锁里），
+    /// 所以等 `accepted` 不花时间
+    /// The stream of `recv` just opened: one opened during 0-RTT is counted, the count given back
+    /// and going down once dropped; one opened once the handshake is through waits, with 0-RTT
+    /// rejected and handles of old streams still held, for those to be dropped. A stream opened
+    /// once the handshake is through is not `is_0rtt`, quinn having settled `accepted` by the time
+    /// it tells so (opening a stream takes that connection lock too), so awaiting `accepted` takes
+    /// no time
+    async fn enter(&self, recv: &quinn::RecvStream) -> Option<EarlyHeld<'_>> {
+        if recv.is_0rtt() {
+            self.held.send_modify(|held| *held += 1);
+            return Some(EarlyHeld(self));
+        }
+        if *self.held.borrow() == 0 {
+            return None;
+        }
+        if !self.accepted.clone().await {
+            let _ = self.held.subscribe().wait_for(|&held| held == 0).await;
+        }
+        None
+    }
+}
+
+/// 0-RTT 期间开出、句柄还没丢的一个流在 [`EarlyStreams`] 里的计数，丢掉时减一 / One stream opened during
+/// 0-RTT with its handles still held, as counted in [`EarlyStreams`], the count going down once
+/// dropped
+struct EarlyHeld<'a>(&'a EarlyStreams);
+
+impl Drop for EarlyHeld<'_> {
+    fn drop(&mut self) {
+        self.0.held.send_modify(|held| *held -= 1);
     }
 }
 
@@ -475,7 +564,7 @@ impl DoqMuxClient {
             pooled.wear.note(start + timeout_dur);
             let answers_before = pooled.answers.load(Ordering::Acquire);
 
-            match timeout(query_budget, Self::ask(&pooled.conn, packet, original_id)).await {
+            match timeout(query_budget, Self::ask(&pooled, packet, original_id)).await {
                 Ok(Ok(bytes)) => {
                     pooled.answers.fetch_add(1, Ordering::AcqRel);
                     return Ok(bytes);
@@ -508,9 +597,11 @@ impl DoqMuxClient {
                         );
                         true
                     } else if Self::early_data_refused(&failure) {
-                        // 连接还在池里，重发取的就是它，握手已经完了
+                        // 连接还在池里，重发取的就是它，握手已经完了（重发开的流先等 0-RTT 期间开出的旧流丢完，见
+                        // [`EarlyStreams`]）
                         // The connection stays pooled, the resend taking it, its handshake
-                        // through
+                        // through (the resend's stream waiting first for the old streams opened
+                        // during 0-RTT to be dropped, see [`EarlyStreams`])
                         debug!(
                             upstream = %self.upstream,
                             error = %failure,
@@ -574,26 +665,34 @@ impl DoqMuxClient {
         }
     }
 
-    /// 在 `conn` 上开一个流问一次（RFC 9250 §4.2）。返回带类型的失败而不是 anyhow：每一步都被 context 包过之后，
+    /// 在 `pooled` 上开一个流问一次（RFC 9250 §4.2）。返回带类型的失败而不是 anyhow：每一步都被 context 包过之后，
     /// anyhow 的 to_string 只剩最外层那一句，quinn 的原始错误到不了判定处
-    /// Asks once on a stream of its own on `conn` (RFC 9250 §4.2). It gives a typed failure
+    /// Asks once on a stream of its own on `pooled` (RFC 9250 §4.2). It gives a typed failure
     /// rather than anyhow: once every step is wrapped in context, anyhow's to_string leaves only
     /// the outermost sentence and quinn's own error never reaches the decision
-    async fn ask(
-        conn: &QuicConnection,
-        packet: &[u8],
-        original_id: u16,
-    ) -> Result<Bytes, DoqFailure> {
-        let (send, recv) = conn.open_bi().await.map_err(DoqFailure::OpenStream)?;
+    async fn ask(pooled: &DoqConn, packet: &[u8], original_id: u16) -> Result<Bytes, DoqFailure> {
+        let (send, recv) = pooled
+            .conn
+            .open_bi()
+            .await
+            .map_err(DoqFailure::OpenStream)?;
+        // 先装好再等（见 [`EarlyStreams::enter`]）：等的时候被丢掉，流照样按 RFC 9250 取消
+        // Made up before any wait (see [`EarlyStreams::enter`]): dropped while waiting, the
+        // stream is still cancelled as RFC 9250 asks
         let mut stream = DoqStream {
             send,
             recv,
             answered: false,
+            early: None,
         };
+        if let Some(early) = &pooled.early {
+            stream.early = early.enter(&stream.recv).await;
+        }
         let DoqStream {
             send,
             recv,
             answered,
+            ..
         } = &mut stream;
 
         // RFC 9250 §4.2: DNS messages sent over QUIC streams MUST be prefixed
@@ -730,10 +829,10 @@ impl DoqMuxClient {
                 deadline,
             );
             async move {
-                let NewDoqConn { conn, used_0rtt } = made.await?;
+                let NewDoqConn { conn, accepted } = made.await?;
                 // 用了 0-RTT 的，握手到期没回就关掉（见 [`answer_within`]）/ One that used 0-RTT is
                 // closed when its handshake goes unanswered past the deadline (see [`answer_within`])
-                let answer_by = if used_0rtt {
+                let answer_by = if accepted.is_some() {
                     zero_rtt_at.map(|(_, rtt)| tokio::time::Instant::now() + answer_within(rtt))
                 } else {
                     *zero_rtt.reached.lock() = Some((conn.remote_address(), conn.rtt()));
@@ -741,7 +840,7 @@ impl DoqMuxClient {
                 };
                 let pooled = Arc::new(DoqConn {
                     conn,
-                    used_0rtt,
+                    early: accepted.map(EarlyStreams::new),
                     wear: Wear::new(),
                     answers: AtomicU64::new(0),
                 });
@@ -953,7 +1052,7 @@ impl DoqMuxClient {
                 );
             });
             match connecting.into_0rtt() {
-                Ok((conn, _zero_rtt_accepted)) => {
+                Ok((conn, accepted)) => {
                     // 0-RTT 连接已建立。上游不收这些早期数据时，查询在这条连接握手完了以后重发（见
                     // [`DoqMuxClient::early_data_refused`]）
                     // 0-RTT connection established. With the upstream taking none of this early
@@ -965,7 +1064,7 @@ impl DoqMuxClient {
                     );
                     return Ok(NewDoqConn {
                         conn,
-                        used_0rtt: true,
+                        accepted: Some(accepted),
                     });
                 }
                 // 0-RTT not available (no previous session), fall back to normal connect
@@ -980,7 +1079,7 @@ impl DoqMuxClient {
 
         Ok(NewDoqConn {
             conn: connection,
-            used_0rtt: false,
+            accepted: None,
         })
     }
 }
@@ -1001,14 +1100,20 @@ const DOQ_REQUEST_CANCELLED: quinn::VarInt = quinn::VarInt::from_u32(0x3);
 /// resets sending with [`DOQ_REQUEST_CANCELLED`], as RFC 9250 section 4.3.1 asks: streams left
 /// for quinn to drop would carry error code 0, DOQ_NO_ERROR, which the upstream takes for a
 /// normal end
-struct DoqStream {
+struct DoqStream<'a> {
     send: quinn::SendStream,
     recv: quinn::RecvStream,
     /// 上游已经把回答发完 / The upstream has finished sending the answer
     answered: bool,
+    /// 0-RTT 期间开出的，它在 [`EarlyStreams`] 里的计数。字段按声明的顺序丢，它排在 `send`、`recv` 后面：quinn 的两个句柄都丢了
+    /// 才减一，等着的新流这时用起来才安全
+    /// Its count in [`EarlyStreams`] when opened during 0-RTT. Fields drop in the order declared
+    /// and it comes after `send` and `recv`: the count goes down only once both quinn handles are
+    /// dropped, when the new streams waiting are safe to use
+    early: Option<EarlyHeld<'a>>,
 }
 
-impl Drop for DoqStream {
+impl Drop for DoqStream<'_> {
     fn drop(&mut self) {
         if !self.answered {
             let _ = self.send.reset(DOQ_REQUEST_CANCELLED);

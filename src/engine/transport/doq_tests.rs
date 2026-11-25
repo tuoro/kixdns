@@ -125,20 +125,23 @@ fn doq_response_short_message_does_not_panic() {
 }
 
 /// 重启过的本机 DoQ 上游：同一张证书、收早期数据，重启前发的票据不认（换了票据的密钥、anycast 换了实例也一样），握手压住
-/// `accept_delay`。给出它的地址，和只信任这张证书、拿着一张重启前发的票据的客户端 TLS 设置（票据按服务器名存）
+/// `accept_delay`，查询照 `reply` 回答（见 [`spawn_doq_upstream`]）。给出它的地址，和只信任这张证书、拿着一张重启前发的票据的
+/// 客户端 TLS 设置（票据按服务器名存）
 /// A local DoQ upstream restarted: the same certificate, taking early data, and knowing no ticket
 /// given before the restart (as with its ticket keys changed or another anycast instance), its
-/// handshake held back for `accept_delay`. Gives its address and client TLS settings trusting the
-/// certificate alone and holding a ticket given before the restart (tickets are kept by server
-/// name)
-async fn restarted_doq_upstream(accept_delay: Duration) -> (SocketAddr, ClientConfig) {
+/// handshake held back for `accept_delay` and its queries answered as `reply` says (see
+/// [`spawn_doq_upstream`]). Gives its address and client TLS settings trusting the certificate
+/// alone and holding a ticket given before the restart (tickets are kept by server name)
+async fn restarted_doq_upstream(
+    accept_delay: Duration,
+    reply: fn(usize, &str) -> DoqReply,
+) -> (SocketAddr, ClientConfig) {
     let (mut before, client_tls) = localhost_tls(&[b"doq"]);
     before.max_early_data_size = u32::MAX;
     let mut after = before.clone();
     after.session_storage = rustls::server::ServerSessionMemoryCache::new(32);
-    let answer: fn(usize, &str) -> DoqReply = |_, _| DoqReply::Answer(Duration::ZERO);
-    let before = spawn_doq_upstream(before, Duration::ZERO, answer).await;
-    let after = spawn_doq_upstream(after, accept_delay, answer).await;
+    let before = spawn_doq_upstream(before, Duration::ZERO, answer_at_once).await;
+    let after = spawn_doq_upstream(after, accept_delay, reply).await;
     let ticket = doq_test_client(format!("{before}?sni=localhost"), client_tls.clone(), true);
     ticket
         .send(&udp_test_query("before.example"), Duration::from_secs(2))
@@ -149,38 +152,138 @@ async fn restarted_doq_upstream(accept_delay: Duration) -> (SocketAddr, ClientCo
     (after, client_tls)
 }
 
-/// 上游重启过、不认先前的票据：0-RTT 被拒，建这条连接的查询和同时搭在它上面的查询，都在这条连接握手完了以后在它上面重发、
-/// 答上；0-RTT 照用，下一条连接又提出早期数据
-/// An upstream restarted and knowing no earlier ticket: 0-RTT is rejected, and the query that
-/// made the connection and those riding it at the time are all sent again on it once its
-/// handshake is through, and answered; 0-RTT stays in use, the next connection offering early
-/// data again
-#[tokio::test]
-async fn queries_riding_a_connection_whose_0rtt_is_rejected_are_sent_again() {
-    let (restarted, client_tls) = restarted_doq_upstream(Duration::ZERO).await;
+/// 每个查询都当场回答 / Every query answered at once
+fn answer_at_once(_: usize, _: &str) -> DoqReply {
+    DoqReply::Answer(Duration::ZERO)
+}
+
+/// 连重启过的上游（见 [`restarted_doq_upstream`]）、0-RTT 发往它的客户端 / A client of the restarted
+/// upstream (see [`restarted_doq_upstream`]), sending 0-RTT to it
+fn rejecting_doq_client(restarted: SocketAddr, client_tls: ClientConfig) -> DoqMuxClient {
     let client = doq_test_client(format!("{restarted}?sni=localhost"), client_tls, true);
-    let target = parse_doq_target(&client.upstream).expect("doq target");
     // 上一次完整握手（重启以前）连上的是它：0-RTT 发往它 / The last full handshake (before the
     // restart) reached it: 0-RTT goes to it
     *client.zero_rtt.reached.lock() = Some((restarted, Duration::ZERO));
-    let (a, b) = (udp_test_query("a.example"), udp_test_query("b.example"));
-    let (made_it, rode_it) = tokio::join!(
-        client.send(&a, Duration::from_secs(2)),
-        client.send(&b, Duration::from_secs(2)),
-    );
-    made_it.expect("the query that made the connection is sent again");
-    rode_it.expect("so is the one riding it");
-    // 两个查询的重发都在那条 0-RTT 的连接上答完：没有各建一条 / Both resends were answered on the
-    // 0-RTT connection: they did not make one each
-    let pooled = client.pooled.load_full().expect("a pooled connection");
-    assert!(pooled.used_0rtt, "the connection that offered early data");
-    assert_eq!(pooled.answers.load(Ordering::Acquire), 2);
+    client
+}
 
+/// 上游重启过、不认先前的票据：0-RTT 被拒，建这条连接的查询和同时搭在它上面的查询，各在自己的任务里，都在这条连接握手完了以后
+/// 在它上面重发、答上，远不到预算；0-RTT 照用，下一条连接又提出早期数据。quinn 丢掉被拒的旧流句柄时会删掉同号新流登记的唤醒器
+/// （见 [`EarlyStreams`]）：先重发的查询的回答到了，也可能没人叫醒它，要等满预算。各个任务谁先跑说不准，所以重复多次
+/// An upstream restarted and knowing no earlier ticket: 0-RTT is rejected, and the query that
+/// made the connection and those riding it at the time, each in a task of its own, are all sent
+/// again on it once its handshake is through and answered, well within their budgets; 0-RTT stays
+/// in use, the next connection offering early data again. quinn dropping the handles of old
+/// streams rejected removes the waker registered by the new stream of the same number (see
+/// [`EarlyStreams`]): the answer to a query sent again first could arrive with nobody to wake it,
+/// the query sitting out its budget. Which task runs first is anyone's guess, hence the repeats
+async fn queries_rejected_with_0rtt_are_sent_again() {
+    const ROUNDS: usize = 10;
+    const QUERIES: usize = 8;
+    let mut late = Vec::new();
+    let mut client = None;
+    for _ in 0..ROUNDS {
+        let (restarted, client_tls) =
+            restarted_doq_upstream(Duration::from_millis(100), answer_at_once).await;
+        let rejecting = Arc::new(rejecting_doq_client(restarted, client_tls));
+        let queries: Vec<_> = (0..QUERIES)
+            .map(|n| {
+                let client = Arc::clone(&rejecting);
+                tokio::spawn(async move {
+                    let started = tokio::time::Instant::now();
+                    let query = udp_test_query(&format!("q{n}.example"));
+                    let answer = client.send(&query, Duration::from_secs(2)).await;
+                    (answer, started.elapsed())
+                })
+            })
+            .collect();
+        for query in queries {
+            let (answer, took) = query.await.expect("the query's task");
+            answer.expect("sent again and answered");
+            if took >= Duration::from_secs(1) {
+                late.push(took);
+            }
+        }
+        // 重发都在那条 0-RTT 的连接上答完：没有各建一条 / The resends were all answered on the 0-RTT
+        // connection: they did not make one each
+        let pooled = rejecting.pooled.load_full().expect("a pooled connection");
+        assert!(pooled.used_0rtt(), "the connection that offered early data");
+        assert_eq!(pooled.answers.load(Ordering::Acquire), QUERIES as u64);
+        client = Some(rejecting);
+    }
+    assert!(
+        late.is_empty(),
+        "answered well within the budget, not at its end: {} of {} late, taking {late:?}",
+        late.len(),
+        ROUNDS * QUERIES
+    );
+    let client = client.expect("rounds");
+    let target = parse_doq_target(&client.upstream).expect("doq target");
     // 等这条连接上的新票据到 / The new ticket on that connection arrives
     tokio::time::sleep(Duration::from_millis(100)).await;
     client.pooled.store(None);
     let next = client.get_or_connect(&target).await.expect("connect");
-    assert!(next.pooled.used_0rtt, "0-RTT stays in use");
+    assert!(next.pooled.used_0rtt(), "0-RTT stays in use");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn queries_riding_a_connection_whose_0rtt_is_rejected_are_sent_again() {
+    queries_rejected_with_0rtt_are_sent_again().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queries_riding_a_connection_whose_0rtt_is_rejected_are_sent_again_on_threads() {
+    queries_rejected_with_0rtt_are_sent_again().await;
+}
+
+/// 0-RTT 被拒以后、0-RTT 期间开出的旧流还有句柄没丢时，新来一个查询：它在握手完了的连接上开流，流号和旧流撞上，等旧句柄丢完
+/// 再发，照样答上。不等的话旧句柄丢掉时删掉它登记的唤醒器（见 [`EarlyStreams`]），回答到了也没人叫醒它，要等满预算
+/// A query coming after 0-RTT is rejected, with handles of old streams opened during 0-RTT still
+/// held: it opens its stream on the connection through its handshake, its number that of an old
+/// stream, waits for the old handles to be dropped before sending, and is answered all the same.
+/// Without the wait the old handles dropped would remove the waker it registered (see
+/// [`EarlyStreams`]), and with the answer in nobody would wake it, the query sitting out its budget
+#[tokio::test]
+async fn a_query_after_0rtt_is_rejected_waits_for_the_old_streams_to_go() {
+    let (restarted, client_tls) =
+        restarted_doq_upstream(Duration::from_millis(100), |_, label| match label {
+            "fresh" => DoqReply::Answer(Duration::from_millis(100)),
+            _ => DoqReply::Answer(Duration::ZERO),
+        })
+        .await;
+    let client = Arc::new(rejecting_doq_client(restarted, client_tls));
+    let target = parse_doq_target(&client.upstream).expect("doq target");
+    let DoqConnected { pooled, .. } = client.get_or_connect(&target).await.expect("connect");
+    let early = pooled.early.as_ref().expect("made with 0-RTT");
+    // 一个查询在 0-RTT 期间开了流，之后迟迟不再被 poll，比如它的任务一时没轮上 / A query opened its
+    // stream during 0-RTT and is not polled again for a while, its task not getting a turn, say
+    let query = udp_test_query("stale.example");
+    let mut stale = Box::pin(DoqMuxClient::ask(&pooled, &query, 0x1234));
+    assert!(
+        futures::poll!(stale.as_mut()).is_pending(),
+        "waiting for the answer"
+    );
+    assert!(!early.accepted.clone().await, "0-RTT rejected");
+
+    let fresh = tokio::spawn({
+        let client = Arc::clone(&client);
+        async move {
+            let started = tokio::time::Instant::now();
+            let query = udp_test_query("fresh.example");
+            let answer = client.send(&query, Duration::from_secs(2)).await;
+            (answer, started.elapsed())
+        }
+    });
+    // 新查询开好了流，上游 100 毫秒以后才回答 / The new query has opened its stream, the upstream
+    // answering 100 ms later
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    drop(stale);
+    let (answer, took) = fresh.await.expect("the query's task");
+    assert!(
+        took < Duration::from_secs(1),
+        "answered well within the budget, not at its end: {took:?} {answer:?}"
+    );
+    answer.expect("answered");
 }
 
 /// 上游重启以后，重启前的票据发的 0-RTT 被拒，查询重发、答上；那条连接拿到的新票据给下一条连接用，它的 0-RTT 被接受。上游的
@@ -192,10 +295,10 @@ async fn queries_riding_a_connection_whose_0rtt_is_rejected_are_sent_again() {
 /// `ZeroRttRejected`
 #[tokio::test]
 async fn after_an_upstream_restart_the_new_ticket_has_0rtt_accepted() {
-    let (restarted, client_tls) = restarted_doq_upstream(Duration::from_millis(100)).await;
-    let client = doq_test_client(format!("{restarted}?sni=localhost"), client_tls, true);
+    let (restarted, client_tls) =
+        restarted_doq_upstream(Duration::from_millis(100), answer_at_once).await;
+    let client = rejecting_doq_client(restarted, client_tls);
     let target = parse_doq_target(&client.upstream).expect("doq target");
-    *client.zero_rtt.reached.lock() = Some((restarted, Duration::ZERO));
     let query = udp_test_query("restarted.example");
     client
         .send(&query, Duration::from_secs(2))
@@ -207,12 +310,63 @@ async fn after_an_upstream_restart_the_new_ticket_has_0rtt_accepted() {
     client.pooled.store(None);
     let next = client.get_or_connect(&target).await.expect("connect");
     assert!(
-        next.pooled.used_0rtt,
+        next.pooled.used_0rtt(),
         "the next connection offers early data"
     );
-    DoqMuxClient::ask(&next.pooled.conn, &query, 0x1234)
+    DoqMuxClient::ask(&next.pooled, &query, 0x1234)
         .await
         .expect("and has it accepted");
+}
+
+/// 0-RTT 被接受时，握手完以后来的查询不等还在 0-RTT 期间开出的流上等回答的查询：旧流的流号不变，和新流撞不上（见
+/// [`EarlyStreams`]）
+/// With 0-RTT accepted, a query coming once the handshake is through does not wait for one still
+/// waiting for its answer on a stream opened during 0-RTT: the old streams keep their numbers,
+/// which no new stream shares (see [`EarlyStreams`])
+#[tokio::test]
+async fn with_0rtt_accepted_a_later_query_does_not_wait_for_the_early_ones() {
+    let (mut server, client_tls) = localhost_tls(&[b"doq"]);
+    server.max_early_data_size = u32::MAX;
+    let addr = spawn_doq_upstream(server, Duration::from_millis(100), |_, label| match label {
+        "slow" => DoqReply::Answer(Duration::from_millis(500)),
+        _ => DoqReply::Answer(Duration::ZERO),
+    })
+    .await;
+    let client = Arc::new(resuming_doq_client(addr, client_tls).await);
+    let slow = tokio::spawn({
+        let client = Arc::clone(&client);
+        async move {
+            let query = udp_test_query("slow.example");
+            client.send(&query, Duration::from_secs(2)).await
+        }
+    });
+    let pooled = loop {
+        match client.pooled.load_full() {
+            Some(pooled) => break pooled,
+            None => tokio::task::yield_now().await,
+        }
+    };
+    let early = pooled.early.as_ref().expect("made with 0-RTT");
+    assert!(early.accepted.clone().await, "0-RTT accepted");
+    assert_eq!(
+        *early.held.borrow(),
+        1,
+        "`slow` waits on a stream opened during 0-RTT"
+    );
+
+    let started = tokio::time::Instant::now();
+    client
+        .send(&udp_test_query("fast.example"), Duration::from_secs(2))
+        .await
+        .expect("answered");
+    assert!(
+        started.elapsed() < Duration::from_millis(200),
+        "at once, not after `slow`: {:?}",
+        started.elapsed()
+    );
+    slow.await
+        .expect("the query's task")
+        .expect("`slow` is answered too");
 }
 
 /// 本机 DoQ 测试上游怎么对待一个查询 / How the local DoQ test upstream treats one query
@@ -904,7 +1058,7 @@ async fn zero_rtt_goes_to_the_address_the_last_handshake_reached() {
         .expect("0-RTT to ::1 is answered");
     assert!(started.elapsed() < Duration::from_millis(200), "at once");
     let pooled = client.pooled.load_full().expect("a pooled connection");
-    assert!(pooled.used_0rtt, "the reconnect used 0-RTT");
+    assert!(pooled.used_0rtt(), "the reconnect used 0-RTT");
     assert!(pooled.conn.remote_address().is_ipv6(), "to ::1");
 }
 
@@ -950,13 +1104,13 @@ async fn a_0rtt_handshake_never_answered_leaves_0rtt_on() {
     answering.store(true, Ordering::SeqCst);
     let full = client.get_or_connect(&target).await.expect("connect");
     assert!(
-        !full.pooled.used_0rtt,
+        !full.pooled.used_0rtt(),
         "no 0-RTT sent blindly to that address again"
     );
     tokio::time::sleep(Duration::from_millis(100)).await;
     client.pooled.store(None);
     let resumed = client.get_or_connect(&target).await.expect("connect");
-    assert!(resumed.pooled.used_0rtt, "0-RTT stays on");
+    assert!(resumed.pooled.used_0rtt(), "0-RTT stays on");
 }
 
 /// 本机 DoQ 测试上游怎么对待一个新来的握手 / How the local DoQ test upstream treats a new handshake
@@ -1054,7 +1208,7 @@ async fn a_0rtt_connection_the_upstream_refused_is_made_again_in_full() {
             .await
             .expect("sent again and answered");
         let pooled = client.pooled.load_full().expect("a pooled connection");
-        assert!(!pooled.used_0rtt, "sent again with a full handshake");
+        assert!(!pooled.used_0rtt(), "sent again with a full handshake");
         assert!(
             client.zero_rtt.reached.lock().is_some(),
             "0-RTT stays on, going to the address that full handshake reached"
@@ -1161,7 +1315,7 @@ async fn a_slow_answer_over_0rtt_leaves_0rtt_on() {
         client
             .pooled
             .load_full()
-            .is_some_and(|pooled| pooled.used_0rtt && pooled.conn.handshake_data().is_some())
+            .is_some_and(|pooled| pooled.used_0rtt() && pooled.conn.handshake_data().is_some())
     });
     let err = slow.expect_err("the upstream never answers `slow`");
     assert!(format!("{err:#}").contains("doq timeout"), "{err:#}");
@@ -1171,7 +1325,7 @@ async fn a_slow_answer_over_0rtt_leaves_0rtt_on() {
     );
     client.pooled.store(None);
     let resumed = client.get_or_connect(&target).await.expect("connect");
-    assert!(resumed.pooled.used_0rtt, "a reconnect uses 0-RTT again");
+    assert!(resumed.pooled.used_0rtt(), "a reconnect uses 0-RTT again");
 }
 
 /// 全局关了 0-RTT、这个上游写着 `0rtt=true`：重连用 0-RTT。以前 TLS 照全局设置不提出早期数据，按上游开的 0-RTT 从来
@@ -1200,7 +1354,7 @@ async fn an_upstream_uses_0rtt_with_it_off_globally() {
         .await
         .expect("the reconnect is answered");
     let pooled = client.pooled.load_full().expect("a pooled connection");
-    assert!(pooled.used_0rtt, "the reconnect used 0-RTT");
+    assert!(pooled.used_0rtt(), "the reconnect used 0-RTT");
 }
 
 /// 上一次完整握手连上的 127.0.0.1 后来不回应了，::1 还通：重连照常把 0-RTT 发往 127.0.0.1，握手到期（[`answer_within`]）
