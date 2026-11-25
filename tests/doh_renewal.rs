@@ -1,7 +1,8 @@
 //! 入站 DoH 的证书续期一次只读一次：证书和私钥一起换，监视给两个文件各回调一次，读的只有头一次。
 //!
 //! 在真程序上跑：配了 bind_doh，日志级别 info。证书和私钥都换成新的一对（先写好再改名盖过去，像 certbot、acme.sh 的
-//! deploy hook 那样），日志里只有一条 reloaded；两个都换成读不了的，只有一条 reload failed。
+//! deploy hook 那样），日志里只有一条 reloaded；两个都换成读不了的，只有一条 reload failed；私钥先到、证书隔一会儿才到，
+//! 也只有一条 reloaded。
 //!
 //! A renewal of the inbound DoH certificate is read once: the certificate and the key are
 //! replaced together, the watch calls back once for each file, and the first callback alone
@@ -10,7 +11,8 @@
 //! Runs the real binary with bind_doh configured, logging at info. The certificate and the key
 //! both replaced by a new pair (written aside and renamed over them, as the deploy hooks of
 //! certbot and acme.sh do) log one "reloaded" alone; both replaced by unreadable ones, one
-//! "reload failed" alone.
+//! "reload failed" alone; the key first and the certificate a while later, one "reloaded" alone
+//! too.
 #![cfg(unix)]
 
 use std::path::Path;
@@ -122,4 +124,35 @@ fn a_renewal_reads_the_certificate_once() {
         "DoH TLS certificate reload failed",
     );
     assert_eq!(failed, 1, "{}", std::fs::read_to_string(&log).unwrap());
+
+    // 私钥先到、隔 0.5 秒证书才到（比别的平台等写入停下的 0.3 秒还久，哪儿都是两阵），只有一条 reloaded，没有 reload
+    // failed / The key first and the certificate 0.5 s later (longer than the 0.3 s other platforms
+    // wait for writing to stop, two bursts anywhere): one "reloaded" alone, no "reload failed"
+    let (reloaded, failed) = (
+        lines_with(&log, "DoH TLS certificate reloaded"),
+        lines_with(&log, "DoH TLS certificate reload failed"),
+    );
+    let (cert_pem, key_pem) = certificate();
+    replace(&key, &key_pem);
+    std::thread::sleep(Duration::from_millis(500));
+    replace(&cert, &cert_pem);
+    assert!(
+        eventually(Duration::from_secs(10), || {
+            lines_with(&log, "DoH TLS certificate reloaded") > reloaded
+        }),
+        "{}",
+        std::fs::read_to_string(&log).unwrap_or_default()
+    );
+    std::thread::sleep(Duration::from_millis(1500));
+    let log_text = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        lines_with(&log, "DoH TLS certificate reloaded") - reloaded,
+        1,
+        "{log_text}"
+    );
+    assert_eq!(
+        lines_with(&log, "DoH TLS certificate reload failed") - failed,
+        0,
+        "{log_text}"
+    );
 }

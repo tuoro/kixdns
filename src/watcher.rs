@@ -26,7 +26,7 @@ const QUIET: Duration = Duration::from_millis(300);
 
 /// 一阵改动从第一个事件起最多等这么久：一直有人在写，也照样读一次 / A burst of changes is waited for
 /// at most this long from its first event: a file written to without end is still read
-const AT_MOST: Duration = Duration::from_secs(2);
+pub(crate) const AT_MOST: Duration = Duration::from_secs(2);
 
 /// 监视每隔这么久自己核对一次（见 [`Targets::check`]），接上事件报不到的变化：上层目录改了名、文件系统卸载又挂上、
 /// 目录删掉以后过了 [`QUIET`] 才重建、有位置监视不上的文件改了。比 [`AT_MOST`] 长得多，核对很少碰上一阵改动；
