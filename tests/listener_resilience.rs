@@ -88,11 +88,14 @@ async fn doh_answers(port: u16) -> bool {
         .is_ok_and(|r| r.status() == reqwest::StatusCode::OK)
 }
 
-/// 连上几个，监听口每接受一个都碰上接受错误：XNU 的 accept 碰上 EMFILE 会丢掉排队的那个连接，只连一个只碰上一次，
-/// 每次都记和隔一阵才记一条分不出来（Linux 上连接留在队列里，每 100 ms 再碰一次）
-/// Several connect, and the listener meets the accept error on accepting each: XNU's accept,
-/// meeting EMFILE, drops the connection queued, so one alone meets it once, and logging each
-/// time could not be told from logging once in a while (on Linux the connection stays queued,
+/// 连上几个，好让监听口一再碰上接受错误：XNU 的 accept 碰上 EMFILE 会丢掉排队的那个连接，只连一个只碰上一次，
+/// 每次都记和隔一阵才记一条分不出来。监听口每 100 ms 再接受一次，等的 300 ms 里五个约有三个这样碰上，其余的等句柄
+/// 放出来以后照常接受（Linux 上连接留在队列里，排头那个每 100 ms 再碰一次）
+/// Several connect, so that the listener meets the accept error again and again: XNU's
+/// accept, meeting EMFILE, drops the connection queued, so one alone meets it once, and logging
+/// each time could not be told from logging once in a while. The listener accepts again every
+/// 100 ms, so in the 300 ms waited about three of the five meet it so, the rest accepted as
+/// usual once descriptors are free (on Linux the connection stays queued, the one at its head
 /// met again every 100 ms)
 fn probes<T>(connect: impl FnMut() -> std::io::Result<T>) -> Vec<std::io::Result<T>> {
     std::iter::repeat_with(connect).take(5).collect()
