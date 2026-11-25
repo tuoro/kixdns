@@ -1193,6 +1193,7 @@ impl PanelMetrics {
                 "diagnostics_trace_client_v1",
                 "diagnostics_trace_candidate_v1",
                 "config_static_cname_response_v1",
+                "config_panel_block_v1",
                 "metrics_upstream_precision_v1",
                 "metrics_upstream_response_latency_v1",
                 "querylog_v1",
@@ -5891,6 +5892,32 @@ mod diagnostic_tests {
         ] {
             assert!(
                 capabilities().iter().any(|name| name == capability),
+                "{capability}"
+            );
+        }
+    }
+
+    /// 包里 `panel/capabilities.json` 声明的配置能力，health 都声明：面板按前者判断还没起来的内核包，按后者判断运行中的
+    /// 内核，同一个内核两边说的得一样。顶层留给面板的块（`config_panel_block_v1`，见 `config::PANEL_BLOCK`）在其中
+    /// Health declares every config capability `panel/capabilities.json` declares in the package:
+    /// the panel judges a package not yet running by the former and a running kernel by the
+    /// latter, and the two have to say the same of one kernel. The top-level block kept for the
+    /// panel (`config_panel_block_v1`, see `config::PANEL_BLOCK`) is among them
+    #[test]
+    fn health_declares_the_config_capabilities_of_the_package() {
+        let package: serde_json::Value =
+            serde_json::from_str(include_str!("../panel/capabilities.json")).expect("parses");
+        let declared: Vec<&str> = package["config_capabilities"]
+            .as_array()
+            .expect("a list")
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        assert!(declared.contains(&"config_panel_block_v1"), "{declared:?}");
+        let capabilities = capabilities();
+        for capability in declared {
+            assert!(
+                capabilities.iter().any(|name| name == capability),
                 "{capability}"
             );
         }
