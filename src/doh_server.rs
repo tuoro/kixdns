@@ -188,10 +188,7 @@ fn reload(current: &ArcSwap<TlsAcceptor>, cert: &str, key: &str, read: &mut Stam
     if built.is_err() {
         std::thread::sleep(watcher::AT_MOST);
         if stamps(cert, key) != *read {
-            debug!(
-                cert,
-                key, "DoH TLS certificate changed while waiting, read on that change's callback"
-            );
+            debug!(cert, key, "DoH TLS certificate changed while waiting");
             return;
         }
     }
