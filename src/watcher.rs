@@ -45,6 +45,10 @@ const CHECK_EVERY: Duration = Duration::from_secs(10);
 pub(crate) const SEEN_WITHIN: &str = "changes there are noticed within 10 s";
 const _: () = assert!(CHECK_EVERY.as_secs() == 10, "SEEN_WITHIN names the period");
 
+/// 日志说一个文件有位置监视不上（开始时，和重新解析以后）/ What the log says of a file with places
+/// that cannot be watched (at the start, and once resolved again)
+const UNWATCHED: &str = "cannot watch every place the file leads";
+
 #[cfg(test)]
 thread_local! {
     /// 这个线程上装的监视多久核对一次，测试用（见 [`check_every`]）/ How often the watches installed on
@@ -63,6 +67,28 @@ pub(crate) fn check_every(every: Duration) -> impl Drop {
         }
     }
     TEST_CHECK_EVERY.set(Some(every));
+    Reset
+}
+
+#[cfg(test)]
+thread_local! {
+    /// 这个线程上装的监视建不起 notify 的监视，测试用（见 [`without_notify`]）/ Whether the watches
+    /// installed on this thread cannot make notify's watcher, for tests (see [`without_notify`])
+    static TEST_WITHOUT_NOTIFY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// 测试用：守卫活着时，这个线程上装的监视建不起 notify 的监视，像 inotify 的 max_user_instances 用完时那样 / For tests:
+/// while the guard lives, the watches installed on this thread cannot make notify's watcher, as
+/// when inotify's max_user_instances have run out
+#[cfg(test)]
+pub(crate) fn without_notify() -> impl Drop {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_WITHOUT_NOTIFY.set(false);
+        }
+    }
+    TEST_WITHOUT_NOTIFY.set(true);
     Reset
 }
 
@@ -92,10 +118,10 @@ pub struct ConfigWatch {
 impl ConfigWatch {
     /// 开始监视配置文件 `path`，在读它之前调用 / Starts watching the configuration file `path`;
     /// call it before reading the file
-    pub fn new(path: &Path) -> notify::Result<Self> {
-        let watch = PendingWatch::new(&[path.to_path_buf()])?;
+    pub fn new(path: &Path) -> Self {
+        let watch = PendingWatch::new(&[path.to_path_buf()]);
         let before_read = FileStamp::of(path).ok();
-        Ok(Self { watch, before_read })
+        Self { watch, before_read }
     }
 
     /// 配置文件每改一次（开始之前排着的也算）就照着它重载 `engine`，直到返回的 [`FileWatch`] 被丢掉。`read` 是启动时
@@ -103,7 +129,7 @@ impl ConfigWatch {
     /// Reloads `engine` from the configuration file on every change to it (those queued before
     /// the start included), until the returned [`FileWatch`] is dropped. `read` is the
     /// configuration text startup read (see [`ConfigWatch::start_reporting`])
-    pub fn start(self, engine: Engine, read: String) -> notify::Result<FileWatch> {
+    pub fn start(self, engine: Engine, read: String) -> std::io::Result<FileWatch> {
         self.start_reporting(engine, read, |_| {})
     }
 
@@ -113,8 +139,8 @@ impl ConfigWatch {
     ///
     /// 头一次重载之前，文件还是启动时读它之前的样子（见 [`FileStamp`]）、内容也和启动时读到的 `read` 一字不差时不重载：
     /// 内核用的就是它。macOS 的 FSEvents 会把装监视之前不久的写入报给刚装上的监视，同一份配置就会在启动以后又重载一次，
-    /// 配置里有问题时还多记一条重载失败。一字不差地再存一次照样重载（Geo 数据的监视整个装不上时，让重载重读数据文件），
-    /// 存过以后修改时间就变了；修改时间只精确到秒的文件系统上，同一秒里改成一样长的别的内容，靠内容看得出来
+    /// 配置里有问题时还多记一条重载失败。一字不差地再存一次照样重载：存过以后它就不是读之前的样子了；修改时间只精确到秒
+    /// 的文件系统上，同一秒里改成一样长的别的内容，靠内容看得出来
     /// As [`ConfigWatch::start`], with how the file is watched going to `on_watch`: why some of
     /// its places cannot be watched, None when every one is. It is reported once at the start, as
     /// installed (see [`PendingWatch::uncovered`]), and again before each reload, as the file is
@@ -126,17 +152,16 @@ impl ConfigWatch {
     /// what the kernel runs. macOS's FSEvents reports a write made shortly before the watch was
     /// installed to the watch just installed, and the same configuration would be reloaded once
     /// more after startup, a failed reload logged besides for a configuration with a problem.
-    /// Saved again word for word it is reloaded all the same (making the reload read the Geo data
-    /// files again when their watch could not be installed at all), the save changing its
-    /// modification time; on a
-    /// file system keeping that time to the second, other content of the same length written
-    /// within that second is told by the content
+    /// Saved again word for word it is reloaded all the same, the save leaving it looking
+    /// otherwise than before the read; on a file system keeping the modification time to the
+    /// second, other content of the same length written within that second is told by the
+    /// content
     pub fn start_reporting(
         self,
         engine: Engine,
         read: String,
         mut on_watch: impl FnMut(Option<&notify::Error>) + Send + 'static,
-    ) -> notify::Result<FileWatch> {
+    ) -> std::io::Result<FileWatch> {
         let Self { watch, before_read } = self;
         let mut as_read = before_read.map(|stamp| (stamp, read));
         on_watch(watch.uncovered().next().map(|(_, err)| err));
@@ -172,19 +197,18 @@ impl ConfigWatch {
                     }
                 }
             }, move |_, watched| on_watch(watched))
-            .map_err(notify::Error::io)
     }
 }
 
 /// 一个文件的路径、长度、修改时间和改动时间（见 [`Changed`]）：四样都没变，就当内容没变。记下文件读之前什么样：监视
 /// 报来的改动是不是还是读到的那份（见 [`ConfigWatch`]），监视核对时文件换没换样子（见 [`Targets::check`]），MMDB
-/// 换没换（见 `GeoIpManager::use_mmdb`），整个监视装不上时 Geo 数据文件换没换样子
+/// 换没换（见 `GeoIpManager::use_mmdb`），DoH 的证书和私钥换没换
 /// A file's path, length, modification time and change time (see [`Changed`]): with all four
 /// unchanged, its content counts as unchanged. It notes what a file looked like before it was
 /// read: whether a change the watch reports is still what was read (see [`ConfigWatch`]),
 /// whether the file looks otherwise when the watch checks itself (see [`Targets::check`]),
-/// whether the MMDB was replaced (see `GeoIpManager::use_mmdb`), and whether a Geo data file
-/// looks otherwise when its watch could not be installed at all
+/// whether the MMDB was replaced (see `GeoIpManager::use_mmdb`), and whether the DoH
+/// certificate and key were
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct FileStamp {
     path: PathBuf,
@@ -292,7 +316,7 @@ fn identity_of(dir: &Path) -> Option<Identity> {
 /// reach the callback after [`PendingWatch::start`]. Installing the watch before reading the
 /// files means a change made while they are being read is not missed.
 pub(crate) struct PendingWatch {
-    watcher: RecommendedWatcher,
+    watcher: Notify,
     targets: Targets,
     /// 装的时候有位置监视不上的文件，和为什么（见 [`PendingWatch::uncovered`]）/ The files with places
     /// that could not be watched when installed, and why (see [`PendingWatch::uncovered`])
@@ -312,42 +336,41 @@ impl PendingWatch {
     /// [`Targets::check`]), and each is logged as an error at the start (see
     /// [`PendingWatch::start_reporting`]); a watch dropped before it starts logs nothing, the
     /// error its user met reading the files saying more
-    pub(crate) fn new(paths: &[PathBuf]) -> notify::Result<Self> {
+    pub(crate) fn new(paths: &[PathBuf]) -> Self {
         let (tx, rx) = mpsc::channel();
         let events = tx.clone();
         let (watcher, targets, uncovered) = Targets::watch(paths, move |event| {
             let _ = events.send(Message::Event(event));
-        })?;
-        Ok(Self {
+        });
+        Self {
             watcher,
             targets,
             uncovered,
             every: checking_every(),
             tx,
             rx,
-        })
+        }
     }
 
-    /// 再监视 `paths`，在读它们之前调用：先读的文件决定了还要读哪些时（见 `engine::geo` 的 GeoIP 数据）。只有解析不了
-    /// 路径时报错
+    /// 再监视 `paths`，在读它们之前调用：先读的文件决定了还要读哪些时（见 `engine::geo` 的 GeoIP 数据）
     /// Watches `paths` too; call it before reading them, when the files read first decide which
-    /// others are read (see the GeoIP data in `engine::geo`). An error only when a path cannot be
-    /// resolved
-    pub(crate) fn add(&mut self, paths: &[PathBuf]) -> notify::Result<()> {
+    /// others are read (see the GeoIP data in `engine::geo`)
+    pub(crate) fn add(&mut self, paths: &[PathBuf]) {
         self.targets
-            .add(&mut self.watcher, paths, &mut self.uncovered)
+            .add(&mut self.watcher, paths, &mut self.uncovered);
     }
 
     /// 装的时候有位置监视不上的文件（一处都没监视上的也算）：配置里写的路径，和为什么（事件报不出那里的变化，由核对接上，
     /// 见 [`Targets::check`]）。比如符号链接指向的目录还不存在：链接所在的目录监视着，链接换了指向看得到，目录建好以后
-    /// 里面的文件出现了要等核对。开始以后文件重新解析时监视得怎样经 [`PendingWatch::start_reporting`] 的 `on_watch` 报
+    /// 里面的文件出现了要等核对。建不起 notify 的监视时是全部文件（见 [`Notify`]）。开始以后文件重新解析时监视得怎样经
+    /// [`PendingWatch::start_reporting`] 的 `on_watch` 报
     /// The files with places that could not be watched when installed (those watched nowhere
     /// included): the path as configured, and why (events do not report changes there, which
     /// the checks catch, see [`Targets::check`]). A symlink into a directory not there yet, say:
     /// the link's directory is watched, so the link pointing elsewhere is seen, yet once the
-    /// directory is made the file showing up in it waits for a check. How a file is watched as
-    /// it is resolved again after the start goes to `on_watch` of
-    /// [`PendingWatch::start_reporting`]
+    /// directory is made the file showing up in it waits for a check. Every file, when notify's
+    /// watcher cannot be made (see [`Notify`]). How a file is watched as it is resolved again
+    /// after the start goes to `on_watch` of [`PendingWatch::start_reporting`]
     pub(crate) fn uncovered(&self) -> impl Iterator<Item = (&Path, &notify::Error)> {
         self.uncovered
             .iter()
@@ -368,15 +391,15 @@ impl PendingWatch {
 
     /// 同 [`PendingWatch::start`]，文件每次重新解析、监视跟着换以后（回调之前，或者核对时又处处监视上了），把它监视得
     /// 怎样交给 `on_watch`：参数是配置里写的路径，和它新的位置为什么监视不上（事件报不出那里的变化，由核对接上；这时也
-    /// 记一条 error），都监视上了是 None。开始之前监视得怎样见 [`PendingWatch::uncovered`]，那些文件在这里、起线程
-    /// 之前各记一条 error
+    /// 记一条 error），都监视上了是 None。开始之前监视得怎样见 [`PendingWatch::uncovered`]，那些文件在这里、监视线程
+    /// 起来以后在调用的线程上各记一条 error
     /// As [`PendingWatch::start`], and each time a file is resolved again with the watches
     /// following (before its callback, or when a check finds it watched everywhere again), how
     /// it is watched goes to `on_watch`: the path as configured, and why its new places cannot be
     /// watched (events do not report changes there, which the checks catch; an error is logged
     /// too), None when every one is. How it is watched before the start, see
-    /// [`PendingWatch::uncovered`]; those files are each logged as an error here, before the
-    /// thread starts
+    /// [`PendingWatch::uncovered`]; those files are each logged as an error here, on the calling
+    /// thread once the watch thread has started
     pub(crate) fn start_reporting(
         self,
         name: &str,
@@ -391,24 +414,27 @@ impl PendingWatch {
             tx,
             rx,
         } = self;
+        let files = format!("{:?}", targets.configured());
+        let thread_name = name.to_owned();
+        let thread = thread::Builder::new()
+            .name(name.to_owned())
+            .spawn(move || {
+                // 监视随线程一起结束 / The watch ends with the thread
+                let (mut watcher, mut targets) = (watcher, targets);
+                pump(
+                    &thread_name,
+                    every,
+                    &mut watcher,
+                    &mut targets,
+                    &rx,
+                    &mut on_change,
+                    &mut on_watch,
+                );
+            })?;
         for (path, err) in &uncovered {
-            error!(name, path = %path.display(), error = %err, "cannot watch every place the file leads, {SEEN_WITHIN}");
+            error!(name, path = %path.display(), error = %err, "{UNWATCHED}, {SEEN_WITHIN}");
         }
-        info!(name, files = ?targets.configured(), "file watcher started (watching parent directories for atomic replacement support)");
-        let name = name.to_owned();
-        let thread = thread::Builder::new().name(name.clone()).spawn(move || {
-            // 监视随线程一起结束 / The watch ends with the thread
-            let (mut watcher, mut targets) = (watcher, targets);
-            pump(
-                &name,
-                every,
-                &mut watcher,
-                &mut targets,
-                &rx,
-                &mut on_change,
-                &mut on_watch,
-            );
-        })?;
+        info!(name, files = %files, "file watcher started (watching parent directories for atomic replacement support)");
         Ok(FileWatch {
             stop: tx,
             thread: Some(thread),
@@ -498,43 +524,76 @@ struct Target {
 /// the path as configured, and why
 type Uncovered = Vec<(PathBuf, notify::Error)>;
 
+/// notify 的监视。建不起来时（比如 inotify 的 max_user_instances 用完了）记着为什么：这个监视里的文件就哪儿都监视不上，
+/// 改动全由核对接上（见 [`Targets::check`]）
+/// notify's watcher. When it cannot be made (inotify's max_user_instances run out, say) why is
+/// kept: the files of this watch are then watched nowhere, every change caught by the checks
+/// (see [`Targets::check`])
+struct Notify(Result<RecommendedWatcher, String>);
+
+impl Notify {
+    fn new(handler: impl notify::EventHandler) -> Self {
+        #[cfg(test)]
+        if TEST_WITHOUT_NOTIFY.get() {
+            return Self(Err("no file watcher, for a test".to_owned()));
+        }
+        let watcher = RecommendedWatcher::new(handler, Config::default());
+        Self(watcher.map_err(|err| format!("the file watcher cannot be made: {err}")))
+    }
+
+    /// 监视目录 `dir`（不连带下面的）/ Watches the directory `dir` (not those under it)
+    fn watch(&mut self, dir: &Path) -> notify::Result<()> {
+        match &mut self.0 {
+            Ok(watcher) => watcher.watch(dir, RecursiveMode::NonRecursive),
+            Err(why) => Err(notify::Error::generic(why)),
+        }
+    }
+
+    /// 不再监视 `dir`。目录已经删掉、notify 已经撤了它时 notify 报错，不用管 / No longer watches
+    /// `dir`. notify errs when the directory is gone already or it has taken the watch out, which
+    /// needs no handling
+    fn unwatch(&mut self, dir: &Path) {
+        if let Ok(watcher) = &mut self.0 {
+            let _ = watcher.unwatch(dir);
+        }
+    }
+}
+
 impl Targets {
     /// 监视 `paths`，事件交给 `handler`，并给出有监视点所在的目录监视不了的文件和为什么，一个都监视不了的也在里面（它
-    /// 哪儿都没监视上，同一个监视里别的文件照常监视）。只有建不起监视、解析不了路径时报错
+    /// 哪儿都没监视上，同一个监视里别的文件照常监视）。notify 的监视建不起来时（见 [`Notify`]）是全部文件
     /// Watches `paths`, sending events to `handler`, and gives the files with a watch point
     /// directory that cannot be watched, and why, those with none that can included (watched
-    /// nowhere, the other files of the watch being watched as usual). An error only when the
-    /// watcher cannot be made or a path cannot be resolved
-    fn watch(
-        paths: &[PathBuf],
-        handler: impl notify::EventHandler,
-    ) -> notify::Result<(RecommendedWatcher, Self, Uncovered)> {
-        let mut watcher = RecommendedWatcher::new(handler, Config::default())?;
+    /// nowhere, the other files of the watch being watched as usual). Every file, when notify's
+    /// watcher cannot be made (see [`Notify`])
+    fn watch(paths: &[PathBuf], handler: impl notify::EventHandler) -> (Notify, Self, Uncovered) {
+        let mut watcher = Notify::new(handler);
         let mut targets = Self {
             files: Vec::with_capacity(paths.len()),
             dirs: HashMap::new(),
         };
         let mut uncovered = Vec::new();
-        targets.add(&mut watcher, paths, &mut uncovered)?;
-        Ok((watcher, targets, uncovered))
+        targets.add(&mut watcher, paths, &mut uncovered);
+        (watcher, targets, uncovered)
     }
 
-    /// 再监视 `paths`，有位置监视不上的文件加进 `uncovered`；已经在监视的不再算一遍。只有解析不了路径时报错
+    /// 再监视 `paths`，有位置监视不上的文件加进 `uncovered`；已经在监视的不再算一遍。解析不了路径的（相对路径，当前目录
+    /// 又没了）哪儿都监视不上，也算在里面
     /// Watches `paths` too, the files with places that cannot be watched going into
-    /// `uncovered`; one watched already does not count twice. An error only when a path cannot
-    /// be resolved
-    fn add(
-        &mut self,
-        watcher: &mut RecommendedWatcher,
-        paths: &[PathBuf],
-        uncovered: &mut Uncovered,
-    ) -> notify::Result<()> {
+    /// `uncovered`; one watched already does not count twice. One whose path cannot be resolved
+    /// (a relative path, the current directory gone) is watched nowhere and goes in too
+    fn add(&mut self, watcher: &mut Notify, paths: &[PathBuf], uncovered: &mut Uncovered) {
         for path in paths {
             if self.files.iter().any(|target| target.configured == *path) {
                 continue;
             }
-            let points = watch_points(path).map_err(notify::Error::io)?;
-            let (held, first_error) = self.hold(watcher, &points);
+            let (points, held, first_error) = match watch_points(path) {
+                Ok(points) => {
+                    let (held, first_error) = self.hold(watcher, &points);
+                    (points, held, first_error)
+                }
+                Err(err) => (Vec::new(), Vec::new(), Some(notify::Error::io(err))),
+            };
             if let Some(err) = first_error {
                 uncovered.push((path.clone(), err));
             }
@@ -545,7 +604,6 @@ impl Targets {
                 seen: FileStamp::of(path).ok(),
             });
         }
-        Ok(())
     }
 
     /// 监视 `points` 所在的目录，给出监视上了的（见 [`Target::held`]），和第一个监视不上的为什么
@@ -553,7 +611,7 @@ impl Targets {
     /// and why the first that did not
     fn hold(
         &mut self,
-        watcher: &mut RecommendedWatcher,
+        watcher: &mut Notify,
         points: &[PathBuf],
     ) -> (Vec<PathBuf>, Option<notify::Error>) {
         let mut held = Vec::with_capacity(points.len());
@@ -570,27 +628,26 @@ impl Targets {
     }
 
     /// 多一个监视点用 `dir`，头一个时开始监视它 / One more watch point uses `dir`; the first starts watching it
-    fn add_dir(&mut self, watcher: &mut RecommendedWatcher, dir: &Path) -> notify::Result<()> {
+    fn add_dir(&mut self, watcher: &mut Notify, dir: &Path) -> notify::Result<()> {
         if let Some(watched) = self.dirs.get_mut(dir) {
             watched.users += 1;
             return Ok(());
         }
         let identity = identity_of(dir);
-        watcher.watch(dir, RecursiveMode::NonRecursive)?;
+        watcher.watch(dir)?;
         let watched = Watched { users: 1, identity };
         self.dirs.insert(dir.to_path_buf(), watched);
         Ok(())
     }
 
-    /// 少一个监视点用 `dir`，没有了就不再监视。目录已经删掉时 notify 报错，不用管
-    /// One watch point fewer uses `dir`; with none left it is no longer watched. notify
-    /// errs when the directory is gone already, which needs no handling
-    fn remove_dir(&mut self, watcher: &mut RecommendedWatcher, dir: &Path) {
+    /// 少一个监视点用 `dir`，没有了就不再监视 / One watch point fewer uses `dir`; with none left it
+    /// is no longer watched
+    fn remove_dir(&mut self, watcher: &mut Notify, dir: &Path) {
         if let Some(watched) = self.dirs.get_mut(dir) {
             watched.users -= 1;
             if watched.users == 0 {
                 self.dirs.remove(dir);
-                let _ = watcher.unwatch(dir);
+                watcher.unwatch(dir);
             }
         }
     }
@@ -600,7 +657,7 @@ impl Targets {
     /// Resolves file `index` again and moves the watches to the directories of its new watch
     /// points. An error when it cannot be resolved (the watches staying where they were), or a
     /// watch point's directory cannot be watched: the watch does not see changes there
-    fn refresh(&mut self, watcher: &mut RecommendedWatcher, index: usize) -> notify::Result<()> {
+    fn refresh(&mut self, watcher: &mut Notify, index: usize) -> notify::Result<()> {
         let points = watch_points(&self.files[index].configured).map_err(notify::Error::io)?;
         // 先装新的再撤旧的，两边都用着的目录不会断开 / The new watches go in before the old come out,
         // so a directory both use is never dropped
@@ -633,7 +690,7 @@ impl Targets {
     /// notify took out only errs; FSEvents watches by path, and with it out behaves as the
     /// others. So, as far as events tell, the directories notify watches are always those
     /// counted here; what events do not tell the checks catch (see [`Targets::check`])
-    fn lost(&mut self, watcher: &mut RecommendedWatcher, gone: &[PathBuf]) -> Vec<usize> {
+    fn lost(&mut self, watcher: &mut Notify, gone: &[PathBuf]) -> Vec<usize> {
         let lost: Vec<PathBuf> = self
             .dirs
             .keys()
@@ -643,8 +700,7 @@ impl Targets {
         let mut files = Vec::new();
         for dir in &lost {
             self.dirs.remove(dir);
-            // notify 已经撤了的报错，不用管 / notify errs for one it has taken out, which needs no handling
-            let _ = watcher.unwatch(dir);
+            watcher.unwatch(dir);
             for (index, target) in self.files.iter_mut().enumerate() {
                 let counted = target.held.len();
                 target.held.retain(|held| held != dir);
@@ -656,7 +712,8 @@ impl Targets {
         files
     }
 
-    /// 核对监视有没有跟丢事件报不到的变化（见 [`CHECK_EVERY`]），`pending` 说的文件已经在等回调，不看。给出两样：
+    /// 核对监视有没有跟丢事件报不到的变化（见 [`CHECK_EVERY`]）。`pending` 说的文件已经在等回调，不比样子、不重新解析；
+    /// 用到换了的目录的照样给出（同一阵改动里只回调一次）。给出两样：
     ///
     /// - 要当成改了的文件：用到的目录不再是装监视时那一个的（上层目录改了名；这些目录像没了一样处理，见
     ///   [`Targets::lost`]），和文件自己换了样子的（见 [`Target::seen`]：有位置监视不上的地方改了，网络文件系统上别的
@@ -668,9 +725,10 @@ impl Targets {
     /// 所以 Linux 上比样子之前把还是那一个的目录都再监视一遍：还在的监视不变（IN_MASK_ADD），撤了的重新装上，这之前的
     /// 改动比得出样子，之后的事件报得到。装不上（比如目录改成了列不出）时还在的监视照旧，撤了的那里就只靠比样子
     ///
-    /// Checks for what the watch has lost track of with no event telling (see [`CHECK_EVERY`]),
-    /// leaving out the files `pending` names, which wait for their callback already. It gives two
-    /// things:
+    /// Checks for what the watch has lost track of with no event telling (see [`CHECK_EVERY`]).
+    /// The files `pending` names, waiting for their callback already, are neither compared nor
+    /// resolved again; those using a directory swapped are given all the same (called back once
+    /// in a burst). It gives two things:
     ///
     /// - The files to count as changed: those using a directory that is no longer the one its
     ///   watch went in on (a directory above renamed; such directories are handled as gone, see
@@ -691,7 +749,7 @@ impl Targets {
     /// out the comparison alone tells
     fn check(
         &mut self,
-        watcher: &mut RecommendedWatcher,
+        watcher: &mut Notify,
         pending: impl Fn(usize) -> bool,
     ) -> (Vec<usize>, Vec<usize>) {
         let moved: Vec<PathBuf> = self
@@ -703,7 +761,7 @@ impl Targets {
         let mut changed = self.lost(watcher, &moved);
         #[cfg(target_os = "linux")]
         for dir in self.dirs.keys() {
-            let _ = watcher.watch(dir, RecursiveMode::NonRecursive);
+            let _ = watcher.watch(dir);
         }
         let mut covered = Vec::new();
         for index in 0..self.files.len() {
@@ -917,7 +975,7 @@ fn watch_points(path: &Path) -> std::io::Result<Vec<PathBuf>> {
 fn pump(
     name: &str,
     every: Duration,
-    watcher: &mut RecommendedWatcher,
+    watcher: &mut Notify,
     targets: &mut Targets,
     rx: &Receiver<Message>,
     mut on_change: impl FnMut(&Path),
@@ -1012,7 +1070,7 @@ fn pump(
 fn call_back(
     name: &str,
     targets: &mut Targets,
-    watcher: &mut RecommendedWatcher,
+    watcher: &mut Notify,
     index: usize,
     on_change: &mut impl FnMut(&Path),
     on_watch: &mut impl FnMut(&Path, Option<&notify::Error>),
@@ -1020,7 +1078,7 @@ fn call_back(
     let watched = targets.refresh(watcher, index);
     let target = &mut targets.files[index];
     if let Err(err) = &watched {
-        error!(name, path = %target.configured.display(), error = %err, "cannot watch the file where it now leads, {SEEN_WITHIN}");
+        error!(name, path = %target.configured.display(), error = %err, "{UNWATCHED}, {SEEN_WITHIN}");
     }
     on_watch(&target.configured, watched.as_ref().err());
     target.seen = FileStamp::of(&target.configured).ok();
@@ -1040,7 +1098,7 @@ mod tests {
         let target = dir.path().join("target.file");
         std::fs::write(&target, "v1").expect("seed file");
 
-        let pending = PendingWatch::new(std::slice::from_ref(&target)).expect("watch");
+        let pending = PendingWatch::new(std::slice::from_ref(&target));
         std::fs::write(&target, "v2").expect("change file");
         let (tx, rx) = mpsc::channel();
         let _watch = pending
@@ -1067,7 +1125,6 @@ mod tests {
 
         let (tx, rx) = mpsc::channel();
         let watch = PendingWatch::new(std::slice::from_ref(&target))
-            .expect("watch")
             .start("test-watch", move |_| {
                 let _ = tx.send(());
             })
@@ -1098,7 +1155,6 @@ mod tests {
 
         let (tx, rx) = mpsc::channel();
         let _watch = PendingWatch::new(&[target.clone(), other.clone()])
-            .expect("watch")
             .start("test-watch", move |path| {
                 let _ = tx.send(path.to_path_buf());
             })
@@ -1129,7 +1185,6 @@ mod tests {
 
         let (tx, rx) = mpsc::channel();
         let _watch = PendingWatch::new(std::slice::from_ref(&relative))
-            .expect("watch")
             .start("test-watch", move |path| {
                 let _ = tx.send(path.to_path_buf());
             })
@@ -1156,7 +1211,6 @@ mod tests {
 
         let (tx, rx) = mpsc::channel();
         let _watch = PendingWatch::new(std::slice::from_ref(&target))
-            .expect("watch")
             .start("test-watch", move |_| {
                 let _ = tx.send(());
             })
@@ -1247,14 +1301,15 @@ mod tests {
 
     /// notify 漏了事件（比如 inotify 的队列满了）时报的 Rescan 不带路径：什么都可能改过，每个文件都回调一次，记一条
     /// error；notify 报的错也记 error，这两条带着监视的文件。重新解析以后有位置监视不上的文件（这里是所在的目录不在）
-    /// 也记一条 error，带着它的路径和那里改了会怎样（见 [`SEEN_WITHIN`]）。每条都带着监视的名字：配置、GeoSite、
+    /// 也记一条 error，和开始时说的一样（见 [`UNWATCHED`]），带着它的路径和那里改了会怎样（见 [`SEEN_WITHIN`]）。每条都带着监视的名字：配置、GeoSite、
     /// GeoIP、DoH 证书各有一个监视，看得出是哪个
     /// The Rescan notify reports when events were missed (inotify's queue overflowing, say)
     /// names no path: anything may have changed, so every file is called back once and an
     /// error is logged; an error notify reports is logged as an error too, both carrying the
     /// watch's files. A file with places that cannot be watched once resolved again (here its
-    /// directory is not there) logs an error too, carrying its path and what becomes of a change
-    /// there (see [`SEEN_WITHIN`]). Each carries the watch's name: the configuration,
+    /// directory is not there) logs an error too, saying what the start says (see
+    /// [`UNWATCHED`]) and carrying its path and what becomes of a change there (see
+    /// [`SEEN_WITHIN`]). Each carries the watch's name: the configuration,
     /// GeoSite, GeoIP and the DoH certificate each have a watch, and which one it is shows
     #[test]
     fn a_rescan_calls_every_file_back_and_errors_are_logged() {
@@ -1292,7 +1347,7 @@ mod tests {
             tx,
             rx,
             ..
-        } = PendingWatch::new(&files).expect("watch");
+        } = PendingWatch::new(&files);
         let rescan = notify::Event::new(EventKind::Other).set_flag(notify::event::Flag::Rescan);
         tx.send(Message::Event(Ok(rescan))).unwrap();
         tx.send(Message::Event(Err(notify::Error::generic("broken"))))
@@ -1341,6 +1396,7 @@ mod tests {
         }
         let unwatched = format!("path={} ", files[2].display());
         assert!(errors[2].contains(&unwatched), "{}", errors[2]);
+        assert!(errors[2].contains(UNWATCHED), "{}", errors[2]);
         assert!(errors[2].contains(SEEN_WITHIN), "{}", errors[2]);
     }
 
@@ -1387,7 +1443,6 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let read = target.clone();
         let _watch = PendingWatch::new(std::slice::from_ref(&target))
-            .expect("watch")
             .start("test-watch", move |_| {
                 let _ = tx.send(std::fs::read_to_string(&read).unwrap_or_default());
             })
@@ -1430,7 +1485,6 @@ mod tests {
 
         let (tx, rx) = mpsc::channel();
         let _watch = PendingWatch::new(std::slice::from_ref(&target))
-            .expect("watch")
             .start("test-watch", move |_| {
                 let _ = tx.send(());
             })
@@ -1473,7 +1527,6 @@ mod tests {
 
         let (tx, rx) = mpsc::channel();
         let _watch = PendingWatch::new(std::slice::from_ref(&configured))
-            .expect("watch")
             .start("test-watch", move |path| {
                 let _ = tx.send(path.to_path_buf());
             })
@@ -1514,7 +1567,6 @@ mod tests {
 
         let (tx, rx) = mpsc::channel();
         let _watch = PendingWatch::new(std::slice::from_ref(&configured))
-            .expect("watch")
             .start("test-watch", move |path| {
                 let _ = tx.send(path.to_path_buf());
             })
@@ -1557,7 +1609,6 @@ mod tests {
 
         let (tx, rx) = mpsc::channel();
         let _watch = PendingWatch::new(std::slice::from_ref(&configured))
-            .expect("watch")
             .start("test-watch", move |path| {
                 let _ = tx.send(path.to_path_buf());
             })
@@ -1600,7 +1651,7 @@ mod tests {
         let configured = real.join("conf/data.json.link");
         symlink(real.join("old/data.json"), &configured).unwrap();
         let (mut watcher, mut targets, _) =
-            Targets::watch(std::slice::from_ref(&configured), |_| {}).expect("watch");
+            Targets::watch(std::slice::from_ref(&configured), |_| {});
         assert_eq!(
             watched_dirs(&targets),
             [real.join("conf"), real.join("old")]
@@ -1635,7 +1686,7 @@ mod tests {
         let configured = conf.join("data.json");
         std::os::unix::fs::symlink(missing.join("data.json"), &configured).unwrap();
         let (mut watcher, mut targets, uncovered) =
-            Targets::watch(std::slice::from_ref(&configured), |_| {}).expect("watch");
+            Targets::watch(std::slice::from_ref(&configured), |_| {});
         assert_eq!(uncovered.len(), 1, "{uncovered:?}");
         assert_eq!(watched_dirs(&targets), std::slice::from_ref(&conf));
 
@@ -1663,8 +1714,7 @@ mod tests {
         let (first, second) = (conf.join("first.json"), conf.join("second.json"));
         symlink(shared.join("first.json"), &first).unwrap();
         std::fs::write(&second, "second").unwrap();
-        let (mut watcher, mut targets, _) =
-            Targets::watch(&[first, second.clone()], |_| {}).expect("watch");
+        let (mut watcher, mut targets, _) = Targets::watch(&[first, second.clone()], |_| {});
         let point_second_at = |target: PathBuf| {
             std::fs::remove_file(&second).unwrap();
             symlink(target, &second).unwrap();
@@ -1700,7 +1750,7 @@ mod tests {
         let (watched, nowhere) = (real.join("watched.file"), real.join("missing/nowhere.file"));
         std::fs::write(&watched, "v1").expect("seed file");
 
-        let pending = PendingWatch::new(&[nowhere.clone(), watched.clone()]).expect("watch");
+        let pending = PendingWatch::new(&[nowhere.clone(), watched.clone()]);
         let uncovered: Vec<&Path> = pending.uncovered().map(|(path, _)| path).collect();
         assert_eq!(uncovered, [nowhere.as_path()]);
         let (tx, rx) = mpsc::channel();
@@ -1733,7 +1783,7 @@ mod tests {
         std::os::unix::fs::symlink(root.path().join("missing/linked.json"), &linked).unwrap();
         std::fs::write(&plain, "plain").unwrap();
 
-        let pending = PendingWatch::new(&[linked.clone(), plain]).expect("watch");
+        let pending = PendingWatch::new(&[linked.clone(), plain]);
         let uncovered: Vec<(&Path, String)> = pending
             .uncovered()
             .map(|(path, err)| (path, err.to_string()))
@@ -1765,7 +1815,6 @@ mod tests {
             let (tx, rx) = mpsc::channel();
             let read = std::fs::read_to_string(&path).unwrap_or_default();
             let _watch = ConfigWatch::new(&path)
-                .expect("watch")
                 .start_reporting(engine.clone(), read, move |watched| {
                     let _ = tx.send(watched.map(ToString::to_string));
                 })
@@ -1806,7 +1855,6 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let (called, called_rx) = mpsc::channel();
         let _watch = PendingWatch::new(std::slice::from_ref(&configured))
-            .expect("watch")
             .start_reporting(
                 "test-watch",
                 move |path| {
@@ -1862,7 +1910,6 @@ mod tests {
         std::fs::write(&configured, "v1").unwrap();
         let (tx, rx) = mpsc::channel();
         let _watch = PendingWatch::new(std::slice::from_ref(&configured))
-            .expect("watch")
             .start("test-watch", move |path| {
                 let _ = tx.send(path.to_path_buf());
             })
@@ -1900,7 +1947,6 @@ mod tests {
         std::fs::write(new.join("data.json"), "v2").unwrap();
         let (tx, rx) = mpsc::channel();
         let _watch = PendingWatch::new(std::slice::from_ref(&configured))
-            .expect("watch")
             .start("test-watch", move |path| {
                 let _ = tx.send(path.to_path_buf());
             })
@@ -1966,7 +2012,6 @@ mod tests {
         }
         let (tx, rx) = mpsc::channel();
         let _watch = PendingWatch::new(&files)
-            .expect("watch")
             .start("test-watch", move |path| {
                 let _ = tx.send(path.to_path_buf());
             })
@@ -2023,7 +2068,7 @@ mod tests {
             tx,
             rx,
             ..
-        } = PendingWatch::new(std::slice::from_ref(&configured)).expect("watch");
+        } = PendingWatch::new(std::slice::from_ref(&configured));
         std::fs::remove_dir_all(&dir).unwrap();
         std::fs::create_dir(&dir).unwrap();
         // 删掉、重建的事件漏了 / The events of the removal and the making again are missed
@@ -2076,7 +2121,6 @@ mod tests {
         let (called, called_rx) = mpsc::channel();
         let (watched, watched_rx) = mpsc::channel();
         let watch = PendingWatch::new(paths)
-            .expect("watch")
             .start_reporting(
                 "test-watch",
                 move |path| {
@@ -2136,7 +2180,7 @@ mod tests {
         }
         let configured = real.join("A/geo/x.dat");
         let (mut watcher, mut targets, _) =
-            Targets::watch(std::slice::from_ref(&configured), |_| {}).expect("watch");
+            Targets::watch(std::slice::from_ref(&configured), |_| {});
         assert_eq!(targets.check(&mut watcher, |_| false), (vec![], vec![]));
 
         std::fs::rename(real.join("A"), real.join("A.old")).unwrap();
@@ -2164,8 +2208,9 @@ mod tests {
         std::fs::write(&configured, "v1").unwrap();
         let (events, rx) = mpsc::channel();
         let (mut watcher, mut targets, _) =
-            Targets::watch(std::slice::from_ref(&configured), events).expect("watch");
-        watcher.unwatch(&real).expect("the watch taken out");
+            Targets::watch(std::slice::from_ref(&configured), events);
+        let notify = watcher.0.as_mut().expect("notify's watcher");
+        notify.unwatch(&real).expect("the watch taken out");
 
         assert_eq!(targets.check(&mut watcher, |_| false), (vec![], vec![]));
         std::fs::write(&configured, "v2").unwrap();
@@ -2193,7 +2238,7 @@ mod tests {
         let configured = dir.path().join("b.dat");
         std::fs::write(&configured, "v1").unwrap();
         let (mut watcher, mut targets, _) =
-            Targets::watch(std::slice::from_ref(&configured), |_| {}).expect("watch");
+            Targets::watch(std::slice::from_ref(&configured), |_| {});
         let inode = || std::fs::metadata(&configured).unwrap().ino();
         let before = inode();
 
@@ -2292,12 +2337,9 @@ mod tests {
             mode(0o700);
             return;
         }
-        let pending = PendingWatch::new(std::slice::from_ref(&configured));
-        let uncovered = pending
-            .as_ref()
-            .map(|pending| pending.uncovered().count())
-            .unwrap_or_default();
-        drop(pending);
+        let uncovered = PendingWatch::new(std::slice::from_ref(&configured))
+            .uncovered()
+            .count();
         let (_watch, called, _) = checked_watch(std::slice::from_ref(&configured));
         std::fs::write(&configured, "v2, longer").unwrap();
         let seen = called.recv_timeout(Duration::from_secs(5)).ok();
@@ -2324,7 +2366,6 @@ mod tests {
         let engine = crate::engine::test_support::engine_from(serde_json::from_str(&read).unwrap());
         let _check = check_every(CHECKED);
         let _watch = ConfigWatch::new(&path)
-            .expect("watch")
             .start(engine.clone(), read)
             .expect("start");
         let generation = engine.config_generation();
@@ -2337,6 +2378,82 @@ mod tests {
                 Instant::now() < deadline,
                 "the new configuration file is reloaded"
             );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// notify 的监视建不起来（像 inotify 的 max_user_instances 用完了）：每个文件都监视不上，为什么就是建不起来的那个
+    /// 错误；文件改了，事件报不到，核对看出来，照样回调，回调之前也报一次它监视不上。以前整个监视装不上，改了谁也不知道
+    /// notify's watcher cannot be made (as when inotify's max_user_instances have run out): no
+    /// file can be watched, why being the error making it met; a file changed, with no event
+    /// telling, is caught by the check and called back all the same, reported unwatched before its
+    /// callback too. The whole watch used to go uninstalled, and nothing knew of a change
+    #[test]
+    fn without_notify_the_check_calls_a_change_back() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let files = [dir.path().join("a.json"), dir.path().join("b.json")];
+        for file in &files {
+            std::fs::write(file, "v1").unwrap();
+        }
+        let _notify = without_notify();
+        let pending = PendingWatch::new(&files);
+        let uncovered: Vec<(&Path, String)> = pending
+            .uncovered()
+            .map(|(path, err)| (path, err.to_string()))
+            .collect();
+        assert_eq!(uncovered.len(), 2, "{uncovered:?}");
+        assert!(
+            uncovered
+                .iter()
+                .all(|(_, why)| why.contains("no file watcher")),
+            "{uncovered:?}"
+        );
+        drop(pending);
+
+        let (_watch, called, watched) = checked_watch(&files);
+        std::fs::write(&files[1], "v2, longer").unwrap();
+        called_back(&called, &files[1], "the change caught by the check");
+        let (path, why) = watched.try_recv().expect("reported before the callback");
+        assert_eq!(path, files[1]);
+        assert!(why.is_some_and(|why| why.contains("no file watcher")));
+    }
+
+    /// notify 的监视建不起来：配置文件开始时就报监视不上、带着为什么；改了（面板保存那样写好再改名盖过去），核对看出来，
+    /// 照样重载。以前配置改了不重载，面板保存的配置永远不生效
+    /// notify's watcher cannot be made: the configuration file is reported unwatched from the
+    /// start, with why; changed (written aside and renamed over it, as the panel saves), it is
+    /// caught by the check and reloaded all the same. A change used to go unreloaded, a save from
+    /// the panel never applied
+    #[tokio::test]
+    async fn without_notify_a_config_change_is_reloaded_by_the_check() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let path = root.path().join("kixdns.json");
+        let config =
+            |version: &str| serde_json::json!({ "version": version, "pipelines": [] }).to_string();
+        std::fs::write(&path, config("first")).unwrap();
+        let read = std::fs::read_to_string(&path).unwrap();
+        let engine = crate::engine::test_support::engine_from(serde_json::from_str(&read).unwrap());
+        let (_check, _notify) = (check_every(CHECKED), without_notify());
+        let (tx, rx) = mpsc::channel();
+        let _watch = ConfigWatch::new(&path)
+            .start_reporting(engine.clone(), read, move |watched| {
+                let _ = tx.send(watched.map(ToString::to_string));
+            })
+            .expect("start");
+        let reported = rx.try_recv().expect("reported at the start");
+        assert!(
+            reported
+                .as_deref()
+                .is_some_and(|why| why.contains("no file watcher")),
+            "{reported:?}"
+        );
+        let generation = engine.config_generation();
+
+        std::fs::write(path.with_extension("tmp"), config("second")).unwrap();
+        std::fs::rename(path.with_extension("tmp"), &path).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while engine.config_generation() == generation {
+            assert!(Instant::now() < deadline, "the change is reloaded");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }

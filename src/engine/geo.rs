@@ -16,7 +16,7 @@ use super::types::EngineInner;
 use crate::matcher::geoip::{GeoIpManager, is_country_tag};
 use crate::matcher::geosite::{GeoSiteManager, parsed_provides_any};
 use crate::matcher::{GeoManagers, RuntimePipelineConfig};
-use crate::watcher::{FileStamp, FileWatch, PendingWatch, SEEN_WITHIN};
+use crate::watcher::{FileWatch, PendingWatch, SEEN_WITHIN};
 use parking_lot::Mutex;
 
 /// 配置里决定加载哪些 GeoSite 数据的部分 / The part of a configuration that decides which GeoSite data is loaded
@@ -71,58 +71,20 @@ impl GeoIpSpec {
     }
 }
 
-/// 按一份 spec 加载的数据从哪来、谁在监视 / Where the data loaded for a spec came from, and what watches it
+/// 按一份 spec 加载的数据从哪来、谁在监视（监视线程起不来时没有）/ Where the data loaded for a spec came
+/// from, and what watches it (nothing when the watch thread could not start)
 struct Loaded<S> {
     spec: S,
-    /// 监视装不上、起不了线程时，全部文件（数据文件和 MMDB），各带读它之前它什么样：换了样子由热重载读。监视着时是空的，
-    /// 它看不到的变化由它自己核对出来（见 `watcher::Targets::check`）
-    /// When the watch could not be installed or started, every file (the data files and the
-    /// MMDB), each with what it looked like before it was read: one looking otherwise is read by
-    /// a hot reload. Empty while watched, what the watch cannot see being caught by its own
-    /// checks (see `watcher::Targets::check`)
-    unwatched: Vec<Stamped>,
     watch: Option<FileWatch>,
 }
 
-impl<S: PartialEq> Loaded<S> {
-    /// 按 `spec` 加载的数据是否就是现在这份：监视以外的文件有哪个换了样子就不是；都还是那个样子时，存在却读不了的也一样，
-    /// 读出来的数据不会不同
-    /// Whether loading for `spec` would give the data already loaded: not once any file outside
-    /// the watch looks otherwise; while each looks the same, one there yet unreadable included,
-    /// reading again would give the same data
-    fn is_current(&self, spec: &S) -> bool {
-        self.spec == *spec && self.unwatched.iter().all(Stamped::unchanged)
-    }
-}
-
-/// 一个文件，和读它之前它什么样（不存在时是 None）/ A file, and what it looked like before it was
-/// read (None when it was missing)
-struct Stamped {
-    path: PathBuf,
-    seen: Option<FileStamp>,
-}
-
-impl Stamped {
-    /// `path` 现在的样子，在读它之前看：读的时候换了，下次热重载照样看得出来 / What `path` looks like
-    /// now, looked at before it is read: one replaced meanwhile is still noticed by the next hot reload
-    fn now(path: impl Into<PathBuf>) -> Self {
-        let path = path.into();
-        let seen = FileStamp::of(&path).ok();
-        Self { path, seen }
-    }
-
-    fn unchanged(&self) -> bool {
-        FileStamp::of(&self.path).ok() == self.seen
-    }
-}
-
 /// 两种 Geo 数据眼下的问题：配置了却不存在或读不了的文件、读得出来却没有规则用到的标签了的文件（留着先前读进来的数据）、
-/// 装不上的监视和有位置监视不上的文件、规则用到却没有数据提供的标签。启动、热重载和监视到文件变了时跟着更新，面板经控制
-/// 通道读（见 [`Engine::geo_data_warnings`]）
+/// 起不来的监视线程和有位置监视不上的文件、规则用到却没有数据提供的标签。启动、热重载和监视到文件变了时跟着更新，面板
+/// 经控制通道读（见 [`Engine::geo_data_warnings`]）
 /// What is wrong with the two kinds of Geo data right now: configured files that are missing
 /// or cannot be read, files that read yet have none of the tags rules use any more (the data
-/// read from them before staying), watches that cannot be installed and files with places
-/// that cannot be watched, and tags rules use that no data provides. Kept up to date at
+/// read from them before staying), watch threads that cannot start and files with places that
+/// cannot be watched, and tags rules use that no data provides. Kept up to date at
 /// startup, on hot reloads and as watched files change, and read by the panel over the
 /// control channel (see [`Engine::geo_data_warnings`])
 #[derive(Default)]
@@ -138,7 +100,7 @@ struct DataStatus {
     /// read in, and those that read yet have none of the tags rules use any more, each with the
     /// sentence saying so
     files: Vec<(PathBuf, String)>,
-    /// 监视装不上时说它的那句话 / The sentence saying the watch could not be installed, when it could not
+    /// 监视线程起不来时说它的那句话 / The sentence saying the watch thread could not start, when it could not
     watch: Option<String>,
     /// 监视着、却有位置监视不上的文件（事件报不出那里的变化，由监视的核对接上），各带说它的那句话
     /// The files watched, yet with places that cannot be (events not reporting changes there,
@@ -171,12 +133,12 @@ impl DataStatus {
         say(&mut self.files, (path.to_path_buf(), said));
     }
 
-    /// `what` 的监视因为 `err` 装不上：没有一个文件监视着，都在监视以外（见 `Loaded::unwatched`）
-    /// The watch on `what` could not be installed because of `err`: no file is watched, every
-    /// one being outside the watch (see `Loaded::unwatched`)
+    /// `what` 的监视线程因为 `err` 起不来：哪个文件都没人监视，改了要等重启才读
+    /// The watch thread of `what` could not start because of `err`: no file is watched by
+    /// anything, and a change waits for a restart to be read
     fn not_watched(&mut self, what: &str, err: &dyn std::fmt::Display) {
         self.watch = Some(format!(
-            "{what} cannot be watched for changes, which are read at the next configuration reload: {err}"
+            "{what} cannot be watched for changes, which are read after a restart: {err}"
         ));
         self.partly_watched.clear();
     }
@@ -233,15 +195,15 @@ fn say<F: AsRef<Path>>(sentences: &mut Vec<(F, String)>, said: (F, String)) {
 
 impl Engine {
     /// Geo 数据眼下的问题，一样一句话：配置了却不存在或读不了的文件、读得出来却没有规则用到的标签了的文件（只有它提供的
-    /// 标签留着先前读进来的数据，重启以后就没有了）、装不上的文件监视、有位置监视不上的文件、规则用到却没有数据提供的标签
+    /// 标签留着先前读进来的数据，重启以后就没有了）、起不来的监视线程、有位置监视不上的文件、规则用到却没有数据提供的标签
     /// （这样的规则 geo_site、geoip_country 永不命中，geo_site_not 总命中）。没有问题时是空的。启动、热重载和监视到文件
     /// 变了时跟着更新
     /// What is wrong with the Geo data right now, a sentence each: configured files that are
     /// missing or cannot be read, files that read yet have none of the tags rules use any more
     /// (the tags only they provide keeping the data read from them before, gone after a
-    /// restart), file watches that cannot be installed, files with places that cannot be
-    /// watched, and tags rules use that no data provides (geo_site and geoip_country never match
-    /// them, and geo_site_not always does).
+    /// restart), watch threads that cannot start, files with places that cannot be watched, and
+    /// tags rules use that no data provides (geo_site and geoip_country never match them, and
+    /// geo_site_not always does).
     /// Empty when nothing is wrong. Kept up to date at startup, on hot reloads and as watched
     /// files change
     pub fn geo_data_warnings(&self) -> Vec<String> {
@@ -358,7 +320,7 @@ impl GeoSources {
     /// data, so the new rules find the new tags and files from their first query
     pub(crate) fn follow(&mut self, cfg: RuntimePipelineConfig) {
         let spec = GeoSiteSpec::of(&cfg);
-        let (geosite, site) = (!self.geosite.is_current(&spec))
+        let (geosite, site) = (self.geosite.spec != spec)
             .then(|| {
                 info!(paths = ?spec.paths, tags = spec.tags.len(), "GeoSite data follows the new configuration");
                 // 先停下旧的监视并等它结束：它不会再换数据，状态里的就是在用的那份
@@ -369,7 +331,7 @@ impl GeoSources {
             })
             .unzip();
         let spec = GeoIpSpec::of(&cfg);
-        let (geoip, ip) = (!self.geoip.is_current(&spec))
+        let (geoip, ip) = (self.geoip.spec != spec)
             .then(|| {
                 info!(tags = ?spec.tags, db_path = ?spec.db_path, dat_path = ?spec.dat_path, "GeoIP data follows the new configuration");
                 self.geoip.watch = None;
@@ -440,9 +402,6 @@ type Reload = Box<dyn Fn(&ArcSwap<EngineInner>, &Path, &Mutex<DataStatus>) + Sen
 /// spec, not in the state yet
 struct Pending<S> {
     spec: S,
-    /// 读之前看过的文件（数据文件和 MMDB，见 [`Stamped::now`]），都交给了监视 / The files as looked at
-    /// before reading (the data files and the MMDB, see [`Stamped::now`]), every one handed to the watch
-    files: Vec<Stamped>,
     /// 装好、还没起线程的监视 / The watch installed, its thread not started yet
     watch: Option<PendingWatch>,
     /// 监视着的 MMDB，GeoSite 没有（见 [`named`]）/ The MMDB watched, none for GeoSite (see [`named`])
@@ -488,41 +447,11 @@ impl<S> Pending<S> {
                 of(&watching).lock().watched(what, path, err);
             },
         );
-        // 监视起不来时文件都在监视以外 / Without the watch running every file is outside it
-        let unwatched = if watch.is_some() {
-            Vec::new()
-        } else {
-            self.files
-        };
         Loaded {
             spec: self.spec,
-            unwatched,
             watch,
         }
     }
-}
-
-/// 开始监视 `files`，在读它们之前调用。不在的文件也监视：所在的目录在，出现时就看得见；目录也不在（或者经悬空的符号
-/// 链接），就和别的有位置监视不上的文件一样，由监视的核对接上（见 [`note_uncovered`]），链接换了指向照样看得见。装不上
-/// 时记一条错误、写进 `problems`，数据照样加载，文件换了样子由热重载读（见 [`Loaded::unwatched`]）
-/// Starts watching `files`; call it before reading them. A file not there is watched too:
-/// with its directory there it is seen once created; with its directory not there either (or
-/// behind a dangling symlink) it is caught up with by the watch's checks, as any other file with
-/// places that cannot be watched (see [`note_uncovered`]), and a link along the way pointing
-/// elsewhere is still seen. When the watch cannot be installed an error is logged and written
-/// to `problems`, the data is loaded all the same, and a file looking otherwise is read by a hot
-/// reload (see [`Loaded::unwatched`])
-fn pending_watch(
-    kind: &Kind,
-    files: &[PathBuf],
-    problems: &mut DataStatus,
-) -> Option<PendingWatch> {
-    PendingWatch::new(files)
-        .inspect_err(|err| {
-            error!(what = kind.files, error = %err, "cannot watch data files for changes, they are read again at the next configuration reload");
-            problems.not_watched(kind.files, err);
-        })
-        .ok()
 }
 
 /// 装好的监视里有位置监视不上的文件，写进 `problems`（见 [`DataStatus::watched`]）；`mmdb` 见 [`named`]
@@ -555,7 +484,7 @@ fn start_watch(
     pending?
         .start_reporting(name, on_change, on_watch)
         .inspect_err(|err| {
-            error!(name, error = %err, "cannot start the data file watcher, the files are read again at the next configuration reload");
+            error!(name, error = %err, "cannot start the data file watcher, changes to the files are read after a restart");
             status.lock().not_watched(what, err);
         })
         .ok()
@@ -582,10 +511,14 @@ fn load_geosite(
         spec.paths.iter().map(PathBuf::from).collect()
     };
     let mut problems = DataStatus::default();
-    let seen = files.iter().map(Stamped::now).collect();
-    let watch = (!files.is_empty())
-        .then(|| pending_watch(&GEOSITE, &files, &mut problems))
-        .flatten();
+    // 读之前先监视。不在的文件也监视：所在的目录在，出现时就看得见；目录也不在（或者经悬空的符号链接），就和别的有位置
+    // 监视不上的文件一样，由监视的核对接上（见 `note_uncovered`），链接换了指向照样看得见
+    // Watched before they are read. A file not there is watched too: with its directory there
+    // it is seen once created; with its directory not there either (or behind a dangling
+    // symlink) it is caught up with by the watch's checks, as any other file with places that
+    // cannot be watched (see `note_uncovered`), and a link along the way pointing elsewhere is
+    // still seen
+    let watch = (!files.is_empty()).then(|| PendingWatch::new(&files));
     note_uncovered(&GEOSITE, watch.as_ref(), None, &mut problems);
     let mut fresh = GeoSiteManager::default();
     // 读出来没有一个规则用到的标签的文件（读不了的也算）/ The files whose read gave none of the
@@ -654,7 +587,6 @@ fn load_geosite(
     let tags = spec.tags.clone();
     let pending = Pending {
         spec,
-        files: seen,
         watch,
         mmdb: None,
         reload: Box::new(move |state, path, status| {
@@ -740,10 +672,8 @@ fn load_geoip(
     // read, and for which tags, is known only once the MMDB is read (see below), and it joins
     // the watch then, still before it is read
     let mmdb = spec.db_path.as_ref().map(PathBuf::from);
-    let mut seen: Vec<Stamped> = mmdb.iter().map(Stamped::now).collect();
     let mut watch = (spec.db_path.is_some() || spec.dat_path.is_some())
-        .then(|| pending_watch(&GEOIP, mmdb.as_slice(), &mut problems))
-        .flatten();
+        .then(|| PendingWatch::new(mmdb.as_slice()));
     if let Some(db) = &mmdb
         && let Err(err) = fresh.use_mmdb(db, in_use)
     {
@@ -768,13 +698,8 @@ fn load_geoip(
             files.push(PathBuf::from(dat_path));
         }
     }
-    seen.extend(files.iter().map(Stamped::now));
-    if let Some(pending) = &mut watch
-        && let Err(err) = pending.add(&files)
-    {
-        error!(what = GEOIP.files, error = %err, "cannot watch data files for changes, they are read again at the next configuration reload");
-        problems.not_watched(GEOIP.files, &err);
-        watch = None;
+    if let Some(pending) = &mut watch {
+        pending.add(&files);
     }
     note_uncovered(&GEOIP, watch.as_ref(), mmdb.as_deref(), &mut problems);
     // 读出来没有一个规则用到的标签的数据文件（读不了的也算）/ The data file if its read gave none of
@@ -824,7 +749,6 @@ fn load_geoip(
     let (tags, database) = (spec.tags.clone(), mmdb.clone());
     let pending = Pending {
         spec,
-        files: seen,
         watch,
         mmdb,
         reload: Box::new(move |state, path, status| {

@@ -114,14 +114,14 @@ pub struct DohCertificate {
 
 impl DohCertificate {
     /// 读 `cert_path` 和 `key_path`，读之前先装好监视（见 `watcher::PendingWatch`）：读的时候证书续期了，这次改动排着队，
-    /// 照样换上。监视不了（装不上、起不了线程）只记错误，证书照用，续期的要重启才用上；有位置监视不上的文件，那里续期的
-    /// 10 秒以内察觉（见 `watcher::Targets::check`），开始监视时记一条错误。证书读不了时监视不开始，什么都不记，只有读不了
-    /// 的那个错误
+    /// 照样换上。监视线程起不来只记错误，证书照用，续期的要重启才用上；有位置监视不上的文件（建不起 notify 的监视时是两个
+    /// 都是），那里续期的 10 秒以内察觉（见 `watcher::Targets::check`），开始监视时记一条错误。证书读不了时监视不开始，
+    /// 什么都不记，只有读不了的那个错误
     /// Reads `cert_path` and `key_path`, watching them before they are read (see
     /// `watcher::PendingWatch`): a renewal made while they are read waits in line and is brought
-    /// in all the same. When they cannot be watched (the watch not installed, its thread not
-    /// started) an error is logged and the certificate used as read, a renewal waiting for a
-    /// restart; for a file with places that cannot be watched, a renewal there is noticed
+    /// in all the same. When the watch thread cannot start an error is logged and the
+    /// certificate used as read, a renewal waiting for a restart; for a file with places that
+    /// cannot be watched (both, when notify's watcher cannot be made), a renewal there is noticed
     /// within 10 s (see `watcher::Targets::check`), an error logged as the watch starts. With the
     /// certificate unreadable the watch does not start and logs nothing, the error being why it
     /// cannot be read alone
@@ -132,15 +132,11 @@ impl DohCertificate {
         let current = Arc::new(ArcSwap::from_pointee(build_tls_acceptor(
             cert_path, key_path,
         )?));
+        let reloaded = Arc::clone(&current);
+        let (cert, key) = (cert_path.to_owned(), key_path.to_owned());
         let watch = pending
-            .and_then(|pending| {
-                let reloaded = Arc::clone(&current);
-                let (cert, key) = (cert_path.to_owned(), key_path.to_owned());
-                pending
-                    .start("doh-cert-watcher", move |_| {
-                        reload(&reloaded, &cert, &key, &mut read);
-                    })
-                    .map_err(notify::Error::io)
+            .start("doh-cert-watcher", move |_| {
+                reload(&reloaded, &cert, &key, &mut read);
             })
             .inspect_err(|err| error!(cert = cert_path, key = key_path, error = %err, "cannot watch the DoH certificate, a renewed one is not used until restart"))
             .ok();
@@ -1560,6 +1556,31 @@ mod tests {
         })
         .await
         .expect("the certificate in the new directory is used");
+    }
+
+    /// notify 的监视建不起来（像 inotify 的 max_user_instances 用完了）：证书和私钥都监视不上，续期了，核对看出来，换上
+    /// 新证书。以前整个监视装不上，续期的证书要重启才用上
+    /// notify's watcher cannot be made (as when inotify's max_user_instances have run out): the
+    /// certificate and key cannot be watched, and once renewed the check tells, bringing the new
+    /// certificate in. The whole watch used to go uninstalled, a renewed certificate used only
+    /// after a restart
+    #[tokio::test]
+    async fn without_notify_a_renewal_is_used_after_the_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, key) = crate::engine::test_support::write_certificate(dir.path());
+        let _check = crate::watcher::check_every(Duration::from_millis(100));
+        let _notify = crate::watcher::without_notify();
+        let certificate = DohCertificate::load(&cert, &key).unwrap();
+        let read = certificate.current.load_full();
+
+        crate::engine::test_support::write_certificate(dir.path());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while Arc::ptr_eq(&certificate.current.load_full(), &read) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the renewed certificate is used");
     }
 
     /// 最后一个监听口停下时证书的监视也停下：监视线程结束，放下它手里的证书。以前这个线程谁也停不了，进程活着它就一直在
