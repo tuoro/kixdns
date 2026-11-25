@@ -400,8 +400,9 @@ pub struct RuntimeRule {
     /// what decisions carry; None for a rule without one, whose decisions then carry nothing.
     /// The rule used to keep its own copy of the response matchers and actions as well
     pub response_phase: Option<Arc<ResponsePhase>>,
-    /// Pre-computed merge result for multiple Forward actions (None if <=1 Forward action).
-    /// 多个 Forward action 的预计算合并结果（<=1 个 Forward 时为 None）。
+    /// 几个 forward 合并成的那一次转发，编译时算好；什么时候有见 `config::Rule::merged_forward` / The one
+    /// forward several forwards merge into, worked out as it compiles; when there is one, see
+    /// `config::Rule::merged_forward`
     pub merged_forward: Option<config::MergedForward>,
 }
 
@@ -519,12 +520,8 @@ impl RuntimePipelineConfig {
         let mut reads = Vec::new();
         for (i, p) in cfg.pipelines.into_iter().enumerate() {
             let mut rules = Vec::new();
-            for (j, mut r) in p.rules.into_iter().enumerate() {
-                // Pre-compute merged Forward upstreams for multi-Forward rules (performance optimization).
-                // Eliminates per-request FxHashSet + format! + join overhead on the hot path.
-                // 预计算多 Forward 规则的合并上游（性能优化）。
-                // 消除热路径上每请求的 FxHashSet + format! + join 开销。
-                r.compute_merged_forward();
+            for (j, r) in p.rules.into_iter().enumerate() {
+                let merged_forward = r.merged_forward();
                 let mut matchers: Vec<_> = r
                     .matchers
                     .into_iter()
@@ -584,7 +581,7 @@ impl RuntimePipelineConfig {
                     matchers,
                     actions,
                     response_phase,
-                    merged_forward: r.merged_forward,
+                    merged_forward,
                 });
             }
 
