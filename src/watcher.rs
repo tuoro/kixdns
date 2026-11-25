@@ -43,10 +43,13 @@ const CHECK_EVERY: Duration = Duration::from_secs(10);
 /// 有位置监视不上时那里的改动会怎样，日志和 Geo 数据的问题都这么说（见 [`CHECK_EVERY`]）/ What becomes of a
 /// change where the watch cannot see, as the log and the Geo data's problems say it (see [`CHECK_EVERY`])
 pub(crate) const SEEN_WITHIN: &str = "changes there are noticed within 10 s";
-const _: () = assert!(CHECK_EVERY.as_secs() == 10, "SEEN_WITHIN names the period");
+const _: () = assert!(
+    CHECK_EVERY.as_secs() == 10,
+    "SEEN_WITHIN and the log of a watch without notify name the period"
+);
 
-/// 日志说一个文件有位置监视不上（开始时，和重新解析以后）/ What the log says of a file with places
-/// that cannot be watched (at the start, and once resolved again)
+/// 日志说一个文件有位置监视不上（开始时，和重新解析以后变得监视不上时）/ What the log says of a file
+/// with places that cannot be watched (at the start, and as it comes to be so once resolved again)
 const UNWATCHED: &str = "cannot watch every place the file leads";
 
 #[cfg(test)]
@@ -390,16 +393,16 @@ impl PendingWatch {
     }
 
     /// 同 [`PendingWatch::start`]，文件每次重新解析、监视跟着换以后（回调之前，或者核对时又处处监视上了），把它监视得
-    /// 怎样交给 `on_watch`：参数是配置里写的路径，和它新的位置为什么监视不上（事件报不出那里的变化，由核对接上；这时也
-    /// 记一条 error），都监视上了是 None。开始之前监视得怎样见 [`PendingWatch::uncovered`]，那些文件在这里、监视线程
-    /// 起来以后在调用的线程上各记一条 error
+    /// 怎样交给 `on_watch`：参数是配置里写的路径，和它新的位置为什么监视不上（事件报不出那里的变化，由核对接上；从监视
+    /// 得上变成监视不上时也记一条 error），都监视上了是 None。开始之前监视得怎样见 [`PendingWatch::uncovered`]，那些
+    /// 文件在这里、监视线程起来以后在调用的线程上各记一条 error
     /// As [`PendingWatch::start`], and each time a file is resolved again with the watches
     /// following (before its callback, or when a check finds it watched everywhere again), how
     /// it is watched goes to `on_watch`: the path as configured, and why its new places cannot be
     /// watched (events do not report changes there, which the checks catch; an error is logged
-    /// too), None when every one is. How it is watched before the start, see
-    /// [`PendingWatch::uncovered`]; those files are each logged as an error here, on the calling
-    /// thread once the watch thread has started
+    /// too as it goes from watched to unwatched), None when every one is. How it is watched
+    /// before the start, see [`PendingWatch::uncovered`]; those files are each logged as an error
+    /// here, on the calling thread once the watch thread has started
     pub(crate) fn start_reporting(
         self,
         name: &str,
@@ -415,6 +418,11 @@ impl PendingWatch {
             rx,
         } = self;
         let files = format!("{:?}", targets.configured());
+        let how = if watcher.0.is_ok() {
+            "watching parent directories for atomic replacement support"
+        } else {
+            "without events, checking the files every 10 s"
+        };
         let thread_name = name.to_owned();
         let thread = thread::Builder::new()
             .name(name.to_owned())
@@ -434,7 +442,7 @@ impl PendingWatch {
         for (path, err) in &uncovered {
             error!(name, path = %path.display(), error = %err, "{UNWATCHED}, {SEEN_WITHIN}");
         }
-        info!(name, files = %files, "file watcher started (watching parent directories for atomic replacement support)");
+        info!(name, files = %files, "file watcher started ({how})");
         Ok(FileWatch {
             stop: tx,
             thread: Some(thread),
@@ -518,6 +526,13 @@ struct Target {
     /// callback, see [`FileStamp`]), None when it was not there: looking otherwise at a check,
     /// it was changed without an event telling (see [`Targets::check`])
     seen: Option<FileStamp>,
+    /// 上次报的是不是有位置监视不上（开始时、回调之前，和核对时又处处监视上了，见 [`call_back`]）：从监视得上变成监视不上
+    /// 才记 error，一直监视不上（比如建不起 notify 的监视）时不是每次回调都记一条
+    /// Whether it was last reported with places that cannot be watched (at the start, before a
+    /// callback, and when a check finds it watched everywhere again, see [`call_back`]): an error
+    /// is logged only as it goes from watched to unwatched, not on every callback while it stays
+    /// unwatched (notify's watcher not made, say)
+    unwatched: bool,
 }
 
 /// 有位置监视不上的文件：配置里写的路径，和为什么 / The files with places that cannot be watched:
@@ -538,7 +553,7 @@ impl Notify {
             return Self(Err("no file watcher, for a test".to_owned()));
         }
         let watcher = RecommendedWatcher::new(handler, Config::default());
-        Self(watcher.map_err(|err| format!("the file watcher cannot be made: {err}")))
+        Self(watcher.map_err(|err| cannot_make(&err)))
     }
 
     /// 监视目录 `dir`（不连带下面的）/ Watches the directory `dir` (not those under it)
@@ -557,6 +572,23 @@ impl Notify {
             let _ = watcher.unwatch(dir);
         }
     }
+}
+
+/// notify 的监视因为 `err` 建不起来时说的话。Linux 上 inotify 实例用完（fs.inotify.max_user_instances）和打开的文件
+/// 用完都是 EMFILE，系统只说后一个，看着像是 ulimit -n，所以两个都写明
+/// What is said when notify's watcher cannot be made because of `err`. On Linux inotify
+/// instances run out (fs.inotify.max_user_instances) and open files run out are both EMFILE,
+/// the system naming the latter alone, which reads as ulimit -n, so both are spelled out
+fn cannot_make(err: &notify::Error) -> String {
+    #[cfg(target_os = "linux")]
+    if let notify::ErrorKind::Io(io) = &err.kind
+        && io.raw_os_error() == Some(libc::EMFILE)
+    {
+        return format!(
+            "the file watcher cannot be made, inotify instances (fs.inotify.max_user_instances) or open files used up: {err}"
+        );
+    }
+    format!("the file watcher cannot be made: {err}")
 }
 
 impl Targets {
@@ -594,6 +626,7 @@ impl Targets {
                 }
                 Err(err) => (Vec::new(), Vec::new(), Some(notify::Error::io(err))),
             };
+            let unwatched = first_error.is_some();
             if let Some(err) = first_error {
                 uncovered.push((path.clone(), err));
             }
@@ -602,6 +635,7 @@ impl Targets {
                 points,
                 held,
                 seen: FileStamp::of(path).ok(),
+                unwatched,
             });
         }
     }
@@ -774,6 +808,7 @@ impl Targets {
             } else if target.held.len() < target.points.len()
                 && self.refresh(watcher, index).is_ok()
             {
+                self.files[index].unwatched = false;
                 covered.push(index);
             }
         }
@@ -961,17 +996,20 @@ fn watch_points(path: &Path) -> std::io::Result<Vec<PathBuf>> {
 /// 把变化交给 `on_change`，直到收到停止消息或通道关闭。一阵改动等到改了的文件都写完（见 [`Change::settle`]）、
 /// 最多 [`AT_MOST`]，每个文件重新解析、监视跟着换，监视得怎样交给 `on_watch`（见 [`PendingWatch::start_reporting`]），
 /// 再各回调一次。在监视的目录删掉、改名挪走时，用到它的文件也算改了（见 [`Targets::lost`]）。每过 `every` 核对一次
-/// （见 [`Targets::check`]）：核对出改了的文件和新出现的文件一样等写入停下再回调，又处处监视上了的文件只报给
-/// `on_watch`。记的日志带着监视的名字 `name` 和它的文件，看得出是哪个监视
+/// （见 [`Targets::check`]）：核对出改了的文件看不出写的一方关没关上它，和新出现的文件一样等写入停下再回调（原地写到
+/// 一半停得比 [`QUIET`] 久就读到半截，下次核对它又换了样子，再读一遍），又处处监视上了的文件只报给 `on_watch`。记的
+/// 日志带着监视的名字 `name` 和它的文件，看得出是哪个监视
 /// Hands changes to `on_change` until told to stop or the channel closes. A burst of changes
 /// is waited for until every file changed is written (see [`Change::settle`]), at most
 /// [`AT_MOST`]; then each file is resolved again with the watches following, how it is watched
 /// goes to `on_watch` (see [`PendingWatch::start_reporting`]), and it is called back once. A
 /// watched directory removed or renamed away counts as a change to the files using it (see
 /// [`Targets::lost`]). Every `every` it checks itself (see [`Targets::check`]): a file the
-/// check finds changed is waited for as a file newly there is before its callback, and one
-/// found watched everywhere again only goes to `on_watch`. What it logs carries the watch's
-/// `name` and its files, telling which watch it is
+/// check finds changed cannot tell whether its writer closed it, and is waited for as a file
+/// newly there is before its callback (written in place with a pause longer than [`QUIET`]
+/// halfway, half of it is read, and the next check, finding it looking otherwise again, reads
+/// it once more), while one found watched everywhere again only goes to `on_watch`. What it
+/// logs carries the watch's `name` and its files, telling which watch it is
 fn pump(
     name: &str,
     every: Duration,
@@ -984,6 +1022,13 @@ fn pump(
     let close_reported = RecommendedWatcher::kind() == WatcherKind::Inotify;
     let mut burst: Option<Burst> = None;
     let mut next_check = Instant::now() + every;
+    // 文件 `index` 在 `now` 有了 `change` 这样的动静，没有一阵改动在等时从它起一阵 / File `index` changed as
+    // `change` at `now`, a burst starting with it when none is waiting
+    let note = |burst: &mut Option<Burst>, index, change: Change, now| {
+        burst
+            .get_or_insert_with(|| Burst::new(now))
+            .note(index, now + change.settle(close_reported));
+    };
     loop {
         let now = Instant::now();
         // 一阵改动在等时也照样核对：事件不断时核对不会一直往后推 / A check is made with a burst
@@ -996,9 +1041,7 @@ fn pump(
                 on_watch(&targets.files[index].configured, None);
             }
             for index in changed {
-                burst
-                    .get_or_insert_with(|| Burst::new(now))
-                    .note(index, now + Change::Created.settle(close_reported));
+                note(&mut burst, index, Change::Created, now);
             }
         }
         let wake = burst
@@ -1016,9 +1059,8 @@ fn pump(
                 let dirs: Vec<PathBuf> = targets.dirs.keys().cloned().collect();
                 targets.lost(watcher, &dirs);
                 let now = Instant::now();
-                let burst = burst.get_or_insert_with(|| Burst::new(now));
                 for index in 0..targets.files.len() {
-                    burst.note(index, now + Change::Written.settle(close_reported));
+                    note(&mut burst, index, Change::Written, now);
                 }
             }
             Ok(Message::Event(Ok(event))) => {
@@ -1034,9 +1076,7 @@ fn pump(
                 });
                 let now = Instant::now();
                 for (index, change) in lost.chain(named) {
-                    burst
-                        .get_or_insert_with(|| Burst::new(now))
-                        .note(index, now + change.settle(close_reported));
+                    note(&mut burst, index, change, now);
                 }
             }
             // 出了错，改动可能要等核对才看得到；默认日志级别是 error，记成 warn 谁也看不到 / After an error
@@ -1061,10 +1101,12 @@ fn pump(
     }
 }
 
-/// 文件 `index` 改完了：先重新解析、跟上新的解析结果，监视得怎样交给 `on_watch`，记下它读之前的样子（见
-/// [`Target::seen`]），再交给 `on_change`。回调读文件时，新位置上的变化已经在监视之下
+/// 文件 `index` 改完了：先重新解析、跟上新的解析结果，监视得怎样交给 `on_watch`（从监视得上变成监视不上时也记一条
+/// error，见 [`Target::unwatched`]），记下它读之前的样子（见 [`Target::seen`]），再交给 `on_change`。回调读文件时，新
+/// 位置上的变化已经在监视之下
 /// File `index` is done changing: it is resolved again and the watches follow, how it is
-/// watched goes to `on_watch`, what it looks like before it is read is noted (see
+/// watched goes to `on_watch` (an error logged too as it goes from watched to unwatched, see
+/// [`Target::unwatched`]), what it looks like before it is read is noted (see
 /// [`Target::seen`]), and then it goes to `on_change`. By the time the callback reads the file,
 /// changes at the new places are being watched
 fn call_back(
@@ -1077,9 +1119,12 @@ fn call_back(
 ) {
     let watched = targets.refresh(watcher, index);
     let target = &mut targets.files[index];
-    if let Err(err) = &watched {
+    if let Err(err) = &watched
+        && !target.unwatched
+    {
         error!(name, path = %target.configured.display(), error = %err, "{UNWATCHED}, {SEEN_WITHIN}");
     }
+    target.unwatched = watched.is_err();
     on_watch(&target.configured, watched.as_ref().err());
     target.seen = FileStamp::of(&target.configured).ok();
     on_change(&target.configured);
@@ -1299,40 +1344,53 @@ mod tests {
         assert_eq!(gone(&both), std::slice::from_ref(&old));
     }
 
-    /// notify 漏了事件（比如 inotify 的队列满了）时报的 Rescan 不带路径：什么都可能改过，每个文件都回调一次，记一条
-    /// error；notify 报的错也记 error，这两条带着监视的文件。重新解析以后有位置监视不上的文件（这里是所在的目录不在）
-    /// 也记一条 error，和开始时说的一样（见 [`UNWATCHED`]），带着它的路径和那里改了会怎样（见 [`SEEN_WITHIN`]）。每条都带着监视的名字：配置、GeoSite、
-    /// GeoIP、DoH 证书各有一个监视，看得出是哪个
-    /// The Rescan notify reports when events were missed (inotify's queue overflowing, say)
-    /// names no path: anything may have changed, so every file is called back once and an
-    /// error is logged; an error notify reports is logged as an error too, both carrying the
-    /// watch's files. A file with places that cannot be watched once resolved again (here its
-    /// directory is not there) logs an error too, saying what the start says (see
-    /// [`UNWATCHED`]) and carrying its path and what becomes of a change there (see
-    /// [`SEEN_WITHIN`]). Each carries the watch's name: the configuration,
-    /// GeoSite, GeoIP and the DoH certificate each have a watch, and which one it is shows
-    #[test]
-    fn a_rescan_calls_every_file_back_and_errors_are_logged() {
+    /// 在这个线程上跑 `f`，给出这期间记的 `level` 及以上的每条日志的各个字段 / Runs `f` on this thread, giving
+    /// the fields of each event logged meanwhile at `level` and above
+    fn logged(level: tracing::Level, f: impl FnOnce()) -> Vec<String> {
         use tracing_subscriber::layer::SubscriberExt as _;
-        /// 记下的每条 error 的字段 / The fields of each error logged
-        struct Errors(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
-        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Errors {
+        /// 记下的每条日志的字段 / The fields of each event logged
+        struct Fields(
+            tracing::Level,
+            std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        );
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Fields {
             fn on_event(
                 &self,
                 event: &tracing::Event<'_>,
                 _: tracing_subscriber::layer::Context<'_, S>,
             ) {
-                if *event.metadata().level() == tracing::Level::ERROR {
+                if *event.metadata().level() <= self.0 {
                     let mut fields = String::new();
                     event.record(
                         &mut |field: &tracing::field::Field, value: &dyn std::fmt::Debug| {
                             fields.push_str(&format!("{}={value:?} ", field.name()));
                         },
                     );
-                    self.0.lock().unwrap().push(fields);
+                    self.1.lock().unwrap().push(fields);
                 }
             }
         }
+        // 这些日志别的测试的监视线程也会碰到 / Other tests' watch threads hit these logs too
+        crate::engine::test_support::callsites_ask_every_time();
+        let events = std::sync::Arc::default();
+        let subscriber =
+            tracing_subscriber::registry().with(Fields(level, std::sync::Arc::clone(&events)));
+        tracing::subscriber::with_default(subscriber, f);
+        std::mem::take(&mut *events.lock().unwrap())
+    }
+
+    /// notify 漏了事件（比如 inotify 的队列满了）时报的 Rescan 不带路径：什么都可能改过，每个文件都回调一次，记一条
+    /// error；notify 报的错也记 error，这两条带着监视的文件和监视的名字：配置、GeoSite、GeoIP、DoH 证书各有一个监视，看得
+    /// 出是哪个。重新解析以后还是监视不上的文件（这里是所在的目录不在，开始时就报过）不再记（见 [`Target::unwatched`]）
+    /// The Rescan notify reports when events were missed (inotify's queue overflowing, say)
+    /// names no path: anything may have changed, so every file is called back once and an
+    /// error is logged; an error notify reports is logged as an error too, both carrying the
+    /// watch's files and its name: the configuration, GeoSite, GeoIP and the DoH certificate each
+    /// have a watch, and which one it is shows. A file still unwatched once resolved again (here
+    /// its directory is not there, as reported at the start) logs nothing more (see
+    /// [`Target::unwatched`])
+    #[test]
+    fn a_rescan_calls_every_file_back_and_errors_are_logged() {
         let dir = tempfile::tempdir().expect("tempdir");
         // 不建这些文件，免得真的事件也回调它们；最后一个所在的目录也不在 / The files are not created,
         // so that no real event calls them back too; the last one's directory is not there either
@@ -1359,14 +1417,8 @@ mod tests {
             let _ = stop.send(Message::Stop);
         });
 
-        // 重新解析时记的那条，别的测试的监视线程也会碰到 / The one logged when resolving again is hit
-        // by other tests' watch threads too
-        crate::engine::test_support::callsites_ask_every_time();
-        let errors = std::sync::Arc::default();
-        let subscriber =
-            tracing_subscriber::registry().with(Errors(std::sync::Arc::clone(&errors)));
         let mut called = Vec::new();
-        tracing::subscriber::with_default(subscriber, || {
+        let errors = logged(tracing::Level::ERROR, || {
             pump(
                 "test-watch",
                 CHECK_EVERY,
@@ -1384,20 +1436,13 @@ mod tests {
         });
         called.sort();
         assert_eq!(called, files);
-        let errors = errors.lock().unwrap();
-        assert_eq!(errors.len(), 3, "{errors:#?}");
+        assert_eq!(errors.len(), 2, "{errors:#?}");
         for error in errors.iter() {
             assert!(error.contains("name=\"test-watch\""), "{error}");
-        }
-        for error in &errors[..2] {
             for file in &files {
                 assert!(error.contains(&format!("{file:?}")), "{error}");
             }
         }
-        let unwatched = format!("path={} ", files[2].display());
-        assert!(errors[2].contains(&unwatched), "{}", errors[2]);
-        assert!(errors[2].contains(UNWATCHED), "{}", errors[2]);
-        assert!(errors[2].contains(SEEN_WITHIN), "{}", errors[2]);
     }
 
     /// 一阵改动等到每个文件都安静下来：写着的文件晚，其它文件早安静了也得等它；它写完了就按它的时刻；
@@ -2192,13 +2237,15 @@ mod tests {
         assert_eq!(targets.check(&mut watcher, |_| false), (vec![], vec![]));
     }
 
-    /// 文件系统卸载又挂上：目录还是那一个，inotify 却撤了它的监视，notify 不说（这里绕过 [`Targets`] 撤掉监视来模拟）。
-    /// 核对把监视装回去，之后的改动事件报得到。以前核对只比目录是不是那一个，看不出来，之后每次改动都要等核对比样子
+    /// 文件系统卸载又挂上：目录还是那一个，inotify 却撤了它的监视，notify 不说、自己还记着它（这里绕过 notify 在内核里
+    /// 撤掉监视来模拟，见 [`take_out_behind_notify`]）。核对把监视装回去，之后的改动事件报得到。以前核对只比目录是不是
+    /// 那一个，看不出来，之后每次改动都要等核对比样子
     /// A file system unmounted and mounted again: the directory is the same one, yet inotify has
-    /// taken its watch out, notify telling no one (here the watch is taken out behind
-    /// [`Targets`]' back to stand in). The check puts the watch back, and later changes are
-    /// reported by events. The check used to compare only whether the directory was the same
-    /// one, which could not tell, and every change after waited for a check to compare the files
+    /// taken its watch out, notify telling no one and still counting it (here the watch is taken
+    /// out in the kernel behind notify's back to stand in, see [`take_out_behind_notify`]). The
+    /// check puts the watch back, and later changes are reported by events. The check used to
+    /// compare only whether the directory was the same one, which could not tell, and every
+    /// change after waited for a check to compare the files
     #[cfg(target_os = "linux")]
     #[test]
     fn the_check_puts_back_a_watch_taken_out_of_the_same_directory() {
@@ -2209,8 +2256,7 @@ mod tests {
         let (events, rx) = mpsc::channel();
         let (mut watcher, mut targets, _) =
             Targets::watch(std::slice::from_ref(&configured), events);
-        let notify = watcher.0.as_mut().expect("notify's watcher");
-        notify.unwatch(&real).expect("the watch taken out");
+        take_out_behind_notify(&real);
 
         assert_eq!(targets.check(&mut watcher, |_| false), (vec![], vec![]));
         std::fs::write(&configured, "v2").unwrap();
@@ -2219,6 +2265,41 @@ mod tests {
             .expect("an event")
             .expect("not an error");
         assert!(event.paths.contains(&configured), "{event:?}");
+    }
+
+    /// 绕过 notify 在内核里撤掉 `dir` 的 inotify 监视，像文件系统卸载时那样，notify 自己还记着它：按 /proc/self/fdinfo
+    /// 里每个监视记的 inode 号和设备号找到监视 `dir` 的 inotify 实例和监视号。不要 root
+    /// Takes `dir`'s inotify watch out in the kernel behind notify's back, as unmounting a file
+    /// system does, notify still counting it: the inotify instance and watch descriptor watching
+    /// `dir` are found by the inode and device numbers /proc/self/fdinfo gives for each watch.
+    /// Needs no root
+    #[cfg(target_os = "linux")]
+    fn take_out_behind_notify(dir: &Path) {
+        use std::os::unix::fs::MetadataExt as _;
+        let meta = std::fs::metadata(dir).unwrap();
+        // 一行是一个监视：inotify wd:1 ino:3e8 sdev:800001 ...，设备号按内核自己的编码 / A line per watch:
+        // inotify wd:1 ino:3e8 sdev:800001 ..., the device in the kernel's own encoding
+        let sdev = libc::major(meta.dev()) << 20 | libc::minor(meta.dev());
+        let watching = format!(" ino:{:x} sdev:{sdev:x} ", meta.ino());
+        let mut taken = 0;
+        for entry in std::fs::read_dir("/proc/self/fdinfo").unwrap().flatten() {
+            let fd = entry.file_name().to_str().and_then(|fd| fd.parse().ok());
+            let (Some(fd), Ok(info)) = (fd, std::fs::read_to_string(entry.path())) else {
+                continue;
+            };
+            for line in info.lines().filter(|line| line.contains(&watching)) {
+                let wd = line
+                    .strip_prefix("inotify wd:")
+                    .and_then(|rest| rest.split(' ').next())
+                    .and_then(|wd| i32::from_str_radix(wd, 16).ok())
+                    .expect("a watch descriptor");
+                // SAFETY: 只是撤掉一个监视，实例和监视号都是内核报的 / Only takes a watch out, the
+                // instance and the descriptor as the kernel gives them
+                assert_eq!(unsafe { libc::inotify_rm_watch(fd, wd) }, 0, "{line}");
+                taken += 1;
+            }
+        }
+        assert_eq!(taken, 1, "the one watch on {dir:?}");
     }
 
     /// vfat 上的文件被逐出 inode 缓存再读回，换了一个 inode 号，内容没变：核对不当它改了，不再读一遍。被监视的目录
@@ -2456,5 +2537,154 @@ mod tests {
             assert!(Instant::now() < deadline, "the change is reloaded");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    /// 建不起 notify 的监视时，文件连改三次、核对接上三次，每次回调之前都报它监视不上，却不再记 error：开始时已经为它记过
+    /// 一条（见 [`PendingWatch::uncovered`]）。以前每次回调都再记一条，默认日志级别看着像每次重载都出错
+    /// Without notify's watcher, a file changed three times and caught by the check three times
+    /// is reported unwatched before every callback, logging no error again: the start logged one
+    /// for it already (see [`PendingWatch::uncovered`]). Each callback used to log one more,
+    /// which at the default log level looked like every reload failing
+    #[test]
+    fn without_notify_changes_caught_by_the_check_log_no_error_again() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let configured = dir.path().join("a.json");
+        std::fs::write(&configured, "v1").unwrap();
+        let _notify = without_notify();
+        let PendingWatch {
+            mut watcher,
+            mut targets,
+            uncovered,
+            tx,
+            rx,
+            ..
+        } = PendingWatch::new(std::slice::from_ref(&configured));
+        assert_eq!(uncovered.len(), 1, "logged at the start");
+        let stop = tx.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_secs(5));
+            let _ = stop.send(Message::Stop);
+        });
+
+        // 每份都比上一份长，一个节拍里写的也看得出换了样子 / Each longer than the one before, so even
+        // one written within a tick looks otherwise
+        std::fs::write(&configured, "v2, longer").unwrap();
+        let (mut called, mut reported) = (0, Vec::new());
+        let errors = logged(tracing::Level::ERROR, || {
+            pump(
+                "test-watch",
+                CHECKED,
+                &mut watcher,
+                &mut targets,
+                &rx,
+                |path| {
+                    called += 1;
+                    if called < 3 {
+                        std::fs::write(path, "v3, longer still".repeat(called)).unwrap();
+                    } else {
+                        let _ = tx.send(Message::Stop);
+                    }
+                },
+                |_, why| reported.push(why.is_some()),
+            );
+        });
+        assert_eq!(called, 3, "each change caught by the check");
+        assert_eq!(reported, [true; 3], "reported unwatched every time");
+        assert_eq!(errors, Vec::<String>::new());
+    }
+
+    /// 只在从监视得上变成监视不上的那次回调记 error：所在的目录删掉（像事件说的那样不再监视它）以后回调记一条，目录还不在
+    /// 时再回调不记；回调时、核对时又处处监视上了，再删掉又记一条。每次回调都报给 `on_watch`
+    /// An error is logged only on the callback where a file goes from watched to unwatched: its
+    /// directory removed (watched no more, as an event has it), a callback logs one, and another
+    /// with the directory still gone logs none; watched everywhere again at a callback or at a
+    /// check, and removed again, it logs one more. Every callback is reported to `on_watch`
+    #[cfg(unix)]
+    #[test]
+    fn an_error_is_logged_as_a_file_becomes_unwatched_alone() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let real = std::fs::canonicalize(root.path()).unwrap();
+        let dir = real.join("geo");
+        std::fs::create_dir(&dir).unwrap();
+        let configured = dir.join("data.json");
+        let (mut watcher, mut targets, uncovered) =
+            Targets::watch(std::slice::from_ref(&configured), |_| {});
+        assert!(uncovered.is_empty(), "{uncovered:?}");
+        let remove = |targets: &mut Targets, watcher: &mut Notify| {
+            std::fs::remove_dir(&dir).unwrap();
+            targets.lost(watcher, std::slice::from_ref(&dir));
+        };
+
+        let mut reported = Vec::new();
+        let errors = logged(tracing::Level::ERROR, || {
+            let mut back = |targets: &mut Targets, watcher: &mut Notify| {
+                let on_watch = &mut |_: &Path, why: Option<&notify::Error>| {
+                    reported.push(why.is_some());
+                };
+                call_back("test-watch", targets, watcher, 0, &mut |_| {}, on_watch);
+            };
+            remove(&mut targets, &mut watcher);
+            back(&mut targets, &mut watcher);
+            back(&mut targets, &mut watcher);
+            std::fs::create_dir(&dir).unwrap();
+            back(&mut targets, &mut watcher);
+            remove(&mut targets, &mut watcher);
+            back(&mut targets, &mut watcher);
+            std::fs::create_dir(&dir).unwrap();
+            assert_eq!(targets.check(&mut watcher, |_| false), (vec![], vec![0]));
+            remove(&mut targets, &mut watcher);
+            back(&mut targets, &mut watcher);
+        });
+        assert_eq!(reported, [true, true, false, true, true]);
+        assert_eq!(errors.len(), 3, "{errors:#?}");
+        let path = format!("path={} ", configured.display());
+        for error in &errors {
+            assert!(
+                error.contains(&path) && error.contains(UNWATCHED),
+                "{error}"
+            );
+        }
+    }
+
+    /// 建不起 notify 的监视时，开始的那条日志说按 10 秒核对，不说在监视上层目录 / Without notify's watcher, the
+    /// log of the start says the files are checked every 10 s, not that parent directories are watched
+    #[test]
+    fn without_notify_the_start_says_the_files_are_checked() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let configured = dir.path().join("a.json");
+        let _notify = without_notify();
+        let started = logged(tracing::Level::INFO, || {
+            PendingWatch::new(std::slice::from_ref(&configured))
+                .start("test-watch", |_| {})
+                .expect("start");
+        });
+        let started: Vec<&String> = started
+            .iter()
+            .filter(|event| event.contains("file watcher started"))
+            .collect();
+        assert_eq!(started.len(), 1, "{started:#?}");
+        assert!(
+            started[0].contains("without events, checking the files every 10 s"),
+            "{started:#?}"
+        );
+    }
+
+    /// Linux 上建不起 notify 的监视、报的是 EMFILE 时，说的话写明 inotify 实例和打开的文件两种可能：系统只说「No file
+    /// descriptors available」，看着像是 ulimit -n
+    /// When notify's watcher cannot be made on Linux with EMFILE, what is said names both inotify
+    /// instances and open files: the system says "No file descriptors available" alone, which
+    /// reads as ulimit -n
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn running_out_of_inotify_instances_is_named() {
+        let emfile = notify::Error::io(std::io::Error::from_raw_os_error(libc::EMFILE));
+        let said = cannot_make(&emfile);
+        assert!(said.contains("fs.inotify.max_user_instances"), "{said}");
+        assert!(said.ends_with(&emfile.to_string()), "{said}");
+        let other = notify::Error::io(std::io::Error::from_raw_os_error(libc::ENOMEM));
+        assert_eq!(
+            cannot_make(&other),
+            format!("the file watcher cannot be made: {other}")
+        );
     }
 }
