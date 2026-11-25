@@ -261,6 +261,7 @@ enum Message {
 /// Linux inotify 监视的是 inode 而不是路径，目录能收到目标文件名的 IN_MOVED_TO/IN_CREATE。
 /// 路径经过符号链接时，路上每个符号链接所在的目录和真文件所在的目录都监视（见 [`watch_points`]），
 /// 链接指向别的目录、Kubernetes 卷换 `..data` 这样的变化也能察觉；有变化时重新解析，监视跟着换。
+/// 在监视的目录自己删掉、改名挪走时，用到它的文件也重新解析（见 [`Targets::lost`]）。
 /// 事件按完整路径对上文件，另一个被监视的目录里同名的文件不算。
 /// The watched files. Each file is watched through its directory so atomic replacement
 /// (write tmp + rename over target) is detected: Linux inotify watches inodes, not paths, and
@@ -268,8 +269,9 @@ enum Message {
 /// through symlinks, the directory of every symlink along the way and that of the real file
 /// are watched too (see [`watch_points`]), so a link to another directory, or a Kubernetes
 /// volume swapping `..data`, is detected as well; on a change the path is resolved again and
-/// the watches follow. Events are matched to files by full path, so a file of the same name
-/// in another watched directory does not count.
+/// the watches follow. A watched directory itself removed or renamed away has the files using
+/// it resolved again too (see [`Targets::lost`]). Events are matched to files by full path, so
+/// a file of the same name in another watched directory does not count.
 struct Targets {
     files: Vec<Target>,
     /// 在监视的目录，以及各被几个监视点用着 / The directories watched, and how many watch points use each
@@ -282,12 +284,13 @@ struct Target {
     configured: PathBuf,
     /// 它的变化出现在哪些路径的事件里（见 [`watch_points`]）/ The paths its changes show up under in events (see [`watch_points`])
     points: Vec<PathBuf>,
-    /// 替它记着数的目录（见 [`Targets::dirs`]）：监视点所在的目录里监视上了的，每个监视点一项。撤它的监视时只减这些，
-    /// 没替它监视上的目录不减：那个目录后来替它或别的文件监视上了，记的数是后来那些的
+    /// 替它记着数的目录（见 [`Targets::dirs`]）：监视点所在的目录里监视上了的，每个监视点一项，没了的不算（见
+    /// [`Targets::lost`]）。撤它的监视时只减这些，没替它监视上的目录不减：那个目录后来替它或别的文件监视上了，记的数是
+    /// 后来那些的
     /// The directories counted for it (see [`Targets::dirs`]): those of its watch points'
-    /// directories that went in, one per watch point. Its watches come out by these alone,
-    /// never by a directory that did not go in for it: watched later, for it or another file,
-    /// that directory's count is theirs
+    /// directories that went in, one per watch point, less those gone (see [`Targets::lost`]).
+    /// Its watches come out by these alone, never by a directory that did not go in for it:
+    /// watched later, for it or another file, that directory's count is theirs
     held: Vec<PathBuf>,
 }
 
@@ -398,6 +401,36 @@ impl Targets {
         uncovered.map_or(Ok(()), Err)
     }
 
+    /// 在监视的目录里 `gone` 说没了的（见 [`gone`]）不再监视、不再记数，给出替它们记着数的文件（见 [`Target::held`]）：
+    /// 这些文件重新解析时，目录回来了就重新监视，没回来就是监视不上。监视总要撤：inotify 的监视跟着改名挪走的旧目录走，
+    /// 事件却还按原来的路径报；删掉的目录 inotify、kqueue 已经撤了，再撤只是报错；FSEvents 按路径监视，撤了和别的平台
+    /// 一样。notify 监视着的目录就总是这里记着的那些
+    /// Those of the watched directories that `gone` names (see [`gone`]) are watched and
+    /// counted no more, giving the files they were counted for (see [`Target::held`]): resolved
+    /// again, these are watched there anew once the directory is back, and cannot be watched
+    /// there if not. The watch always comes out: inotify's follows a directory renamed away, its
+    /// events still reported under the old path; inotify and kqueue have taken out a removed
+    /// directory's already, so this only errs; FSEvents watches by path, and with it out
+    /// behaves as the others. So the directories notify watches are always those counted here
+    fn lost(&mut self, watcher: &mut RecommendedWatcher, gone: &[PathBuf]) -> Vec<usize> {
+        let mut files = Vec::new();
+        for dir in gone {
+            if self.dirs.remove(dir).is_none() {
+                continue;
+            }
+            // notify 已经撤了的报错，不用管 / notify errs for one it has taken out, which needs no handling
+            let _ = watcher.unwatch(dir);
+            for (index, target) in self.files.iter_mut().enumerate() {
+                let counted = target.held.len();
+                target.held.retain(|held| held != dir);
+                if target.held.len() != counted && !files.contains(&index) {
+                    files.push(index);
+                }
+            }
+        }
+        files
+    }
+
     /// 配置里写的路径，按文件的顺序，记日志用 / The paths as configured, in the files' order, for
     /// the log
     fn configured(&self) -> Vec<&Path> {
@@ -462,6 +495,22 @@ impl Change {
             Self::Writing if close_reported => AT_MOST,
             Self::Writing | Self::Created => QUIET,
         }
+    }
+}
+
+/// 事件说没了的路径：删掉的，改名挪走的（两端都列出来的改名是头一个）。说不出是哪头的改名（kqueue、FSEvents）也算：
+/// 那里的已经不是原来那个了
+/// The paths an event says are gone: removed, or renamed away (the first of a rename naming
+/// both ends). A rename not telling which end it is (kqueue, FSEvents) counts too: what is
+/// there is no longer what was
+fn gone(event: &notify::Event) -> &[PathBuf] {
+    match event.kind {
+        EventKind::Remove(_)
+        | EventKind::Modify(ModifyKind::Name(RenameMode::From | RenameMode::Any)) => &event.paths,
+        EventKind::Modify(ModifyKind::Name(RenameMode::Both)) => {
+            event.paths.get(..1).unwrap_or_default()
+        }
+        _ => &[],
     }
 }
 
@@ -557,12 +606,15 @@ fn watch_points(path: &Path) -> std::io::Result<Vec<PathBuf>> {
 
 /// 把变化交给 `on_change`，直到收到停止消息或通道关闭。一阵改动等到改了的文件都写完（见 [`Change::settle`]）、
 /// 最多 [`AT_MOST`]，每个文件重新解析、监视跟着换，监视得怎样交给 `on_watch`（见 [`PendingWatch::start_reporting`]），
-/// 再各回调一次。记的日志带着监视的名字 `name` 和它的文件，看得出是哪个监视
+/// 再各回调一次。在监视的目录删掉、改名挪走时，用到它的文件也算改了（见 [`Targets::lost`]）。记的日志带着监视的名字
+/// `name` 和它的文件，看得出是哪个监视
 /// Hands changes to `on_change` until told to stop or the channel closes. A burst of changes
 /// is waited for until every file changed is written (see [`Change::settle`]), at most
 /// [`AT_MOST`]; then each file is resolved again with the watches following, how it is watched
-/// goes to `on_watch` (see [`PendingWatch::start_reporting`]), and it is called back once. What
-/// it logs carries the watch's `name` and its files, telling which watch it is
+/// goes to `on_watch` (see [`PendingWatch::start_reporting`]), and it is called back once. A
+/// watched directory removed or renamed away counts as a change to the files using it (see
+/// [`Targets::lost`]). What it logs carries the watch's `name` and its files, telling which
+/// watch it is
 fn pump(
     name: &str,
     watcher: &mut RecommendedWatcher,
@@ -584,6 +636,11 @@ fn pump(
             // naming no path: anything may have changed, and every file counts as written
             Ok(Message::Event(Ok(event))) if event.need_rescan() => {
                 error!(name, files = ?targets.configured(), "the file watcher missed events, reading every watched file again");
+                // 漏掉的事件里可能有在监视的目录没了：监视全部撤掉，回调之前各文件重新解析时再装上
+                // The events missed may include a watched directory going away: every watch
+                // comes out, to go in again as each file is resolved again before its callback
+                let dirs: Vec<PathBuf> = targets.dirs.keys().cloned().collect();
+                targets.lost(watcher, &dirs);
                 let now = Instant::now();
                 let burst = burst.get_or_insert_with(|| Burst::new(now));
                 for index in 0..targets.files.len() {
@@ -591,11 +648,18 @@ fn pump(
                 }
             }
             Ok(Message::Event(Ok(event))) => {
-                let Some((change, paths)) = Change::of(&event) else {
-                    continue;
-                };
+                // 在监视的目录没了的，用到它的文件重新解析（见 `Targets::lost`）。目录可能马上重建、文件跟着写进来，和
+                // 新出现的文件一样等写入停下
+                // For a watched directory gone, the files using it are resolved again (see
+                // `Targets::lost`). The directory may be made again at once, the file written
+                // into it: waited for as a file newly there is
+                let lost = targets.lost(watcher, gone(&event));
+                let lost = lost.into_iter().map(|index| (index, Change::Created));
+                let named = Change::of(&event).into_iter().flat_map(|(change, paths)| {
+                    targets.named(paths).map(move |index| (index, change))
+                });
                 let now = Instant::now();
-                for index in targets.named(paths) {
+                for (index, change) in lost.chain(named) {
                     burst
                         .get_or_insert_with(|| Burst::new(now))
                         .note(index, now + change.settle(close_reported));
@@ -811,6 +875,37 @@ mod tests {
             Change::of(&both),
             Some((Change::Written, std::slice::from_ref(&to)))
         );
+    }
+
+    /// 事件说没了的路径：删掉的、改名挪走的，两端都列出来的改名是头一个，说不出是哪头的改名（kqueue、FSEvents）也算；
+    /// 改名到达、新建、写入都不算
+    /// The paths an event says are gone: removed, renamed away, the first of a rename naming
+    /// both ends, and a rename not telling which end it is (kqueue, FSEvents) too; an arrival, a
+    /// creation and a write are not
+    #[test]
+    fn events_tell_which_paths_are_gone() {
+        use notify::event::{CreateKind, DataChange, RemoveKind};
+        let (old, new) = (PathBuf::from("/d/geo"), PathBuf::from("/d/geo.new"));
+        let event = |kind| notify::Event::new(kind).add_path(old.clone());
+        for kind in [
+            EventKind::Remove(RemoveKind::Folder),
+            EventKind::Modify(ModifyKind::Name(RenameMode::From)),
+            EventKind::Modify(ModifyKind::Name(RenameMode::Any)),
+        ] {
+            assert_eq!(gone(&event(kind)), std::slice::from_ref(&old), "{kind:?}");
+        }
+        for kind in [
+            EventKind::Modify(ModifyKind::Name(RenameMode::To)),
+            EventKind::Create(CreateKind::Folder),
+            EventKind::Modify(ModifyKind::Data(DataChange::Content)),
+            EventKind::Access(AccessKind::Close(AccessMode::Write)),
+        ] {
+            assert_eq!(gone(&event(kind)), [] as [PathBuf; 0], "{kind:?}");
+        }
+        let both = notify::Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+            .add_path(old.clone())
+            .add_path(new);
+        assert_eq!(gone(&both), std::slice::from_ref(&old));
     }
 
     /// notify 漏了事件（比如 inotify 的队列满了）时报的 Rescan 不带路径：什么都可能改过，每个文件都回调一次，记一条
@@ -1409,5 +1504,136 @@ mod tests {
             "watched again"
         );
         called_back(&called_rx, &configured, "the link pointed back");
+    }
+
+    /// 文件所在的目录删掉、马上重建（`rm -rf` 以后再建、装包时重装）：监视装到新目录上，文件读一遍，之后再改照样回调。
+    /// inotify 在目录删掉时撤了它的监视，以前这里还当它监视着，新目录里怎么改都看不到，直到重启
+    /// The directory a file sits in removed and made again at once (`rm -rf` then made anew, a
+    /// package reinstalled): the watch goes in on the new directory, the file is read once, and
+    /// later edits are called back as ever. inotify takes a directory's watch out when it is
+    /// removed, which used to be counted as watched still, so nothing done in the new directory
+    /// was seen until a restart
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_removed_and_made_again_at_once_is_watched_again() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = root.path().join("geo");
+        std::fs::create_dir(&dir).unwrap();
+        let configured = dir.join("data.json");
+        std::fs::write(&configured, "v1").unwrap();
+        let (tx, rx) = mpsc::channel();
+        let _watch = PendingWatch::new(std::slice::from_ref(&configured))
+            .expect("watch")
+            .start("test-watch", move |path| {
+                let _ = tx.send(path.to_path_buf());
+            })
+            .expect("start");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(&configured, "v2").unwrap();
+        called_back(&rx, &configured, "the file in the directory made again");
+        std::fs::write(&configured, "v3").unwrap();
+        called_back(&rx, &configured, "the file edited afterwards");
+    }
+
+    /// 文件所在的目录改名换掉（`mv geo geo.old; mv geo.new geo`）：监视换到新目录上，读一遍新目录里的文件，之后新目录里
+    /// 改了回调，挪走的旧目录里改了不回调。inotify 的监视跟着旧目录走、事件却还按原来的路径报：以前新目录里的改动看不到，
+    /// 旧目录里的改动反而当成这个文件的
+    /// The directory a file sits in swapped by renames (`mv geo geo.old; mv geo.new geo`): the
+    /// watch moves to the new directory and the file in it is read once; later edits in the new
+    /// directory are called back, and edits in the old one moved away are not. inotify's watch
+    /// follows the old directory, its events still reported under the old path: edits in the new
+    /// directory used to go unseen, and edits in the old one were taken for this file's
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_swapped_by_renames_is_watched_in_its_new_place() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let (dir, new, old) = (
+            root.path().join("geo"),
+            root.path().join("geo.new"),
+            root.path().join("geo.old"),
+        );
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::create_dir(&new).unwrap();
+        let configured = dir.join("data.json");
+        std::fs::write(&configured, "v1").unwrap();
+        std::fs::write(new.join("data.json"), "v2").unwrap();
+        let (tx, rx) = mpsc::channel();
+        let _watch = PendingWatch::new(std::slice::from_ref(&configured))
+            .expect("watch")
+            .start("test-watch", move |path| {
+                let _ = tx.send(path.to_path_buf());
+            })
+            .expect("start");
+
+        std::fs::rename(&dir, &old).unwrap();
+        std::fs::rename(&new, &dir).unwrap();
+        called_back(&rx, &configured, "the directory swapped");
+        std::fs::write(&configured, "v3").unwrap();
+        called_back(&rx, &configured, "the file in the new directory edited");
+        std::fs::write(old.join("data.json"), "old edited").unwrap();
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1)),
+            Err(mpsc::RecvTimeoutError::Timeout),
+            "the old directory is no longer watched"
+        );
+    }
+
+    /// 漏了事件（Rescan）以后监视全部重新装上：漏掉的里面可能有在监视的目录删掉重建。以前重新解析只给记着的目录加个数，
+    /// 新目录一直没监视，之后的改动都看不到
+    /// After events are missed (a Rescan) every watch goes in anew: those missed may include a
+    /// watched directory removed and made again. Resolving the file again used to add one to
+    /// the count of the directory as recorded, the new directory never watched, and later
+    /// changes all went unseen
+    #[cfg(unix)]
+    #[test]
+    fn a_rescan_watches_every_directory_anew() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = root.path().join("geo");
+        std::fs::create_dir(&dir).unwrap();
+        let configured = dir.join("data.json");
+        std::fs::write(&configured, "v1").unwrap();
+        let PendingWatch {
+            mut watcher,
+            mut targets,
+            tx,
+            rx,
+            ..
+        } = PendingWatch::new(std::slice::from_ref(&configured)).expect("watch");
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::create_dir(&dir).unwrap();
+        // 删掉、重建的事件漏了 / The events of the removal and the making again are missed
+        while rx.recv_timeout(Duration::from_millis(500)).is_ok() {}
+        let rescan = notify::Event::new(EventKind::Other).set_flag(notify::event::Flag::Rescan);
+        tx.send(Message::Event(Ok(rescan))).unwrap();
+        let stop = tx.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_secs(5));
+            let _ = stop.send(Message::Stop);
+        });
+
+        let mut called = 0;
+        pump(
+            "test-watch",
+            &mut watcher,
+            &mut targets,
+            &rx,
+            |path| {
+                called += 1;
+                // 头一次是 Rescan 的，这时写进去的应该看得到 / The first is the Rescan's, and what is
+                // written now should be seen
+                if called == 1 {
+                    std::fs::write(path, "v2").unwrap();
+                } else {
+                    let _ = tx.send(Message::Stop);
+                }
+            },
+            |_, _| {},
+        );
+        assert_eq!(
+            called, 2,
+            "the file written after the rescan is called back"
+        );
     }
 }

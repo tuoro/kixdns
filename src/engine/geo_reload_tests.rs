@@ -1271,6 +1271,44 @@ async fn a_geosite_file_partly_watched_at_startup_is_watched_once_its_link_is_ma
     assert_eq!(engine.geo_data_warnings(), Vec::<String>::new());
 }
 
+/// GeoSite 数据文件所在的目录删掉，过一会儿才重建、写进新数据：目录没了以后状态里说它监视不上、改动由下一次热重载读，
+/// 在用的数据留着；配置不变的热重载读进新数据，这句话跟着去掉。以前还当它监视着：状态什么都不说，热重载也不读，新数据
+/// 直到重启都用不上
+/// The directory a GeoSite data file sits in removed, and made again with new data only a
+/// while later: once the directory is gone the status says the file cannot be watched,
+/// changes being read by the next hot reload, the data in use staying; a hot reload with the
+/// configuration unchanged reads the new data in, and the sentence goes. It used to count as
+/// watched still: the status said nothing, hot reloads did not read it either, and the new
+/// data went unused until a restart
+#[cfg(unix)]
+#[tokio::test]
+async fn a_geosite_directory_removed_and_made_again_later_is_read_by_a_reload() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("geo");
+    std::fs::create_dir(&dir).unwrap();
+    let site = dir.join("geosite.dat");
+    std::fs::write(&site, geosite_dat(&[("ads", "first.test")])).unwrap();
+    let engine = engine(geosite_config(&[&site], "ads"));
+    assert_eq!(ask(&engine, "x.first.test").await, Some(MATCHED));
+
+    std::fs::remove_dir_all(&dir).unwrap();
+    let said = partly_watched("GeoSite data file", &site);
+    wait_for("the status says geosite.dat cannot be watched", || {
+        engine
+            .geo_data_warnings()
+            .iter()
+            .any(|sentence| sentence.starts_with(&said))
+    })
+    .await;
+    assert!(engine.geo().geosite.matches("ads", "x.first.test"));
+
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(&site, geosite_dat(&[("ads", "second.test")])).unwrap();
+    engine.reload(geosite_config(&[&site], "ads"));
+    assert_eq!(ask(&engine, "x.second.test").await, Some(MATCHED));
+    assert_eq!(engine.geo_data_warnings(), Vec::<String>::new());
+}
+
 /// 配置了却不存在、读不了的 Geo 数据文件和 MMDB 记成错误：默认日志级别是 error，记成 warn 的话没开面板时谁也看不到。
 /// 以前都记成 warn
 /// Geo data files and an MMDB that are configured yet not there or unreadable are logged as
