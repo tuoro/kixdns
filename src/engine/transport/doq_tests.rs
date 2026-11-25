@@ -286,6 +286,58 @@ async fn a_query_after_0rtt_is_rejected_waits_for_the_old_streams_to_go() {
     answer.expect("answered");
 }
 
+/// 0-RTT 期间开出的旧流写完了查询，0-RTT 被拒以后才结束发送，这时握手完以后来的查询已经开出同号的新流：新流照样答上。多线程下
+/// 写完时 driver 正拿着连接锁处理握手完成，结束发送等锁，放锁后别的查询先开出新流，就会这样。调 quinn 的 `finish` 结束发送的话，
+/// FIN 掉的是新流（见 [`DoqStream::end_sending`]），新查询一写就报 `ClosedStream`、失败
+/// An old stream opened during 0-RTT, its query written, ends sending only once 0-RTT is
+/// rejected, with a query coming after the handshake having opened the new stream of the same
+/// number by then: the new stream is answered all the same. On several threads that happens when
+/// the driver holds the connection lock handling the handshake's completion as the write is
+/// done, ending sending waiting for the lock and another query opening the new stream first once
+/// it is released. Ending sending with quinn's `finish` would finish the new stream (see
+/// [`DoqStream::end_sending`]), the new query failing with `ClosedStream` as soon as it writes
+#[tokio::test]
+async fn an_old_stream_ending_sending_after_0rtt_is_rejected_leaves_the_new_one_alone() {
+    let (restarted, client_tls) =
+        restarted_doq_upstream(Duration::from_millis(100), answer_at_once).await;
+    let client = rejecting_doq_client(restarted, client_tls);
+    let target = parse_doq_target(&client.upstream).expect("doq target");
+    let DoqConnected { pooled, .. } = client.get_or_connect(&target).await.expect("connect");
+    let early = pooled.early.as_ref().expect("made with 0-RTT");
+    // 旧查询在 0-RTT 期间开了流、写完了查询，还没结束发送 / The old query opened its stream during
+    // 0-RTT and wrote the query, sending not ended yet
+    let (send, recv) = pooled.conn.open_bi().await.expect("a stream");
+    let mut stale = DoqStream {
+        send: Some(send),
+        early: early.enter(&recv).await,
+        recv,
+        answered: false,
+    };
+    let query = udp_test_query("stale.example");
+    let mut frame = (query.len() as u16).to_be_bytes().to_vec();
+    frame.extend_from_slice(&query);
+    stale
+        .send
+        .as_mut()
+        .expect("not ended yet")
+        .write_all(&frame)
+        .await
+        .expect("written during 0-RTT");
+    assert!(!early.accepted.clone().await, "0-RTT rejected");
+
+    // 新查询开出了新流（流号重新从 0 数，和旧流的一样），等旧流丢完 / The new query has opened its stream
+    // (numbered from 0 again, as the old one is) and waits for the old ones to be dropped
+    let query = udp_test_query("fresh.example");
+    let mut fresh = Box::pin(client.send(&query, Duration::from_secs(2)));
+    assert!(
+        futures::poll!(fresh.as_mut()).is_pending(),
+        "waiting for the old stream"
+    );
+    stale.end_sending();
+    drop(stale);
+    fresh.await.expect("the new stream answered");
+}
+
 /// 上游重启以后，重启前的票据发的 0-RTT 被拒，查询重发、答上；那条连接拿到的新票据给下一条连接用，它的 0-RTT 被接受。上游的
 /// 握手压住 100 毫秒，查询的流一定开在 0-RTT 期间：早期数据被拒的话，这个流上报的是 `ZeroRttRejected`
 /// After an upstream restart, the 0-RTT sent on a ticket from before it is rejected, the query

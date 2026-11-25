@@ -3,8 +3,9 @@ use crate::config::{Action, EcsMode, GlobalSettings, MatchOperator};
 use crate::ecs::EcsKey;
 use crate::engine::Engine;
 use crate::matcher::{
-    GeoManagers, Requester, RequesterKey, ResponsePhase, RuntimeMatcher, RuntimePipeline,
-    RuntimePipelineConfig, RuntimeResponseMatcher, RuntimeRule,
+    GeoManagers, Requester, RequesterKey, ResponsePhase, RuntimeMatcher, RuntimeMatcherWithOp,
+    RuntimePipeline, RuntimePipelineConfig, RuntimeResponseMatcher, RuntimeResponseMatcherWithOp,
+    RuntimeRule,
 };
 use crate::proto_utils::QueryFlags;
 use bytes::Bytes;
@@ -626,9 +627,9 @@ fn hash_pipeline_semantics(pipeline: &RuntimePipeline, hasher: &mut impl Hasher)
         } = rule;
         name.hash(hasher);
         matchers.len().hash(hasher);
-        for matcher in matchers {
-            hash_match_operator(matcher.operator, hasher);
-            hash_runtime_matcher(&matcher.matcher, hasher);
+        for RuntimeMatcherWithOp { operator, matcher } in matchers {
+            hash_match_operator(*operator, hasher);
+            hash_runtime_matcher(matcher, hasher);
         }
         actions.len().hash(hasher);
         for action in actions {
@@ -637,9 +638,9 @@ fn hash_pipeline_semantics(pipeline: &RuntimePipeline, hasher: &mut impl Hasher)
         let (response_matchers, on_match, on_miss) =
             ResponsePhase::parts(response_phase.as_deref());
         response_matchers.len().hash(hasher);
-        for matcher in response_matchers {
-            hash_match_operator(matcher.operator, hasher);
-            hash_runtime_response_matcher(&matcher.matcher, hasher);
+        for RuntimeResponseMatcherWithOp { operator, matcher } in response_matchers {
+            hash_match_operator(*operator, hasher);
+            hash_runtime_response_matcher(matcher, hasher);
         }
         on_match.len().hash(hasher);
         for action in on_match {
