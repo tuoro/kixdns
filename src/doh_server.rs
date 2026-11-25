@@ -157,18 +157,40 @@ fn stamps(cert: &str, key: &str) -> Stamps {
 
 /// 证书文件改了：换上重新读出来的证书，读不了就留着在用的。两个文件和上次读之前（`read`）一样就不再读：监视给一阵改动
 /// 里改了的每个文件各回调一次，续期时证书和私钥一起换，头一次回调已经把两个都读了
+///
+/// 证书和私钥也会分两阵写到（scp 一个个推，慢路由器上 acme.sh 一个个 `cat >`），先到的那个配着旧的另一个读不了。所以读不了
+/// 时在监视线程上等一阵改动最长能等的那么久（见 `watcher::AT_MOST`），两个文件又换了就再读；还是那一对、照样读不了才记
+/// error，换上了的只记一条 reloaded
 /// The certificate files changed: the certificate read again goes in, or the one in use stays
 /// when it cannot be read. With both files as they were before the last read (`read`) they are
 /// not read again: the watch calls back once for each file a burst of changes changed, and a
 /// renewal replaces the certificate and the key together, both read by the first callback
+///
+/// The certificate and the key also arrive in two bursts (pushed one by one with scp, or
+/// written one `cat >` at a time by acme.sh on a slow router), the first one in going with the
+/// old other one and failing to read. So on a failure the watch thread waits as long as a
+/// burst of changes may last (see `watcher::AT_MOST`), and reads again when the files changed
+/// meanwhile; only the same pair failing again logs an error, and one brought in logs a single
+/// "reloaded"
 fn reload(current: &ArcSwap<TlsAcceptor>, cert: &str, key: &str, read: &mut Stamps) {
-    let now = stamps(cert, key);
+    let mut now = stamps(cert, key);
     if now == *read {
         debug!(cert, key, "DoH TLS certificate unchanged, not read again");
         return;
     }
-    *read = now;
-    match build_tls_acceptor(cert, key) {
+    let built = loop {
+        *read = now;
+        let built = build_tls_acceptor(cert, key);
+        if built.is_ok() {
+            break built;
+        }
+        std::thread::sleep(watcher::AT_MOST);
+        now = stamps(cert, key);
+        if now == *read {
+            break built;
+        }
+    };
+    match built {
         Ok(acceptor) => {
             current.store(Arc::new(acceptor));
             info!(cert, key, "DoH TLS certificate reloaded");
@@ -1581,6 +1603,41 @@ mod tests {
         })
         .await
         .expect("the renewed certificate is used");
+    }
+
+    /// 私钥先换上、隔 0.2 秒证书才到（分两阵写到）：读到新私钥配旧证书读不了，等了一会儿看出证书也换了，再读一遍换上，
+    /// 不记 error。以前先记一条 reload failed，下一阵才换上，默认日志级别只看得到失败
+    /// The key replaced first and the certificate 0.2 s later (arriving in two bursts): the new
+    /// key with the old certificate fails to read, and having waited a while it tells the
+    /// certificate changed too, reads again and brings the pair in, logging no error. A "reload
+    /// failed" used to be logged first and the pair brought in by the next burst, the default
+    /// log level showing the failure alone
+    #[test]
+    fn a_renewal_arriving_in_two_bursts_is_brought_in_without_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, key) = crate::engine::test_support::write_certificate(dir.path());
+        let mut read = stamps(&cert, &key);
+        let current = ArcSwap::from_pointee(build_tls_acceptor(&cert, &key).unwrap());
+        let in_use = current.load_full();
+        let renewal = dir.path().join("renewal");
+        std::fs::create_dir(&renewal).unwrap();
+        let (new_cert, new_key) = crate::engine::test_support::write_certificate(&renewal);
+
+        std::fs::rename(&new_key, &key).unwrap();
+        let certificate = cert.clone();
+        let later = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            std::fs::rename(&new_cert, &certificate).unwrap();
+        });
+        let (warnings, guard) = crate::engine::test_support::Warnings::capture();
+        reload(&current, &cert, &key, &mut read);
+        drop(guard);
+        later.join().unwrap();
+        assert!(
+            !Arc::ptr_eq(&current.load_full(), &in_use),
+            "the renewed pair is used"
+        );
+        assert_eq!(warnings.lines(), Vec::<String>::new());
     }
 
     /// 最后一个监听口停下时证书的监视也停下：监视线程结束，放下它手里的证书。以前这个线程谁也停不了，进程活着它就一直在
