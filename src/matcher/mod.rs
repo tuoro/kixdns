@@ -1086,11 +1086,17 @@ pub(crate) fn static_cname_target(target: &str) -> Option<hickory_proto::rr::Nam
     <hickory_proto::rr::Name as std::str::FromStr>::from_str(target).ok()
 }
 
-/// `qtype`、`response_type` 写的类型：hickory 认得的名字（HTTPS、SVCB、CAA、ANY……），或者 RFC 3597 的 `TYPEnnn`。以前只认
-/// 十种，「HTTPS 查询回 NODATA」这样的规则写不出来，整份配置被拒
-/// The type a `qtype` or `response_type` writes: a name hickory knows (HTTPS, SVCB, CAA, ANY…),
-/// or RFC 3597's `TYPEnnn`. Only ten used to be known, so a rule like "answer HTTPS queries
-/// with NODATA" could not be written and the whole configuration was refused
+/// `qtype`、`response_type` 写的类型：hickory 写得出名字的类型（HTTPS、SVCB、CAA、OPT、ANY……，大小写不论），或者 RFC 3597
+/// 的 `TYPEnnn`。hickory 的 `from_str` 不认它自己写得出的几个名字（OPT、IXFR、ZERO），它不认的按写出的名字反查，所以哪个
+/// 类型的名字都读得回来。以前只认十种，「HTTPS 查询回 NODATA」这样的规则写不出来，整份配置被拒；改用 `from_str` 以后又
+/// 丢了那十种里的 OPT，写着它的配置升级以后起不来
+/// The type a `qtype` or `response_type` writes: a type hickory writes a name for (HTTPS, SVCB,
+/// CAA, OPT, ANY…, in any case), or RFC 3597's `TYPEnnn`. hickory's `from_str` does not know a
+/// few of the names it writes itself (OPT, IXFR, ZERO), and what it does not know is looked up
+/// by the names written, so the name of every type reads back. Only ten used to be known, so a
+/// rule like "answer HTTPS queries with NODATA" could not be written and the whole
+/// configuration was refused; going over to `from_str` then lost OPT, one of those ten, and a
+/// configuration writing it failed to start after the upgrade
 fn parse_dns_type(v: &str) -> anyhow::Result<RecordType> {
     let upper = v.to_ascii_uppercase();
     if let Some(code) = upper
@@ -1100,7 +1106,13 @@ fn parse_dns_type(v: &str) -> anyhow::Result<RecordType> {
         return Ok(RecordType::from(code));
     }
     <RecordType as std::str::FromStr>::from_str(&upper)
-        .map_err(|_| anyhow::anyhow!("unsupported qtype: {upper}"))
+        .ok()
+        .or_else(|| {
+            (0..=u16::MAX).map(RecordType::from).find(|known| {
+                !matches!(known, RecordType::Unknown(_)) && <&str>::from(*known) == upper
+            })
+        })
+        .ok_or_else(|| anyhow::anyhow!("unsupported qtype: {upper}"))
 }
 
 #[cfg(test)]
@@ -1126,6 +1138,55 @@ mod dns_type_tests {
         }
         assert!(parse_dns_type("HTTPSS").is_err());
         assert!(parse_dns_type("TYPE70000").is_err());
+    }
+
+    /// 每个代码的类型，hickory 写得出名字的按名字读得回来（大小写不论），`TYPEnnn` 也读得回来；没有名字的类型 hickory
+    /// 写成 `Unknown`，那不是哪个类型的名字。以前 hickory 的 `from_str` 不认的 OPT、IXFR、ZERO 读不回来，写着
+    /// `qtype: OPT` 的配置升级以后起不来
+    /// The type of every code reads back by its name when hickory writes one (in any case), and by
+    /// `TYPEnnn` too; a type without a name hickory writes as `Unknown`, which names no type.
+    /// OPT, IXFR and ZERO, unknown to hickory's `from_str`, used to read back as nothing, and a
+    /// configuration writing `qtype: OPT` failed to start after the upgrade
+    #[test]
+    fn the_name_of_every_type_reads_back() {
+        for code in 0..=u16::MAX {
+            let written = RecordType::from(code);
+            assert_eq!(parse_dns_type(&format!("TYPE{code}")).unwrap(), written);
+            if !matches!(written, RecordType::Unknown(_)) {
+                let name = written.to_string();
+                assert_eq!(parse_dns_type(&name).unwrap(), written, "{name}");
+                assert_eq!(
+                    parse_dns_type(&name.to_ascii_lowercase()).unwrap(),
+                    written,
+                    "{name}"
+                );
+            }
+        }
+        for (written, expected) in [
+            ("OPT", RecordType::OPT),
+            ("opt", RecordType::OPT),
+            ("IXFR", RecordType::IXFR),
+        ] {
+            assert_eq!(parse_dns_type(written).unwrap(), expected, "{written}");
+        }
+        assert!(parse_dns_type("Unknown").is_err());
+    }
+
+    /// 写着 `OPT` 的 `qtype` 和 `response_type` 照样编译得过，配置照样加载 / A `qtype` and a
+    /// `response_type` writing `OPT` compile, and the configuration loads
+    #[test]
+    fn a_configuration_writing_opt_loads() {
+        let config = serde_json::json!({
+            "settings": { "default_upstream": "1.1.1.1:53" },
+            "pipelines": [{ "id": "main", "rules": [{
+                "name": "opt",
+                "matchers": [{ "type": "qtype", "value": "OPT" }],
+                "actions": [{ "type": "forward" }],
+                "response_matchers": [{ "type": "response_type", "value": "opt" }],
+                "response_actions_on_match": [{ "type": "allow" }]
+            }] }]
+        });
+        crate::config::validate(&config.to_string()).expect("OPT is a type");
     }
 }
 
