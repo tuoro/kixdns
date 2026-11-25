@@ -761,14 +761,14 @@ async fn doq_does_not_retry_without_the_budget_for_it() {
     assert_eq!(SECOND.load(Ordering::Relaxed), 1, "sent once");
 }
 
-/// 没用 0-RTT 的连接上一次回答慢，曾被当成 0-RTT 被拒，把这个上游的 0-RTT 关到
-/// 重启为止；而断连之后要重连，0-RTT 正好省下一个往返。
-/// One slow answer on a connection that did not use 0-RTT used to count as
-/// 0-RTT being rejected and switched it off for the upstream until a
-/// restart, while 0-RTT is exactly what saves a round trip on every
-/// reconnect after a dropped connection.
+/// 没用 0-RTT 的连接上一次回答慢：这个查询超时，0-RTT 发往的地址留着，断连之后重连照样用 0-RTT 省下一个往返。这样的超时曾被
+/// 当成 0-RTT 被拒，把这个上游的 0-RTT 关到重启为止
+/// One slow answer on a connection that did not use 0-RTT: the query times out, and the address
+/// 0-RTT goes to is kept, a reconnect after a dropped connection still saving a round trip with
+/// 0-RTT. Such a timeout used to count as 0-RTT being rejected and switched it off for the
+/// upstream until a restart
 #[tokio::test]
-async fn a_doq_timeout_without_0rtt_leaves_0rtt_on() {
+async fn a_doq_timeout_without_0rtt_keeps_the_0rtt_address() {
     let (server, client_tls) = localhost_tls(&[b"doq"]);
     let addr = spawn_doq_upstream(server, Duration::ZERO, |_, label| {
         if label == "slow" {
@@ -1062,14 +1062,14 @@ async fn zero_rtt_goes_to_the_address_the_last_handshake_reached() {
     assert!(pooled.conn.remote_address().is_ipv6(), "to ::1");
 }
 
-/// 0-RTT 的连接上超时，而上游连握手都没回：是这个地址不通，0-RTT 照用。下一次建连不在它上面盲发 0-RTT，照常完整
-/// 握手；那次连上以后，再重连又用 0-RTT。以前这样的超时也把 0-RTT 关到重启
+/// 0-RTT 的连接上超时，而上游连握手都没回：是这个地址不通，忘掉它。下一次建连不在它上面盲发 0-RTT，照常完整握手；那次连上
+/// 以后，再重连又用 0-RTT。以前这样的超时也把 0-RTT 关到重启
 /// A timeout on a 0-RTT connection whose handshake the upstream never answered: the address is
-/// down, and 0-RTT stays on. The next connect sends no 0-RTT blindly to it but shakes hands in
-/// full; once that one is through, reconnecting uses 0-RTT again. Such a timeout used to switch
-/// 0-RTT off until a restart too
+/// down and forgotten. The next connect sends no 0-RTT blindly to it but shakes hands in full;
+/// once that one is through, reconnecting uses 0-RTT again. Such a timeout used to switch 0-RTT
+/// off until a restart too
 #[tokio::test]
-async fn a_0rtt_handshake_never_answered_leaves_0rtt_on() {
+async fn a_0rtt_handshake_never_answered_forgets_the_0rtt_address() {
     // 关着时新来的握手一概不回，就像这个地址不通 / While off, every new handshake goes unanswered,
     // as for an address that is down
     let answering = Arc::new(AtomicBool::new(true));
@@ -1110,7 +1110,7 @@ async fn a_0rtt_handshake_never_answered_leaves_0rtt_on() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     client.pooled.store(None);
     let resumed = client.get_or_connect(&target).await.expect("connect");
-    assert!(resumed.pooled.used_0rtt(), "0-RTT stays on");
+    assert!(resumed.pooled.used_0rtt(), "a reconnect uses 0-RTT again");
 }
 
 /// 本机 DoQ 测试上游怎么对待一个新来的握手 / How the local DoQ test upstream treats a new handshake
@@ -1250,18 +1250,18 @@ async fn a_late_refusal_of_a_0rtt_connection_names_the_address_and_why() {
     );
 }
 
-/// 上游收了 0-RTT、回了握手，却在第一个查询上关掉连接：这个查询失败，错误里是上游给的原因，0-RTT 照用。以前看守任务在连接关了
-/// 以后照样调 close，原因常被改写成本端关的（「connection lost: closed」）；对端关的又被当成拒绝 0-RTT，多线程下多半把 0-RTT 关到
-/// 重启，而对端关的只可能是 0-RTT 已经接受了的连接：没接受时 quinn 报的是 `ZeroRttRejected`。所以重复多次
+/// 上游收了 0-RTT、回了握手，却在第一个查询上关掉连接：这个查询失败，错误里是上游给的原因，0-RTT 发往的地址留着。以前看守任务在
+/// 连接关了以后照样调 close，原因常被改写成本端关的（「connection lost: closed」）；对端关的又被当成拒绝 0-RTT，多线程下多半把
+/// 0-RTT 关到重启，而对端关的只可能是 0-RTT 已经接受了的连接：没接受时 quinn 报的是 `ZeroRttRejected`。所以重复多次
 /// The upstream taking 0-RTT and answering the handshake, then closing the connection on the
-/// first query: the query fails with the upstream's own reason, and 0-RTT stays on. The watching
-/// task used to call close on a closed connection all the same, often rewriting the reason to a
-/// local close ("connection lost: closed"); and a close by the peer counted as 0-RTT refused,
-/// mostly switching it off until a restart on several threads, while only a connection whose
-/// 0-RTT was accepted can be lost to the peer: one not accepted, quinn says `ZeroRttRejected`.
-/// Hence the repeats
+/// first query: the query fails with the upstream's own reason, and the address 0-RTT goes to is
+/// kept. The watching task used to call close on a closed connection all the same, often
+/// rewriting the reason to a local close ("connection lost: closed"); and a close by the peer
+/// counted as 0-RTT refused, mostly switching it off until a restart on several threads, while
+/// only a connection whose 0-RTT was accepted can be lost to the peer: one not accepted, quinn
+/// says `ZeroRttRejected`. Hence the repeats
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_upstream_closing_on_the_first_0rtt_query_leaves_0rtt_on() {
+async fn an_upstream_closing_on_the_first_0rtt_query_keeps_the_0rtt_address() {
     for _ in 0..10 {
         let (mut server, client_tls) = localhost_tls(&[b"doq"]);
         server.max_early_data_size = u32::MAX;
@@ -1278,18 +1278,19 @@ async fn an_upstream_closing_on_the_first_0rtt_query_leaves_0rtt_on() {
         assert!(format!("{err:#}").contains("by peer"), "{err:#}");
         assert!(
             client.zero_rtt.reached.lock().is_some(),
-            "0-RTT stays on, its address kept: {err:#}"
+            "the address 0-RTT goes to is kept: {err:#}"
         );
     }
 }
 
-/// 0-RTT 的连接上游回了握手，一个回答却慢：这个查询超时，0-RTT 照用，重连还用 0-RTT。以前这样的超时把这个上游的 0-RTT
-/// 关到重启，长期运行几乎必然碰上一次
+/// 0-RTT 的连接上游回了握手，一个回答却慢：这个查询超时，0-RTT 发往的地址留着，重连还用 0-RTT。以前这样的超时把这个上游的
+/// 0-RTT 关到重启，长期运行几乎必然碰上一次
 /// A connection whose 0-RTT handshake the upstream answered, and one slow answer on it: the query
-/// times out, 0-RTT stays on and a reconnect uses it again. Such a timeout used to switch 0-RTT
-/// off for the upstream until a restart, which a long run all but surely meets once
+/// times out, the address 0-RTT goes to is kept and a reconnect uses 0-RTT again. Such a timeout
+/// used to switch 0-RTT off for the upstream until a restart, which a long run all but surely
+/// meets once
 #[tokio::test]
-async fn a_slow_answer_over_0rtt_leaves_0rtt_on() {
+async fn a_slow_answer_over_0rtt_keeps_the_0rtt_address() {
     let (mut server, client_tls) = localhost_tls(&[b"doq"]);
     server.max_early_data_size = u32::MAX;
     let addr = spawn_doq_upstream(server, Duration::ZERO, |_, label| {

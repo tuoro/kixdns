@@ -42,7 +42,7 @@ const ASK_BUDGET: Duration = Duration::from_secs(2);
 /// 失败至少记 1 秒（RFC 9520 3.2），它举的例子从 5 秒起退避，再早问多半拿回同一个失败。再问在后台，最多 [`ASK_BUDGET`]，
 /// 谁也不等它，有建连要地址时才问，一个名字每 10 秒至多问一次：A、AAAA 各问每个服务器，每个至多发三份（见
 /// [`Through::records`]），也就是至多 6 × 服务器数个查询，所以不退避：一族一直问不到（AAAA 查询被丢掉的网络）也就这点开销。
-/// 问到过地址的名字后来一个地址也问不到（比如两族都答 NXDOMAIN）时也一样，留着上回的地址，这么久以后再问
+/// 问到过地址的名字后来一个地址也问不到（比如答了 NXDOMAIN）时也一样，留着上回的地址，这么久以后再问
 /// How long until a family of addresses (A or AAAA) not given this time is asked again (see
 /// [`Known::new`]). Until then that family has no addresses (asked the first time) or those last
 /// given; on a host reaching one family only (IPv6 with ULA only, say), the upstream cannot be
@@ -53,8 +53,8 @@ const ASK_BUDGET: Duration = Duration::from_secs(2);
 /// per name per 10 seconds at most: A and AAAA asked of every server, three copies each at most
 /// (see [`Through::records`]), so 6 × the servers' number of queries at most, and there is no
 /// backing off: a family never given (a network dropping AAAA queries) costs no more than that.
-/// A name once given addresses that later gets none at all (both families answering NXDOMAIN,
-/// say) is no different, keeping the last addresses and asked again after this long
+/// A name once given addresses that later gets none at all (answering NXDOMAIN, say) is no
+/// different, keeping the last addresses and asked again after this long
 const ASK_AGAIN_AFTER: Duration = Duration::from_secs(10);
 
 /// 上游主机名的解析：经 `bootstrap` 的服务器，或者系统的解析器 / Resolving upstream host names: through the
@@ -90,19 +90,31 @@ struct Known {
 }
 
 impl Known {
-    /// 这次问到的两族（`asked`，A 在前）。没问到的那一族沿用 `last` 里这一族的地址，[`ASK_AGAIN_AFTER`] 之后再问；
-    /// 问到了的那一族（没有这一族的记录也算问到）用这次的地址，按它们里最短的 TTL。这样凑不出一个地址时（两族都没有记录，
-    /// 或者没问到的那一族上回也没有地址），整张沿用 `last`，同样 [`ASK_AGAIN_AFTER`] 之后再问。头一回问和后台再问都是这一条：
-    /// 头一回没有 `last`，没问到的那一族就先没有地址，一个地址也没有时是 Err
-    /// What this asking gave of the two families (`asked`, A first). A family not given keeps the
-    /// addresses `last` has of it, asked again after [`ASK_AGAIN_AFTER`]; a family given (no
-    /// record of it counting as given) takes this asking's addresses, by the shortest TTL among
-    /// them. Coming to no address so (neither family having records, or the one not given having
-    /// none last time either), all of `last` is kept, asked again after [`ASK_AGAIN_AFTER`] too.
-    /// Asking the first time and asking again in the background are the one rule: the first time
-    /// has no `last`, a family not given then having no addresses for now, and no address at all
-    /// is an Err
-    fn new(asked: [Family; 2], last: Option<&Known>) -> anyhow::Result<Self> {
+    /// 这次问到的两族（`asked`，A 在前），`not_in_dns` 是它们说 DNS 里没有这个名字的地址（见 [`not_in_dns`]）。说没有时
+    /// 一个地址也没有；不然没问到的那一族沿用 `last` 里这一族的地址，[`ASK_AGAIN_AFTER`] 之后再问，问到了的那一族（没有这一族的
+    /// 记录也算问到）用这次的地址，按它们里最短的 TTL。一个地址也没有时（DNS 里没有，或者没问到的那一族上回也没有地址），整张沿用
+    /// `last`，同样 [`ASK_AGAIN_AFTER`] 之后再问。头一回问和后台再问都是这一条：头一回没有 `last`，没问到的那一族就先没有地址，
+    /// 一个地址也没有时是 Err
+    /// What this asking gave of the two families (`asked`, A first), `not_in_dns` being whether
+    /// that says DNS has no address for the name (see [`not_in_dns`]). Saying so, it comes to no
+    /// address; otherwise a family not given keeps the addresses `last` has of it, asked again
+    /// after [`ASK_AGAIN_AFTER`], and a family given (no record of it counting as given) takes
+    /// this asking's addresses, by the shortest TTL among them. Coming to no address (none in
+    /// DNS, or the family not given having none last time either), all of `last` is kept, asked
+    /// again after [`ASK_AGAIN_AFTER`] too. Asking the first time and asking again in the
+    /// background are the one rule: the first time has no `last`, a family not given then having
+    /// no addresses for now, and no address at all is an Err
+    fn new(asked: [Family; 2], not_in_dns: bool, last: Option<&Known>) -> anyhow::Result<Self> {
+        let no_address = |why: String| match last {
+            Some(last) => Ok(Self {
+                addresses: Arc::clone(&last.addresses),
+                until: Instant::now() + ASK_AGAIN_AFTER,
+            }),
+            None => Err(anyhow::anyhow!(why)),
+        };
+        if not_in_dns {
+            return no_address("no A or AAAA record".to_owned());
+        }
         let (mut addresses, mut ttl, mut failures) = (Vec::new(), Duration::MAX, Vec::new());
         for (family, ipv6) in asked.into_iter().zip([false, true]) {
             match family {
@@ -120,18 +132,11 @@ impl Known {
                 }
             }
         }
+        // DNS 没说没有地址时，一个地址也没有只能是有一族没问到，`failures` 不空 / With DNS not saying
+        // there is no address, no address at all can only come from a family not given, `failures`
+        // not empty
         if addresses.is_empty() {
-            if let Some(last) = last {
-                return Ok(Self {
-                    addresses: Arc::clone(&last.addresses),
-                    until: Instant::now() + ASK_AGAIN_AFTER,
-                });
-            }
-            let why = match failures.is_empty() {
-                true => "no A or AAAA record".to_owned(),
-                false => failures.join("; "),
-            };
-            anyhow::bail!(why);
+            return no_address(failures.join("; "));
         }
         // 有地址时 ttl 已不是 Duration::MAX：地址要么来自一条记录，要么来自没问到的一族 / With addresses ttl is no
         // longer Duration::MAX: each comes from a record or from a family not given
@@ -170,17 +175,20 @@ impl Answered {
     }
 }
 
-/// 这次问到的两族（`asked`）是不是说 DNS 里没有这个名字的地址：一族答了 NXDOMAIN（另一族也就没有，见 [`Answered`]），
-/// 或者两族都答了没有记录。没问到的那一族什么也不说
+/// 这次问到的两族（`asked`）是不是说 DNS 里没有这个名字的地址：哪一族也没给出地址，而且一族答了 NXDOMAIN（另一族也就没有，
+/// 见 [`Answered`]），或者两族都答了没有记录。没问到的那一族什么也不说；给出了地址的那一族说 DNS 里有，另一族的 NXDOMAIN 是
+/// 答错了（RFC 4074 第 4.2 节：有的服务器对有 A 记录的名字的 AAAA 查询答 NXDOMAIN）
 /// Whether what this asking gave of the two families (`asked`) says DNS has no address for the
-/// name: one family answered NXDOMAIN (the other then having none either, see [`Answered`]), or
-/// both answered with no record. A family not given says nothing
+/// name: neither family giving any address, and one answering NXDOMAIN (the other then having
+/// none either, see [`Answered`]) or both answering with no record. A family not given says
+/// nothing; a family giving addresses says DNS has some, the other's NXDOMAIN being an answer
+/// gone wrong (RFC 4074 section 4.2: some servers answer NXDOMAIN to an AAAA query for a name
+/// with A records)
 fn not_in_dns(asked: &[Family; 2]) -> bool {
-    match asked {
-        [Ok(Answered::NoSuchName), _] | [_, Ok(Answered::NoSuchName)] => true,
-        [Ok(a), Ok(aaaa)] => a.records().is_empty() && aaaa.records().is_empty(),
-        _ => false,
-    }
+    // 问到了的那几族 / The families given
+    let given = || asked.iter().flatten();
+    given().all(|given| given.records().is_empty())
+        && (given().any(|given| matches!(given, Answered::NoSuchName)) || given().count() == 2)
 }
 
 /// 问一次的结果，等着它的各拿一份 / One asking's outcome, a copy for each that waits on it
@@ -300,7 +308,7 @@ impl Through {
             let entry = hosts.entry(host.clone()).or_default();
             entry.asking = None;
             let known = asked
-                .and_then(|asked| Known::new(asked, entry.known.as_ref()))
+                .and_then(|asked| Known::new(asked, not_in_dns, entry.known.as_ref()))
                 .map_err(|error| NoAddress {
                     why: format!("bootstrap gave no address for {host}: {error:#}").into(),
                     not_in_dns,
@@ -991,6 +999,69 @@ mod tests {
         assert!(
             asking(&bootstrap, "upstream.test").is_some(),
             "asked again by now"
+        );
+    }
+
+    /// 问到过地址的名字，后台再问时一族答了 NXDOMAIN、另一族没问到（这里答了 SERVFAIL）：DNS 里没有这个名字（RFC 8020），和两族
+    /// 都答 NXDOMAIN 一样，上回的地址整张照用。以前答了 NXDOMAIN 的那一族只当没有这一族的记录，只剩没问到的那一族上回的地址，
+    /// 只连得上另一族的主机这 10 秒里连不上
+    /// A name once given addresses, asked again in the background with one family answering
+    /// NXDOMAIN and the other not given (answering SERVFAIL here): DNS has no such name (RFC
+    /// 8020), as with both families answering NXDOMAIN, and all the last addresses stay in use.
+    /// The family answering NXDOMAIN used to count as only having no record of its own, leaving
+    /// the last addresses of the family not given alone, which a host reaching only the other
+    /// family could not reach for those 10 seconds
+    #[tokio::test]
+    async fn one_family_answering_nxdomain_keeps_all_the_last_addresses() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let cases = [RecordType::A, RecordType::AAAA].map(|nxdomain| async move {
+            let gone = Arc::new(AtomicBool::new(false));
+            let server = upstream({
+                let gone = Arc::clone(&gone);
+                move |query| match gone.load(Ordering::SeqCst) {
+                    // TTL 为 0：下一次要时就在后台再问 / TTL 0: asked again in the background when
+                    // next wanted
+                    false => loopback_addresses(query, 0),
+                    true if query.queries[0].query_type() == nxdomain => {
+                        no_records(query, ResponseCode::NXDomain)
+                    }
+                    true => no_records(query, ResponseCode::ServFail),
+                }
+            })
+            .await;
+            let bootstrap = through(&server.address);
+            let given = bootstrap.addresses("upstream.test", 853).await.unwrap();
+            assert_eq!(given.len(), 2, "both families given");
+            gone.store(true, Ordering::SeqCst);
+            let now = bootstrap.addresses("upstream.test", 853).now_or_never();
+            assert_eq!(now.expect("at once").unwrap(), given);
+            let asked = asking(&bootstrap, "upstream.test").expect("asked again");
+            assert_eq!(
+                asked.await.expect("the last addresses kept").len(),
+                2,
+                "{nxdomain} NXDOMAIN"
+            );
+        });
+        futures::future::join_all(cases).await;
+    }
+
+    /// 一族给出了地址、另一族答了 NXDOMAIN（RFC 4074 第 4.2 节那种答错的服务器）：给出的地址照用，不当 DNS 里没有这个名字
+    /// One family giving addresses and the other answering NXDOMAIN (a server answering wrong as
+    /// in RFC 4074 section 4.2): the addresses given are used, the name not taken for missing
+    /// from DNS
+    #[tokio::test]
+    async fn addresses_given_outweigh_an_nxdomain_for_the_other_family() {
+        let server = upstream(|query| match query.queries[0].query_type() {
+            RecordType::AAAA => no_records(query, ResponseCode::NXDomain),
+            _ => loopback_addresses(query, 300),
+        })
+        .await;
+        assert_eq!(
+            through(&server.address)
+                .addresses("upstream.test", 853)
+                .await
+                .expect("A's address"),
+            ["127.0.0.1:853".parse::<SocketAddr>().unwrap()]
         );
     }
 
