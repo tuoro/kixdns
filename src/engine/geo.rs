@@ -133,13 +133,14 @@ impl DataStatus {
         say(&mut self.files, (path.to_path_buf(), said));
     }
 
-    /// `what` 的监视线程因为 `err` 起不来：哪个文件都没人监视，改了要等重启或者改了读什么的热加载才读
+    /// `what` 的监视线程因为 `err` 起不来：哪个文件都没人监视，改了要等重启或者改了读什么（文件，或者规则用到的标签）的
+    /// 热加载才读
     /// The watch thread of `what` could not start because of `err`: no file is watched by
-    /// anything, and a change waits to be read for a restart or a reload changing which files are
-    /// read
+    /// anything, and a change waits to be read for a restart or a reload changing what is read
+    /// (the files, or the tags rules use)
     fn not_watched(&mut self, what: &str, err: &dyn std::fmt::Display) {
         self.watch = Some(format!(
-            "{what} cannot be watched for changes, which are read after a restart or a reload changing which files are read: {err}"
+            "{what} cannot be watched for changes, which are read after a restart or a reload changing what is read (the files, or the tags rules use): {err}"
         ));
         self.partly_watched.clear();
     }
@@ -485,7 +486,7 @@ fn start_watch(
     pending?
         .start_reporting(name, on_change, on_watch)
         .inspect_err(|err| {
-            error!(name, error = %err, "cannot start the data file watcher, changes to the files are read after a restart or a reload changing which files are read");
+            error!(name, error = %err, "cannot start the data file watcher, changes to the files are read after a restart or a reload changing what is read (the files, or the tags rules use)");
             status.lock().not_watched(what, err);
         })
         .ok()

@@ -52,6 +52,10 @@ const _: () = assert!(
 /// with places that cannot be watched (at the start, and as it comes to be so once resolved again)
 const UNWATCHED: &str = "cannot watch every place the file leads";
 
+/// 日志说一个有位置监视不上的文件又处处监视上了（回调时，和核对时）/ What the log says of a file with
+/// places that could not be watched, once watched everywhere again (at a callback, and at a check)
+const WATCHED_AGAIN: &str = "every place the file leads is watched again";
+
 #[cfg(test)]
 thread_local! {
     /// 这个线程上装的监视多久核对一次，测试用（见 [`check_every`]）/ How often the watches installed on
@@ -238,24 +242,24 @@ impl FileStamp {
 
 /// 文件的改动时间。unix 上是 inode 的 ctime：改名盖过来的别的文件带着它自己写入、改名的时刻，长度、修改时间都一样也看得
 /// 出换了（只有内核时钟的同一个节拍里先后写好的两份分不出）；只改属性（chmod、chown）也会换，那个文件就多读一次。vfat、
-/// exfat 不存 ctime，读进来时等于修改时间（FAT 精确到 2 秒），那里只靠长度和修改时间分辨，同一个两秒里改名换上同样长的
-/// 别的文件看不出来；exfat 上改名或 chmod 以后内存里记着当时的时刻，逐出 inode 缓存一次就又等于修改时间，会多读一遍。不用
-/// inode 号：vfat、exfat、noserverino 的 CIFS、不带 use_ino 的 FUSE 上，文件被逐出 inode 缓存再读回就换一个号，没改也
-/// 像换了。别的平台用建立时间：Windows 的文件名隧道会让十五秒内在同一个名字上新建、改名过来的沿用旧的建立时间，这时只有
-/// 长度、修改时间看得出换了
+/// exfat 不存 ctime，读进来时等于修改时间（vfat 精确到 2 秒，exfat 到 10 毫秒），那里只靠长度和修改时间分辨，同一个刻度
+/// 里（vfat 上是同一个两秒）改名换上同样长的别的文件看不出来；exfat 上改名或 chmod 以后内存里记着当时的时刻，逐出 inode
+/// 缓存一次就又等于修改时间，会多读一遍。不用 inode 号：vfat、exfat、noserverino 的 CIFS、不带 use_ino 的 FUSE 上，文件
+/// 被逐出 inode 缓存再读回就换一个号，没改也像换了。别的平台用建立时间：Windows 的文件名隧道会让十五秒内在同一个名字上
+/// 新建、改名过来的沿用旧的建立时间，这时只有长度、修改时间看得出换了
 /// A file's change time. On unix the inode's ctime: another file renamed over it carries the
 /// moment it was itself written or renamed, so it tells even with the length and modification
 /// time alike (save two written within one tick of the kernel clock); a metadata change alone
 /// (chmod, chown) moves it too, and that file is read once more. vfat and exfat keep no ctime,
-/// reading it back as the modification time (to 2 seconds on FAT), so there only the length
-/// and modification time tell, and another file of the same length renamed in within the same
-/// two seconds does not show; on exfat a rename or chmod leaves the moment in memory, back to
-/// the modification time once the inode is evicted from the cache, and the file is read once
-/// more. Not the inode number: on vfat, exfat, noserverino CIFS and FUSE without use_ino a file
-/// gets another one once evicted from the inode cache and read back, looking replaced
-/// unchanged. Elsewhere the creation time: Windows' file name tunnelling hands the old creation
-/// time to whatever is created or renamed under the same name within fifteen seconds, and then
-/// only the length and modification time tell
+/// reading it back as the modification time (to 2 seconds on vfat, to 10 ms on exfat), so there
+/// only the length and modification time tell, and another file of the same length renamed in
+/// within the same step (the same two seconds on vfat) does not show; on exfat a rename or chmod
+/// leaves the moment in memory, back to the modification time once the inode is evicted from
+/// the cache, and the file is read once more. Not the inode number: on vfat, exfat,
+/// noserverino CIFS and FUSE without use_ino a file gets another one once evicted from the inode
+/// cache and read back, looking replaced unchanged. Elsewhere the creation time: Windows' file
+/// name tunnelling hands the old creation time to whatever is created or renamed under the same
+/// name within fifteen seconds, and then only the length and modification time tell
 #[cfg(unix)]
 type Changed = (i64, i64);
 #[cfg(not(unix))]
@@ -532,11 +536,11 @@ struct Target {
     /// it was changed without an event telling (see [`Targets::check`])
     seen: Option<FileStamp>,
     /// 上次报的是不是有位置监视不上（开始时、回调之前，和核对时又处处监视上了，见 [`call_back`]）：从监视得上变成监视不上
-    /// 才记 error，一直监视不上（比如建不起 notify 的监视）时不是每次回调都记一条
+    /// 才记 error，一直监视不上（比如建不起 notify 的监视）时不是每次回调都记一条；又处处监视上了记一条 info
     /// Whether it was last reported with places that cannot be watched (at the start, before a
     /// callback, and when a check finds it watched everywhere again, see [`call_back`]): an error
     /// is logged only as it goes from watched to unwatched, not on every callback while it stays
-    /// unwatched (notify's watcher not made, say)
+    /// unwatched (notify's watcher not made, say), and an info as it is watched everywhere again
     unwatched: bool,
 }
 
@@ -1001,20 +1005,20 @@ fn watch_points(path: &Path) -> std::io::Result<Vec<PathBuf>> {
 /// 把变化交给 `on_change`，直到收到停止消息或通道关闭。一阵改动等到改了的文件都写完（见 [`Change::settle`]）、
 /// 最多 [`AT_MOST`]，每个文件重新解析、监视跟着换，监视得怎样交给 `on_watch`（见 [`PendingWatch::start_reporting`]），
 /// 再各回调一次。在监视的目录删掉、改名挪走时，用到它的文件也算改了（见 [`Targets::lost`]）。每过 `every` 核对一次
-/// （见 [`Targets::check`]）：核对出改了的文件看不出写的一方关没关上它，和新出现的文件一样等写入停下再回调（原地写到
-/// 一半停得比 [`QUIET`] 久就读到半截，下次核对它又换了样子，再读一遍），又处处监视上了的文件只报给 `on_watch`。记的
-/// 日志带着监视的名字 `name` 和它的文件，看得出是哪个监视
+/// （见 [`Targets::check`]）：核对出改了的文件，察觉以后再等 [`QUIET`] 就回调，看不出写完没有（原地正写着的，不论停没停
+/// 都读到半截，下次核对它又换了样子，再读一遍），又处处监视上了的文件只记一条 info、报给 `on_watch`。记的日志带着监视的
+/// 名字 `name` 和它的文件，看得出是哪个监视
 /// Hands changes to `on_change` until told to stop or the channel closes. A burst of changes
 /// is waited for until every file changed is written (see [`Change::settle`]), at most
 /// [`AT_MOST`]; then each file is resolved again with the watches following, how it is watched
 /// goes to `on_watch` (see [`PendingWatch::start_reporting`]), and it is called back once. A
 /// watched directory removed or renamed away counts as a change to the files using it (see
 /// [`Targets::lost`]). Every `every` it checks itself (see [`Targets::check`]): a file the
-/// check finds changed cannot tell whether its writer closed it, and is waited for as a file
-/// newly there is before its callback (written in place with a pause longer than [`QUIET`]
-/// halfway, half of it is read, and the next check, finding it looking otherwise again, reads
-/// it once more), while one found watched everywhere again only goes to `on_watch`. What it
-/// logs carries the watch's `name` and its files, telling which watch it is
+/// check finds changed is called back [`QUIET`] after it is noticed, with no telling whether
+/// writing is done (one still being written in place is read cut short, pausing or not, and
+/// the next check, finding it looking otherwise again, reads it once more), while one found
+/// watched everywhere again only logs an info and goes to `on_watch`. What it logs carries the
+/// watch's `name` and its files, telling which watch it is
 fn pump(
     name: &str,
     every: Duration,
@@ -1043,7 +1047,9 @@ fn pump(
             let pending = |index| burst.as_ref().is_some_and(|burst| burst.has(index));
             let (changed, covered) = targets.check(watcher, pending);
             for index in covered {
-                on_watch(&targets.files[index].configured, None);
+                let configured = &targets.files[index].configured;
+                info!(name, path = %configured.display(), "{WATCHED_AGAIN}");
+                on_watch(configured, None);
             }
             for index in changed {
                 note(&mut burst, index, Change::Created, now);
@@ -1107,13 +1113,13 @@ fn pump(
 }
 
 /// 文件 `index` 改完了：先重新解析、跟上新的解析结果，监视得怎样交给 `on_watch`（从监视得上变成监视不上时也记一条
-/// error，见 [`Target::unwatched`]），记下它读之前的样子（见 [`Target::seen`]），再交给 `on_change`。回调读文件时，新
-/// 位置上的变化已经在监视之下
+/// error，又处处监视上了时记一条 info，见 [`Target::unwatched`]），记下它读之前的样子（见 [`Target::seen`]），再交给
+/// `on_change`。回调读文件时，新位置上的变化已经在监视之下
 /// File `index` is done changing: it is resolved again and the watches follow, how it is
-/// watched goes to `on_watch` (an error logged too as it goes from watched to unwatched, see
-/// [`Target::unwatched`]), what it looks like before it is read is noted (see
-/// [`Target::seen`]), and then it goes to `on_change`. By the time the callback reads the file,
-/// changes at the new places are being watched
+/// watched goes to `on_watch` (an error logged too as it goes from watched to unwatched, and an
+/// info as it is watched everywhere again, see [`Target::unwatched`]), what it looks like
+/// before it is read is noted (see [`Target::seen`]), and then it goes to `on_change`. By the
+/// time the callback reads the file, changes at the new places are being watched
 fn call_back(
     name: &str,
     targets: &mut Targets,
@@ -1124,10 +1130,14 @@ fn call_back(
 ) {
     let watched = targets.refresh(watcher, index);
     let target = &mut targets.files[index];
-    if let Err(err) = &watched
-        && !target.unwatched
-    {
-        error!(name, path = %target.configured.display(), error = %err, "{UNWATCHED}, {SEEN_WITHIN}");
+    match &watched {
+        Err(err) if !target.unwatched => {
+            error!(name, path = %target.configured.display(), error = %err, "{UNWATCHED}, {SEEN_WITHIN}");
+        }
+        Ok(()) if target.unwatched => {
+            info!(name, path = %target.configured.display(), "{WATCHED_AGAIN}");
+        }
+        _ => {}
     }
     target.unwatched = watched.is_err();
     on_watch(&target.configured, watched.as_ref().err());
@@ -2649,6 +2659,81 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    /// 又处处监视上了记一条 info，核对时、回调时都是：所在的目录删掉，回调记 error；过了 [`QUIET`] 才重建（文件还不在），
+    /// 核对看出又监视上了，记 info；再删掉，又记 error；重建时文件也写进来，核对看出文件换了样子，回调时记 info。以前只在
+    /// 变成监视不上时记，又监视上了日志里什么都没有
+    /// Being watched everywhere again logs an info, at a check and at a callback alike: the
+    /// directory removed, the callback logs an error; made again only past [`QUIET`] (the file
+    /// not there yet), the check finds it watched again and logs an info; removed again, an
+    /// error; made again with the file written into it, the check finds the file looking
+    /// otherwise and its callback logs an info. Only becoming unwatched used to be logged, the
+    /// log saying nothing once it was watched again
+    #[cfg(unix)]
+    #[test]
+    fn a_file_watched_everywhere_again_is_logged() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = std::fs::canonicalize(root.path()).unwrap().join("geo");
+        std::fs::create_dir(&dir).unwrap();
+        let configured = dir.join("data.json");
+        let PendingWatch {
+            mut watcher,
+            mut targets,
+            tx,
+            rx,
+            ..
+        } = PendingWatch::new(std::slice::from_ref(&configured));
+        let (reported, reports) = mpsc::channel();
+        let changing = {
+            let (dir, configured) = (dir.clone(), configured.clone());
+            thread::spawn(move || {
+                let mut seen = Vec::new();
+                for written in [false, true] {
+                    std::fs::remove_dir_all(&dir).unwrap();
+                    seen.push(reports.recv_timeout(Duration::from_secs(5)).ok());
+                    thread::sleep(QUIET * 2);
+                    std::fs::create_dir(&dir).unwrap();
+                    if written {
+                        std::fs::write(&configured, "v1").unwrap();
+                    }
+                    seen.push(reports.recv_timeout(Duration::from_secs(5)).ok());
+                }
+                let _ = tx.send(Message::Stop);
+                seen
+            })
+        };
+        let lines = logged(tracing::Level::INFO, || {
+            pump(
+                "test-watch",
+                CHECKED,
+                &mut watcher,
+                &mut targets,
+                &rx,
+                |_| {},
+                |_, why| {
+                    let _ = reported.send(why.is_some());
+                },
+            );
+        });
+        assert_eq!(
+            changing.join().unwrap(),
+            [Some(true), Some(false), Some(true), Some(false)],
+            "unwatched, watched again, twice over"
+        );
+        let said: Vec<&str> = lines
+            .iter()
+            .filter_map(|line| {
+                [UNWATCHED, WATCHED_AGAIN]
+                    .into_iter()
+                    .find(|said| line.contains(said))
+            })
+            .collect();
+        assert_eq!(
+            said,
+            [UNWATCHED, WATCHED_AGAIN, UNWATCHED, WATCHED_AGAIN],
+            "{lines:#?}"
+        );
     }
 
     /// 建不起 notify 的监视时，开始的那条日志说按 10 秒核对，不说在监视上层目录 / Without notify's watcher, the

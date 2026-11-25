@@ -713,13 +713,15 @@ impl Rule {
     }
 
     /// 几个 forward 合成一次转发：规则写了不止一个 forward，而且作决定的是 forward（见 [`Rule::request_decision`]）。
-    /// 动作按写的顺序执行，forward 前面已经写了别的作决定的动作时，规则给的是那个动作的结果，后面的 forward 轮不到；
-    /// 要是照样合并，这条规则走完整路径时去转发，走快速路径时却照第一个动作回静态应答
+    /// 动作按写的顺序执行，forward 前面已经写了别的作决定的动作时，完整路径执行到作决定的那个动作就返回，轮不到
+    /// forward，也就没有合并：[`Rule::merged_forward`] 为 None，合并才有的检查也不算（ecs 写得不一样不报，写成空的那个
+    /// 也不当作被跳过）
     /// Several forwards merge into one: the rule writes more than one forward, and a forward
     /// decides (see [`Rule::request_decision`]). Actions run in the order written: with another
-    /// deciding action written before the forwards, what the rule gives is that action's outcome
-    /// and the forwards never have their turn; were they merged all the same, the rule would
-    /// forward on the full path while the fast path answered its static first action
+    /// deciding action written before the forwards, the full path returns at that deciding action
+    /// and the forwards never have their turn, so there is no merge: [`Rule::merged_forward`] is
+    /// None, and the checks only a merge has do not apply (forwards' ecs differing is not
+    /// reported, nor is one written empty taken as skipped)
     fn merges(&self) -> bool {
         matches!(self.request_decision(), Some(Action::Forward { .. }))
             && self
@@ -2454,6 +2456,16 @@ fn rule_problems(
     pipelines: &rustc_hash::FxHashSet<&str>,
     mut report: impl FnMut(String),
 ) {
+    // 同一条规则里一模一样的问题只报一次：比如两个经同一传输、都没写上游的 forward，同一个位置报两行一样的没有用
+    // The same problem is raised once per rule: two forwards over one transport writing no
+    // upstream, say, would give two identical lines at one place to no purpose
+    let mut raised = Vec::new();
+    let mut report = |problem: String| {
+        if !raised.contains(&problem) {
+            raised.push(problem.clone());
+            report(problem);
+        }
+    };
     for problem in [
         ignored_negation(
             "matchers",
@@ -4760,6 +4772,31 @@ mod validation_tests {
         let found = problems_of(config("127.0.0.1"));
         assert!(
             found.len() == 1 && found[0].starts_with("settings.default_upstream: "),
+            "{found:#?}"
+        );
+    }
+
+    /// 同一条规则里一模一样的问题只报一次：回答阶段命中、没命中各有一个经 DoQ、没写上游的 forward，default_upstream 经
+    /// DoQ 问不了，报一条。以前在同一个位置报两行一样的
+    /// The same problem is raised once per rule: an answer-phase forward over DoQ writing no
+    /// upstream on a match and another on a miss, default_upstream unusable over DoQ, raise one.
+    /// Two identical lines used to be raised at one place
+    #[test]
+    fn the_same_problem_is_raised_once_per_rule() {
+        let doq = serde_json::json!([{ "type": "forward", "transport": "doq" }]);
+        let found = problems_of(serde_json::json!({
+            "settings": { "default_upstream": "127.0.0.1:853" },
+            "pipelines": [{ "id": "main", "rules": [{
+                "name": "answer",
+                "matchers": [{ "type": "any" }],
+                "actions": [{ "type": "forward", "upstream": "9.9.9.9:53" }],
+                "response_actions_on_match": doq,
+                "response_actions_on_miss": doq
+            }] }]
+        }));
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert!(
+            found[0].starts_with("pipelines[0].rules[0]: a forward writing no upstream asks settings.default_upstream over doq"),
             "{found:#?}"
         );
     }

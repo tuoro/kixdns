@@ -176,9 +176,10 @@ impl ParsedGeoIp {
 /// one (see `matcher::GeoManagers`), and new data goes into a new one swapped in whole
 #[derive(Default)]
 pub struct GeoIpManager {
-    /// MaxMind DB 和它每条数据记录的国家代码；重载时文件没变就和在用的那份共用（见 [`Self::use_mmdb`]）
+    /// MaxMind DB 和它每条数据记录的国家代码；重载时文件没变或内容一样就和在用的那份共用（见 [`Self::use_mmdb`]）
     /// The MaxMind DB and the country code of each of its data records, shared with the one in
-    /// use on a reload while the file stays as it was (see [`Self::use_mmdb`])
+    /// use on a reload while the file stays as it was or holds the same content (see
+    /// [`Self::use_mmdb`])
     mmdb: Option<Arc<Mmdb>>,
     /// 按标签分组的 IP 范围索引（从 .dat/JSON 文件加载）
     /// IP range indexes grouped by tag (loaded from .dat/JSON files)
@@ -295,12 +296,12 @@ fn record_country<'a>(found: &maxminddb::LookupResult<'a, Vec<u8>>) -> Option<&'
 }
 
 impl GeoIpManager {
-    /// 用 `path` 的 MMDB（热重载时）。`current` 在用的正是这个文件、文件也没变（见 `watcher::FileStamp`）时共用它那份，
+    /// 用 `path` 的 MMDB（启动和热重载时）。`current` 在用的正是这个文件、文件也没变（见 `watcher::FileStamp`）时共用它那份，
     /// 不再读一遍：以前只改了规则用的标签也要把整个库（约 10 MB）再读一遍、每个网段再走一遍，旧库还占着内存。文件换了样子
     /// 就读一遍，内容和在用的那份一样时照样共用、不建索引（见 [`Mmdb::open`]）。读不了（不存在、正被替换、写坏了）时，
     /// `current` 用的是同一个路径就留着它那份，返回读不了的原因；文件再改动时监视再读它（见 [`Self::with_mmdb`]）。以前换
     /// 进去的是没有 MMDB 的管理器，文件又在，之后国家代码就一直不按 MMDB 判断，直到重启
-    /// Uses the MMDB at `path` (on a hot reload). When `current` uses that very file and the file
+    /// Uses the MMDB at `path` (at startup and on a hot reload). When `current` uses that very file and the file
     /// is unchanged (see `watcher::FileStamp`) its data is shared rather than read again: a change
     /// to nothing but the tags rules use used to read the whole database (some 10 MB) and walk
     /// every network again while the old one still held memory. A file looking otherwise is read,
@@ -323,15 +324,15 @@ impl GeoIpManager {
     }
 
     /// 和这个管理器用同样的标签、MMDB 换成 `path` 重新读的那份的管理器：监视报来 MMDB 变了时建它，再把它整个换进去（见
-    /// `engine::geo` 的 `reload_mmdb`）。不看文件的样子，读了再按内容比：vfat、exfat 上同一个两秒里换上同样长的别的库，
-    /// 样子看不出来（见 `watcher::FileStamp`），事件却报得到，和 GeoSite、GeoIP 数据文件一样照事件读。内容和在用的那份一样
-    /// 时不建索引，是 None；读不了时给出原因
+    /// `engine::geo` 的 `reload_mmdb`）。不看文件的样子，读了再按内容比：vfat 上同一个两秒里、exfat 上同一个 10 毫秒里换上
+    /// 同样长的别的库，样子看不出来（见 `watcher::FileStamp`），事件却报得到，和 GeoSite、GeoIP 数据文件一样照事件读。内容
+    /// 和在用的那份一样时不建索引，是 None；读不了时给出原因
     /// A manager with this one's tags and the MMDB at `path` read again: built when the watch
     /// reports the MMDB changed, and swapped in whole (see `reload_mmdb` in `engine::geo`). It
     /// goes by the content once read, not by what the file looks like: another database of the
-    /// same length put in place within the same two seconds on vfat or exfat looks alike (see
-    /// `watcher::FileStamp`) though events report it, and like the GeoSite and GeoIP data files it
-    /// is read on the event. None, with no index built, when the content is the one in use's; why
+    /// same length put in place within the same two seconds on vfat, or the same 10 ms on exfat,
+    /// looks alike (see `watcher::FileStamp`) though events report it, and like the GeoSite and
+    /// GeoIP data files it is read on the event. None, with no index built, when the content is the one in use's; why
     /// it cannot be read when it cannot
     pub fn with_mmdb(&self, path: &Path) -> anyhow::Result<Option<Self>> {
         let in_use = self.mmdb_from(path).map(|in_use| in_use.fingerprint);
@@ -1082,14 +1083,14 @@ mod tests {
         assert!(fixed.matches_tag("198.51.100.7".parse().unwrap(), "JP"));
     }
 
-    /// 监视报来的 MMDB 变化按内容读，不看文件的样子：内容一样（同一份库盖过来）时不建索引，给出 None；vfat、exfat 上同一个
-    /// 两秒里换上同样长的别的库，样子一样（这里把在用那份记着的样子换成新文件的来模拟），照样读进新的。以前样子变了就再建
-    /// 一遍索引、换进状态，样子没变就共用在用的那份，新库一直用不上，直到再改
+    /// 监视报来的 MMDB 变化按内容读，不看文件的样子：内容一样（同一份库盖过来）时不建索引，给出 None；vfat 上同一个两秒里、
+    /// exfat 上同一个 10 毫秒里换上同样长的别的库，样子一样（这里把在用那份记着的样子换成新文件的来模拟），照样读进新的。
+    /// 以前样子变了就再建一遍索引、换进状态，样子没变就共用在用的那份，新库一直用不上，直到再改
     /// An MMDB change the watch reports is read by its content, not by what the file looks like:
     /// with the content the same (the same database put over it) no index is built, giving None;
-    /// another database of the same length put in place within the same two seconds on vfat or
-    /// exfat looks alike (here the look the one in use noted is set to the new file's to stand
-    /// in) and is read in all the same. A changed look used to build the index again and swap the
+    /// another database of the same length put in place within the same two seconds on vfat, or
+    /// the same 10 ms on exfat, looks alike (here the look the one in use noted is set to the new
+    /// file's to stand in) and is read in all the same. A changed look used to build the index again and swap the
     /// state, and an unchanged one shared the one in use, the new database going unused until
     /// the next change
     #[test]
