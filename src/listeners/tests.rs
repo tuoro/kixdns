@@ -1152,14 +1152,20 @@ async fn while_taking_turns_nobody_is_refused_over_what_is_in_flight() {
     assert_eq!(manager.inflight(), 5007, "those held and all seven");
 }
 
-/// 开着流控、转发给 `upstream` 的引擎，以及落在不同份里的两台设备 / An engine with flow control forwarding
-/// to `upstream`, and two devices landing in different slots
+/// 开着流控、转发给 `upstream` 的引擎，以及落在不同份里的两台设备。内存的读数钉成充足：读这台机器的话，内存小的机器上
+/// 并行跑的测试一起占着内存，水位到了紧张、满，按内存拒的查询和这里测的在途无关
+/// An engine with flow control forwarding to `upstream`, and two devices landing in different
+/// slots. Memory reads as plenty: reading this machine's, the tests run in parallel on a
+/// machine short of memory take it up together, and once the watermark is tight or full the
+/// queries refused over memory have nothing to do with the in-flight ones tested here
 #[cfg(target_os = "linux")]
 fn engine_with_two_devices(upstream: SocketAddr) -> (Arc<Engine>, SocketAddr, SocketAddr) {
-    let engine = Arc::new(engine_forwarding_to(
+    let mut engine = engine_forwarding_to(
         upstream,
         serde_json::json!({ "flow_control_enabled": true }),
-    ));
+    );
+    read_memory_left(&mut engine, memory_left(1 << 30));
+    let engine = Arc::new(engine);
     let heavy = SocketAddr::from(([127, 0, 0, 4], 53000));
     let light = (2..=250)
         .map(|n| SocketAddr::from(([127, 0, 0, n], 53000)))
@@ -2375,7 +2381,6 @@ fn engine_short_of_memory(
     available: Arc<std::sync::atomic::AtomicU64>,
 ) -> (Engine, Vec<crate::engine::concurrency::PermitGuard>) {
     use crate::config::PipelineConfig;
-    use crate::engine::memory_watermark::{MemoryLeft, MemoryReading, MemoryWatermark};
 
     let config: PipelineConfig = serde_json::from_value(serde_json::json!({
         "settings": {
@@ -2396,6 +2401,17 @@ fn engine_short_of_memory(
         "test".to_string(),
     )
     .unwrap();
+    read_memory_left(&mut engine, available);
+    let in_flight = (0..1000).map(|_| engine.permit_manager.acquire()).collect();
+    (engine, in_flight)
+}
+
+/// `engine` 的流控不读这台机器的内存，读到的是 1 GB 里剩 `available` 字节
+/// The flow control of `engine` reads not this machine's memory but `available` bytes left of
+/// 1 GB
+fn read_memory_left(engine: &mut Engine, available: Arc<std::sync::atomic::AtomicU64>) {
+    use crate::engine::memory_watermark::{MemoryLeft, MemoryReading, MemoryWatermark};
+
     let flow = Arc::get_mut(engine.flow_control_state.as_mut().unwrap()).unwrap();
     flow.memory = MemoryWatermark::reading(move || MemoryReading {
         own: 0,
@@ -2404,8 +2420,6 @@ fn engine_short_of_memory(
             available: available.load(std::sync::atomic::Ordering::Relaxed),
         }],
     });
-    let in_flight = (0..1000).map(|_| engine.permit_manager.acquire()).collect();
-    (engine, in_flight)
 }
 
 /// 测试不必等：内存不够以前问过的设备都算老设备 / A test need not wait: a device that asked before memory
