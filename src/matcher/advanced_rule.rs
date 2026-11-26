@@ -2,6 +2,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 use hickory_proto::op::ResponseCode;
+use hickory_proto::rr::rdata::TXT;
 use hickory_proto::rr::{Name, RecordType};
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
@@ -60,9 +61,10 @@ pub enum StaticRecords {
     Addresses(Box<[IpAddr]>),
     /// static_cname_response 的目标 / A static_cname_response's target
     Cname { target: Name, ttl: u32 },
-    /// static_txt_response 的文本，replace_txt_response 换成的也是它 / A static_txt_response's
-    /// text, which replace_txt_response replaces the answer with too
-    Txt { text: Box<[String]>, ttl: u32 },
+    /// static_txt_response 的文本，replace_txt_response 换成的也是它；加载时就编成记录，每次回答只复制 /
+    /// A static_txt_response's text, which replace_txt_response replaces the answer with too;
+    /// built into the record at load, each answer only copying it
+    Txt { txt: TXT, ttl: u32 },
 }
 
 /// 没编过的动作答 SERVFAIL：动作在配置加载时编好（见 `Action::compile_answer`），反序列化出来时还没有
@@ -114,10 +116,18 @@ impl StaticAnswer {
         if crate::engine::response::txt_problem(text).is_some() {
             return Self::Rcode(ResponseCode::ServFail);
         }
-        Self::Records(StaticRecords::Txt {
-            text: text.into(),
-            ttl: ttl.unwrap_or(Self::DEFAULT_TTL),
-        })
+        // txt_problem 查过的比 TXT 自己查的严（每段 255 字节、总长装得下最长的名字），所以这里总能编成
+        // txt_problem checks more strictly than TXT itself (255 bytes a segment, a total that fits the
+        // longest name), so this always builds
+        TXT::try_new(text.iter().map(String::as_bytes)).map_or(
+            Self::Rcode(ResponseCode::ServFail),
+            |txt| {
+                Self::Records(StaticRecords::Txt {
+                    txt,
+                    ttl: ttl.unwrap_or(Self::DEFAULT_TTL),
+                })
+            },
+        )
     }
 }
 

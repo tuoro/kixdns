@@ -2,7 +2,7 @@ use bytes::Bytes;
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{
     DNSClass, Name, RData, Record, RecordType,
-    rdata::{A, AAAA, CNAME, TXT},
+    rdata::{A, AAAA, CNAME},
 };
 use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
 use std::net::IpAddr;
@@ -323,12 +323,8 @@ impl StaticRecords {
                 *ttl,
                 RData::CNAME(CNAME(target.clone())),
             )],
-            Self::Txt { text, ttl } if matches!(qtype, RecordType::TXT | RecordType::ANY) => {
-                vec![Record::from_rdata(
-                    name,
-                    *ttl,
-                    RData::TXT(TXT::new(text.to_vec())),
-                )]
+            Self::Txt { txt, ttl } if matches!(qtype, RecordType::TXT | RecordType::ANY) => {
+                vec![Record::from_rdata(name, *ttl, RData::TXT(txt.clone()))]
             }
             Self::Txt { .. } => Vec::new(),
         };

@@ -2906,7 +2906,7 @@ mod tests {
             message.add_answer(Record::from_rdata(
                 name.clone(),
                 300,
-                RData::TXT(TXT::new(vec![text])),
+                RData::TXT(TXT::try_from(text).unwrap()),
             ));
         }
         let mut edns = Edns::new();
@@ -2966,7 +2966,7 @@ mod tests {
             response.add_answer(Record::from_rdata(
                 name.clone(),
                 300,
-                RData::TXT(TXT::new(vec![text])),
+                RData::TXT(TXT::try_from(text).unwrap()),
             ));
         }
         let response = encode_message(&response);
@@ -3663,7 +3663,9 @@ mod tests {
         ))));
         msg.add_answer(record(RData::MX(MX::new(10, other.clone()))));
         msg.add_answer(record(RData::SRV(SRV::new(1, 2, 443, other.clone()))));
-        msg.add_answer(record(RData::TXT(TXT::new(vec!["a".into(), "bc".into()]))));
+        msg.add_answer(record(RData::TXT(
+            TXT::try_new(["a", "bc"].into_iter().map(str::as_bytes)).unwrap(),
+        )));
         msg.add_answer(record(RData::HINFO(HINFO::new(
             "RFC8482".into(),
             String::new(),
@@ -3756,7 +3758,7 @@ mod tests {
             ("a TXT string past its RDATA", {
                 let mut msg = Message::new(1, MessageType::Response, OpCode::Query);
                 msg.add_query(Query::query(name.clone(), RecordType::TXT));
-                msg.add_answer(record(RData::TXT(TXT::new(vec!["abc".into()]))));
+                msg.add_answer(record(RData::TXT(TXT::try_from("abc".to_owned()).unwrap())));
                 let mut m = msg.to_vec().unwrap();
                 let at = m.len() - 4;
                 m[at] = 9;

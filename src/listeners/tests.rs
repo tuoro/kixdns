@@ -3475,7 +3475,7 @@ async fn udp_response_truncates_oversized_payload() {
         big.add_answer(Record::from_rdata(
             name.clone(),
             300,
-            RData::TXT(TXT::new(vec![text])),
+            RData::TXT(TXT::try_from(text).unwrap()),
         ));
     }
     let big_response = big.to_vec().unwrap();

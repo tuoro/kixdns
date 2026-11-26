@@ -31,7 +31,7 @@ async fn upstream() -> Upstream {
         let mut record = Record::from_rdata(
             question.name().clone(),
             10,
-            RData::TXT(TXT::new(vec![question.query_class().to_string()])),
+            RData::TXT(TXT::try_from(question.query_class().to_string()).unwrap()),
         );
         record.dns_class = question.query_class();
         reply.add_answer(record);

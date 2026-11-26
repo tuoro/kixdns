@@ -488,7 +488,7 @@ mod txt_regex_tests {
             message.add_answer(Record::from_rdata(
                 Name::from_ascii("example.com.").unwrap(),
                 300,
-                RData::TXT(TXT::new(vec![text.to_owned()])),
+                RData::TXT(TXT::try_from(text.to_owned()).unwrap()),
             ));
             message
         };
@@ -535,7 +535,7 @@ mod txt_regex_tests {
                 message.add_answer(Record::from_rdata(
                     Name::from_ascii("example.com.").unwrap(),
                     300,
-                    RData::TXT(TXT::new(strings.iter().map(|s| s.to_string()).collect())),
+                    RData::TXT(TXT::try_new(strings.iter().map(|s| s.as_bytes())).unwrap()),
                 ));
             }
             message
