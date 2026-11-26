@@ -30,7 +30,9 @@ use common::{Kernel, control_answers, free_port};
 /// 进程可持有的句柄数：启动就占掉几十个，一百多个客户端连接就能把剩下的用光。
 const NOFILE: libc::rlim_t = 128;
 
-#[ctor::ctor]
+// SAFETY: 在 main 之前跑，只把加密实现存成 rustls 的进程级默认值 / Runs before main, only
+// storing the crypto provider as rustls' process-wide default
+#[ctor::ctor(unsafe)]
 fn init() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
