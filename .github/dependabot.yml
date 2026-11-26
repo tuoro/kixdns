@@ -1,0 +1,41 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      actions-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+
+  # 每次合入 main 都会发一版内核，所以小版本和补丁按周合成一个 PR，一周最多多发一版
+  # Every merge into main releases a kernel, so minor and patch updates are grouped into one PR a week, at most one extra
+  # release a week
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+    # 面板照内核编译编辑器里的正则（tuoro/kixdns-panel 的 crates/panel-server/src/regex_check.rs），这三个的版本要和面板的
+    # Cargo.lock 一样，面板的 CI 每次拿内核 main 比一遍（scripts/check-kernel-regex-versions.py）。所以它们不在这里单独升，
+    # 要升就两个仓库一起改
+    # The panel compiles the editor's regexes as the kernel does (crates/panel-server/src/regex_check.rs in
+    # tuoro/kixdns-panel), so these three must equal the panel's Cargo.lock, which the panel's CI compares against the kernel's
+    # main on every run (scripts/check-kernel-regex-versions.py). They are not raised here alone: both repositories move
+    # together
+    ignore:
+      - dependency-name: regex
+      - dependency-name: regex-automata
+      - dependency-name: regex-syntax
