@@ -38,11 +38,11 @@ rand = "0.10"
 maxminddb = "0.27"
 maxminddb-writer = "0.1"
 futures = "0.3"
-parking_lot = "0.12"
+parking_lot = "0.13"
 reqwest = { version = "0.12", default-features = false, features = ["http2", "rustls-tls"] }
 tokio-rustls = "0.26"
 rustls = { version = "0.23", features = ["ring"] }
-webpki-roots = "0.26"
+webpki-roots = "1"
 url = "2"
 quinn = { version = "0.11", features = ["runtime-tokio", "rustls"] }
 
@@ -52,7 +52,7 @@ hyper-util = { version = "0.1", features = ["server", "tokio", "http2"] }
 # DoH 上游的 HTTP/2 直连（见 src/engine/doh_h2.rs），hyper 底下的同一个库 / The direct HTTP/2 connection to DoH upstreams (see src/engine/doh_h2.rs), the library under hyper
 h2 = "0.4"
 http-body-util = "0.1"
-base64 = "0.22"
+base64 = "0.23"
 prost = { version = "0.14.4", features = ["derive"] }
 
 # 面板只在 unix 上编进去（见 src/lib.rs）：诊断用子进程试跑草稿配置，给 tokio 补 process / io-util，特性与上面那一行
@@ -61,7 +61,7 @@ prost = { version = "0.14.4", features = ["derive"] }
 # tokio gains process / io-util, merged with the line above; sha2 digests the configuration
 [target.'cfg(unix)'.dependencies]
 tokio = { version = "1", features = ["process", "io-util"] }
-sha2 = "0.10"
+sha2 = "0.11"
 
 # 智能流控在 Windows 上读内存：系统的、本进程的、所在作业对象的限制
 # Smart flow control reads memory on Windows: the system's, this process's and its job object's limits
@@ -85,10 +85,10 @@ windows-sys = { version = "0.61", features = [
 windows-sys = { version = "0.61", features = ["Win32_Security"] }
 
 [dev-dependencies]
-ctor = "0.2"
+ctor = "1"
 # 测试里用暂停的时钟等超时，不必真等 / Tests wait out timeouts on a paused clock instead of for real
 tokio = { version = "1", features = ["test-util"] }
-rcgen = "0.13"
+rcgen = "0.14"
 tempfile = "3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 # DoH 的 HTTP/2 测试要自己控制一条连接上发什么、什么时候发 / The DoH HTTP/2 tests drive one connection themselves

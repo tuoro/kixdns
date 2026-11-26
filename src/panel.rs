@@ -1031,9 +1031,12 @@ impl PanelMetrics {
     /// stays. The panel used to count the generations itself, telling the first load two ways
     /// by whether the text came along
     fn config_became_active(&self, config: &ConfigLoaded<'_>) {
-        let sha256 = config
-            .source
-            .map(|source| format!("{:x}", Sha256::digest(source.as_bytes())));
+        let sha256 = config.source.map(|source| {
+            Sha256::digest(source.as_bytes())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        });
         let mut active = self.active_config.write();
         active.generation = config.generation;
         if let Some(sha256) = sha256 {
@@ -4238,7 +4241,11 @@ mod tests {
         {
             let active = metrics.active_config.read();
             assert_eq!(active.generation, 1);
-            assert_eq!(active.sha256.len(), 64);
+            // 小写十六进制，每字节两位（0x0d 写成 0d）/ Lower-case hex, two digits a byte (0x0d as 0d)
+            assert_eq!(
+                active.sha256,
+                "b3be0d4c2cfa60dddef9c0bc02261d6262d73c2d55d7f4fe6bbd012be248b858"
+            );
             assert!(active.last_reload_success);
         }
         assert_eq!(metrics.reload_success.load(super::Ordering::Relaxed), 0);
