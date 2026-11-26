@@ -35,7 +35,7 @@ mimalloc = { version = "0.1", default-features = false }
 rustc-hash = "2.1.1"
 smallvec = "1.13"
 rand = "0.10"
-maxminddb = "0.27"
+maxminddb = "0.33"
 maxminddb-writer = "0.1"
 futures = "0.3"
 parking_lot = "0.13"

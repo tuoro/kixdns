@@ -149,6 +149,15 @@ fn write_mmdb(parsed: &ParsedGeoIp, source: &Path, output: &Path) -> Result<Conv
             inserts.push((path.mask, data_ref, path));
         }
     }
+    // 一个网段都没有时不写：这样的 MMDB 没有查找树，maxminddb 打开时就拒绝
+    // Nothing is written without a single network: such an MMDB has no search tree, which
+    // maxminddb refuses to open
+    if inserts.is_empty() {
+        anyhow::bail!(
+            "{} has no network of the countries to convert, and an MMDB without networks cannot be read",
+            source.display()
+        );
+    }
     inserts.sort_by_key(|(mask, _, _)| *mask);
     for (_, data_ref, path) in inserts {
         db.insert_node(path, data_ref);
@@ -276,9 +285,9 @@ mod tests {
         assert_eq!((stats.ipv4_ranges_count, stats.ipv6_ranges_count), (3, 1));
 
         let reader = maxminddb::Reader::from_source(std::fs::read(&output).unwrap()).unwrap();
-        assert_eq!(reader.metadata.binary_format_major_version, 2);
-        assert!(reader.metadata.build_epoch > 0);
-        assert_eq!(reader.metadata.ip_version, 6);
+        assert_eq!(reader.metadata().binary_format_major_version, 2);
+        assert!(reader.metadata().build_epoch > 0);
+        assert_eq!(reader.metadata().ip_version, 6);
         for (ip, country) in [
             ("1.2.3.200", Some("CN")),
             ("1.2.2.1", Some("CN")),
@@ -319,5 +328,25 @@ mod tests {
             refused.to_string().starts_with("PRIVATE is not"),
             "{refused}"
         );
+    }
+
+    /// 过滤条件里的国家一个都不在数据里时报错，不写出 MMDB：没有网段的 MMDB 读不了。以前照样写出一个没有查找树的库，
+    /// maxminddb 0.29 起打不开它，内核加载时只能报读不了
+    /// With none of the filter's countries in the data it is an error and no MMDB is written: an
+    /// MMDB without networks cannot be read. One without a search tree used to be written all
+    /// the same, which maxminddb cannot open since 0.29, the kernel only able to say so as it loads
+    #[test]
+    fn converting_no_network_writes_no_mmdb() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dat(dir.path(), vec![("CN", vec![cidr("1.2.3.0", 24)])]);
+        let output = dir.path().join("out.mmdb");
+        let refused = convert_dat_to_mmdb(&source, &output, Some(&["US".to_string()])).unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("no network of the countries to convert"),
+            "{refused}"
+        );
+        assert!(!output.exists());
     }
 }

@@ -56,7 +56,7 @@ GeoIP 转换选项：
 -f, --filter <CODES>            逗号分隔的国家代码，例如 CN,US,JP
 ~~~
 
-转换和运行时读数据文件是同一套解析：地址里的主机位清掉，超过位宽的前缀按单个地址算，同一个国家的网段合并。输入也可以是 V2Ray 的 JSON 数据文件（扩展名不是 `.dat` 就按 JSON 读）。MMDB 里一个地址只有一个国家，所以只转两个字母的国家代码；PRIVATE、CLOUDFLARE 这类标签和国家的网段重叠，不转，运行时由 geoip_dat_path 指向的数据文件直接匹配。--filter 里写了这类标签会报错。
+转换和运行时读数据文件是同一套解析：地址里的主机位清掉，超过位宽的前缀按单个地址算，同一个国家的网段合并。输入也可以是 V2Ray 的 JSON 数据文件（扩展名不是 `.dat` 就按 JSON 读）。MMDB 里一个地址只有一个国家，所以只转两个字母的国家代码；PRIVATE、CLOUDFLARE 这类标签和国家的网段重叠，不转，运行时由 geoip_dat_path 指向的数据文件直接匹配。--filter 里写了这类标签会报错；一个网段都转不出来时（过滤条件里的国家数据里都没有）也报错，不写出 MMDB：没有网段的 MMDB 读不了。
 
 Linux 和 FreeBSD 上每个 UDP worker 一个 socket，内核把报文分给它们（Linux 的 SO_REUSEPORT、FreeBSD 的 SO_REUSEPORT_LB）；别的系统（macOS、OpenBSD、NetBSD、Windows）的内核不这样分，各绑一个只有一个收得到报文，所以 worker 共用一个 socket。UDP 端口被别的程序占着时启动失败，不和它共用。这是实现细节，不代表固定吞吐承诺。
 
