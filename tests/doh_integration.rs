@@ -111,18 +111,17 @@ fn make_dns_query(domain: &str, txid: u16) -> Vec<u8> {
 /// reqwest client that trusts our self-signed cert.
 fn make_https_client() -> reqwest::Client {
     reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
+        .tls_danger_accept_invalid_certs(true)
         .timeout(Duration::from_secs(5))
         .build()
         .expect("build client")
 }
 
-/// Fully-verifying client that trusts exactly the given self-signed PEM
-/// (plus the built-in public roots, which our test identities are not in).
+/// Fully-verifying client that trusts exactly the given self-signed PEM.
 fn make_client_trusting(cert_pem: &str) -> reqwest::Client {
     let root = reqwest::Certificate::from_pem(cert_pem.as_bytes()).expect("parse root pem");
     reqwest::Client::builder()
-        .add_root_certificate(root)
+        .tls_certs_only([root])
         .timeout(Duration::from_secs(5))
         .build()
         .expect("build client")
@@ -779,7 +778,7 @@ async fn test_doh_half_sent_body_is_answered_408_after_timeout() {
 async fn test_doh_speaks_http2_and_still_http1() {
     let server = start_doh(make_static_ip_engine()).await;
     let http1_only = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
+        .tls_danger_accept_invalid_certs(true)
         .http1_only()
         .timeout(Duration::from_secs(5))
         .build()
@@ -828,7 +827,7 @@ async fn test_doh_first_request_on_a_new_connection_is_not_held_by_nagle() {
     let server = start_doh(make_static_ip_engine()).await;
     let fresh = |http1_only: bool| {
         let builder = reqwest::Client::builder()
-            .danger_accept_invalid_certs(true)
+            .tls_danger_accept_invalid_certs(true)
             .pool_max_idle_per_host(0)
             .timeout(Duration::from_secs(5));
         if http1_only {
