@@ -5,7 +5,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
 use notify::event::{AccessKind, AccessMode, EventKind, ModifyKind, RenameMode};
-use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher, WatcherKind};
+use notify::{Config, EventKindMask, RecommendedWatcher, RecursiveMode, Watcher, WatcherKind};
 use tracing::{debug, error, info};
 
 use crate::config;
@@ -561,8 +561,19 @@ impl Notify {
         if TEST_WITHOUT_NOTIFY.get() {
             return Self(Err("no file watcher, for a test".to_owned()));
         }
-        let watcher = RecommendedWatcher::new(handler, Config::default());
-        Self(watcher.map_err(|err| cannot_make(&err)))
+        // 只报用得上的事件（见 [`Change::of`]、[`gone`]）：打开文件、改属性不报，读一次文件不必醒一次，inotify 的队列也
+        // 少占；漏了事件时的 Rescan 不受影响
+        // Only the events of use are reported (see [`Change::of`], [`gone`]): files opened and
+        // metadata changed are not, so reading a file wakes nothing and takes no room in
+        // inotify's queue; the Rescan for events missed is unaffected
+        let config = Config::default().with_event_kinds(
+            EventKindMask::CREATE
+                | EventKindMask::REMOVE
+                | EventKindMask::MODIFY_DATA
+                | EventKindMask::MODIFY_NAME
+                | EventKindMask::ACCESS_CLOSE,
+        );
+        Self(RecommendedWatcher::new(handler, config).map_err(|err| cannot_make(&err)))
     }
 
     /// 监视目录 `dir`（不连带下面的）/ Watches the directory `dir` (not those under it)
@@ -764,9 +775,10 @@ impl Targets {
     /// - 又处处监视上了的文件：有位置监视不上的（所在的目录删掉以后过了 [`QUIET`] 才重建、监视数用完了），重新解析以后
     ///   都监视上了。样子没变，不用回调，监视得怎样要报。
     ///
-    /// 文件系统卸载又挂上时目录还是那一个（同样的设备和 inode，见 [`Identity`]），inotify 却撤了它的监视，notify 不说。
-    /// 所以 Linux 上比样子之前把还是那一个的目录都再监视一遍：还在的监视不变（IN_MASK_ADD），撤了的重新装上，这之前的
-    /// 改动比得出样子，之后的事件报得到。装不上（比如目录改成了列不出）时还在的监视照旧，撤了的那里就只靠比样子
+    /// 文件系统卸载时 inotify 撤了上面的监视，notify 报成删掉（见 [`gone`]），用到那里的文件重新解析；又挂上以后目录还是
+    /// 那一个（同样的设备和 inode，见 [`Identity`]），这之间的改动比得出样子。Linux 上比样子之前还把还是那一个的目录都
+    /// 再监视一遍：还在的监视不变（IN_MASK_ADD），撤了却没有事件报出来的重新装上，这之前的改动比得出样子，之后的事件
+    /// 报得到。装不上（比如目录改成了列不出）时还在的监视照旧，撤了的那里就只靠比样子
     ///
     /// Checks for what the watch has lost track of with no event telling (see [`CHECK_EVERY`]).
     /// The files `pending` names, waiting for their callback already, are neither compared nor
@@ -783,13 +795,15 @@ impl Targets {
     ///   watched once resolved again. Looking the same, they need no callback, though how they
     ///   are watched is to be reported.
     ///
-    /// A file system unmounted and mounted again leaves the directory the same one (the same
-    /// device and inode, see [`Identity`]), yet inotify has taken its watch out, notify telling
-    /// no one. So on Linux, before the files are compared, every directory still the same one is
-    /// watched again: a watch still in stays as it is (IN_MASK_ADD), one taken out goes back in,
-    /// a change before that shows in the comparison and the events tell those after. Where that
-    /// fails (the directory made unlistable, say) a watch still in stays, and where it was taken
-    /// out the comparison alone tells
+    /// A file system unmounted takes inotify's watches on it out, which notify reports as a
+    /// removal (see [`gone`]), and the files using it are resolved again; mounted again it leaves
+    /// the directory the same one (the same device and inode, see [`Identity`]), and a change in
+    /// between shows in the comparison. On Linux, before the files are compared, every directory
+    /// still the same one is watched again too: a watch still in stays as it is (IN_MASK_ADD),
+    /// one taken out with no event telling goes back in, a change before that shows in the
+    /// comparison and the events tell those after. Where that fails (the directory made
+    /// unlistable, say) a watch still in stays, and where it was taken out the comparison alone
+    /// tells
     fn check(
         &mut self,
         watcher: &mut Notify,
@@ -1229,9 +1243,9 @@ mod tests {
         );
     }
 
-    /// 相对路径也按 notify 报告的完整路径对上（它把相对路径接在当前目录后面）
-    /// A relative path is matched too, by the full path notify reports (it joins a relative
-    /// path onto the current directory)
+    /// 相对路径也对得上：监视之前接在当前目录后面解析好（见 [`watch_points`]），notify 按解析好的路径报
+    /// A relative path is matched too: it is joined onto the current directory and resolved
+    /// before it is watched (see [`watch_points`]), and notify reports under the path resolved
     #[test]
     fn a_relative_path_is_matched() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1554,6 +1568,41 @@ mod tests {
         assert_eq!(
             rx.recv_timeout(Duration::from_secs(1)),
             Err(mpsc::RecvTimeoutError::Timeout)
+        );
+    }
+
+    /// notify 只报监视用得上的事件：读文件、改属性都不报，写完关上照报。只在 Linux 上测：macOS 的 FSEvents 把同一个
+    /// 文件先前的新建、写入和这次的改属性并在一起报
+    /// notify reports only the events the watch has use for: a read and a metadata change are
+    /// not reported, a file closed after writing is. Tested on Linux only: macOS FSEvents
+    /// reports the earlier creation and write of the file together with this metadata change
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reads_and_metadata_changes_are_not_reported() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("target.file");
+        std::fs::write(&target, "v1").expect("seed file");
+
+        let (tx, rx) = mpsc::channel();
+        let mut watcher = Notify::new(tx);
+        watcher.watch(dir.path()).expect("watch");
+        std::fs::read(&target).expect("read");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        std::fs::write(&target, "v2").expect("change file");
+
+        let mut kinds = Vec::new();
+        while let Ok(event) = rx.recv_timeout(Duration::from_millis(500)) {
+            kinds.push(event.expect("event").kind);
+        }
+        let closed = EventKind::Access(AccessKind::Close(AccessMode::Write));
+        assert!(kinds.contains(&closed), "{kinds:?}");
+        assert!(
+            !kinds.iter().any(|kind| matches!(
+                kind,
+                EventKind::Access(AccessKind::Open(_)) | EventKind::Modify(ModifyKind::Metadata(_))
+            )),
+            "{kinds:?}"
         );
     }
 
@@ -2252,15 +2301,13 @@ mod tests {
         assert_eq!(targets.check(&mut watcher, |_| false), (vec![], vec![]));
     }
 
-    /// 文件系统卸载又挂上：目录还是那一个，inotify 却撤了它的监视，notify 不说、自己还记着它（这里绕过 notify 在内核里
-    /// 撤掉监视来模拟，见 [`take_out_behind_notify`]）。核对把监视装回去，之后的改动事件报得到。以前核对只比目录是不是
-    /// 那一个，看不出来，之后每次改动都要等核对比样子
-    /// A file system unmounted and mounted again: the directory is the same one, yet inotify has
-    /// taken its watch out, notify telling no one and still counting it (here the watch is taken
-    /// out in the kernel behind notify's back to stand in, see [`take_out_behind_notify`]). The
-    /// check puts the watch back, and later changes are reported by events. The check used to
-    /// compare only whether the directory was the same one, which could not tell, and every
-    /// change after waited for a check to compare the files
+    /// 目录还是那一个，监视却在内核里撤了，没有事件报出来（这里绕过 notify 撤掉，见 [`take_out_behind_notify`]）。核对把
+    /// 监视装回去，之后的改动事件报得到。以前核对只比目录是不是那一个，看不出来，之后每次改动都要等核对比样子
+    /// The directory is the same one, yet its watch was taken out in the kernel with no event
+    /// telling (here behind notify's back, see [`take_out_behind_notify`]). The check puts the
+    /// watch back, and later changes are reported by events. The check used to compare only
+    /// whether the directory was the same one, which could not tell, and every change after
+    /// waited for a check to compare the files
     #[cfg(target_os = "linux")]
     #[test]
     fn the_check_puts_back_a_watch_taken_out_of_the_same_directory() {
@@ -2282,12 +2329,12 @@ mod tests {
         assert!(event.paths.contains(&configured), "{event:?}");
     }
 
-    /// 绕过 notify 在内核里撤掉 `dir` 的 inotify 监视，像文件系统卸载时那样，notify 自己还记着它：按 /proc/self/fdinfo
-    /// 里每个监视记的 inode 号和设备号找到监视 `dir` 的 inotify 实例和监视号。不要 root
-    /// Takes `dir`'s inotify watch out in the kernel behind notify's back, as unmounting a file
-    /// system does, notify still counting it: the inotify instance and watch descriptor watching
-    /// `dir` are found by the inode and device numbers /proc/self/fdinfo gives for each watch.
-    /// Needs no root
+    /// 绕过 notify 在内核里撤掉 `dir` 的 inotify 监视，notify 只收到 IN_IGNORED、不报事件：按 /proc/self/fdinfo 里每个
+    /// 监视记的 inode 号和设备号找到监视 `dir` 的 inotify 实例和监视号。不要 root
+    /// Takes `dir`'s inotify watch out in the kernel behind notify's back, notify getting
+    /// IN_IGNORED alone and reporting no event: the inotify instance and watch descriptor
+    /// watching `dir` are found by the inode and device numbers /proc/self/fdinfo gives for each
+    /// watch. Needs no root
     #[cfg(target_os = "linux")]
     fn take_out_behind_notify(dir: &Path) {
         use std::os::unix::fs::MetadataExt as _;
