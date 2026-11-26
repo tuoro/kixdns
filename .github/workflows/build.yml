@@ -261,7 +261,11 @@ jobs:
           components: clippy
           targets: x86_64-pc-windows-gnu, x86_64-unknown-freebsd, aarch64-unknown-linux-musl
 
+      # 下载慢的时候连重试要六七分钟；装好以后它还挂住过一次，一个小时没有动静（等 GitHub 的缓存服务），超时让它早点报错
+      # A slow download takes six or seven minutes with its retries; once it also hung after installing, silent for an
+      # hour (waiting on GitHub's cache service), so the timeout makes it fail early
       - name: Install zig
+        timeout-minutes: 10
         uses: mlugg/setup-zig@v2
         with:
           version: 0.17.1

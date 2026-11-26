@@ -3564,7 +3564,7 @@ mod tests {
                     0 => RData::A(A::new(192, 0, 2, u8::try_from(index).unwrap())),
                     1 => RData::AAAA(AAAA::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
                     2 => RData::CNAME(CNAME(Name::from_str("alias.example.net.").unwrap())),
-                    _ => RData::TXT(TXT::new(vec!["v=1".to_owned()])),
+                    _ => RData::TXT(TXT::try_from("v=1".to_owned()).unwrap()),
                 };
                 message
                     .answers
@@ -4589,7 +4589,7 @@ mod tests {
                     4 => RData::NS(NS(name(&mut next))),
                     5 => RData::PTR(PTR(name(&mut next))),
                     6 => RData::MX(MX::new(10, name(&mut next))),
-                    _ => RData::TXT(TXT::new(vec![format!("v={}", next(1000))])),
+                    _ => RData::TXT(TXT::try_from(format!("v={}", next(1000))).unwrap()),
                 };
                 message
                     .answers
