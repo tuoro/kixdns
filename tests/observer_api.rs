@@ -2232,7 +2232,7 @@ async fn doh_listener_reports_the_same_lifecycle_as_in_process_requests() {
     let (engine, recorder) = observed_engine(&raw);
     let (port, _cert_dir) = start_doh(engine.clone()).await;
     let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
+        .tls_danger_accept_invalid_certs(true)
         .timeout(Duration::from_secs(5))
         .build()
         .expect("build client");

@@ -77,7 +77,7 @@ fn tcp_answers(port: u16) -> bool {
 
 async fn doh_answers(port: u16) -> bool {
     let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
+        .tls_danger_accept_invalid_certs(true)
         .timeout(Duration::from_secs(3))
         .build()
         .unwrap();
