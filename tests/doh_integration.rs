@@ -23,7 +23,9 @@ use kixdns::matcher::RuntimePipelineConfig;
 
 /// Install the rustls crypto provider before any test runs.
 /// Required because the test binary needs TLS for both the DoH server and reqwest client.
-#[ctor::ctor]
+// SAFETY: 在 main 之前跑，只把加密实现存成 rustls 的进程级默认值 / Runs before main, only
+// storing the crypto provider as rustls' process-wide default
+#[ctor::ctor(unsafe)]
 fn init() {
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()

@@ -20,7 +20,9 @@ use super::doh_h2::{self, proxy_configured_in};
 use super::test_support::CountedWrites;
 use super::transport::{BUSY_AT, DOH_MEDIA_TYPE, DohClient, UdpClient, throttle_of};
 
-#[ctor::ctor]
+// SAFETY: 在 main 之前跑，只把加密实现存成 rustls 的进程级默认值 / Runs before main, only
+// storing the crypto provider as rustls' process-wide default
+#[ctor::ctor(unsafe)]
 fn init_crypto() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }

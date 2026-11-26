@@ -11,7 +11,9 @@ use tokio::time::timeout;
 
 /// reqwest + rustls 要有进程级的加密实现，明文 http 也一样
 /// reqwest + rustls needs a process-level crypto provider, plain http included
-#[ctor::ctor]
+// SAFETY: 在 main 之前跑，只把加密实现存成 rustls 的进程级默认值 / Runs before main, only
+// storing the crypto provider as rustls' process-wide default
+#[ctor::ctor(unsafe)]
 fn init_crypto() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
