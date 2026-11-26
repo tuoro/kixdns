@@ -221,8 +221,10 @@ pub struct DohClient {
     /// past. A merged forward looks at it first: with no upstream paused, the check costs
     /// this one load
     latest_pause_end: AtomicU64,
-    /// 直连 HTTP/2 用的 TLS 设置：握手时报 h2 和 http/1.1 / The TLS settings of the direct HTTP/2 connection: h2 and http/1.1 offered in the handshake
-    tls_h2: Arc<ClientConfig>,
+    /// DoH 的 TLS 设置（见 [`doh_tls_config`]），直连和 reqwest 都用：根证书是 webpki-roots 的，加密实现是进程默认的
+    /// The TLS settings of DoH (see [`doh_tls_config`]), by the direct connection and reqwest
+    /// alike: the roots are webpki-roots', the crypto provider the process default
+    tls: Arc<ClientConfig>,
     /// 上游的主机名怎样解析（见 [`Bootstrap`]），直连和 reqwest 都用它 / How upstream host names are
     /// resolved (see [`Bootstrap`]), by the direct connection and reqwest alike
     resolver: Resolver,
@@ -262,7 +264,7 @@ impl DohClient {
             last_prune_millis: AtomicU64::new(0),
             epoch: std::time::Instant::now(),
             latest_pause_end: AtomicU64::new(0),
-            tls_h2: direct_tls_config(build_tls_client_config()?),
+            tls: doh_tls_config(build_tls_client_config()?),
             resolver,
             direct_h2: !doh_h2::proxy_configured(),
             idle_timeout: doh_h2::DOH_IDLE_TIMEOUT,
@@ -284,7 +286,7 @@ impl DohClient {
         for root in &self.test_roots {
             roots.add(root.clone()).expect("test root");
         }
-        self.tls_h2 = direct_tls_config(
+        self.tls = doh_tls_config(
             ClientConfig::builder()
                 .with_root_certificates(roots)
                 .with_no_client_auth(),
@@ -358,17 +360,19 @@ impl DohClient {
     /// override therefore speaks only HTTP/1.1 through reqwest, HTTP/2 being left to the direct
     /// connection (see [`DohTarget::uri`])
     fn build_client(&self, target: &DohTarget) -> anyhow::Result<DohHttpClient> {
+        let mut tls = ClientConfig::clone(&self.tls);
         let builder = DohHttpClient::builder();
         let builder = if target.host_override.is_some() {
+            // 握手时也只报 http/1.1：reqwest 不改给它的 TLS 设置，上游选了 h2 它就说 HTTP/2
+            // Only http/1.1 offered in the handshake too: reqwest leaves the TLS settings it is
+            // given alone, and speaks HTTP/2 once the upstream picks h2
+            tls.alpn_protocols = vec![b"http/1.1".to_vec()];
             builder.http1_only()
         } else {
             builder
         };
-        #[cfg(test)]
-        let builder = self.test_roots.iter().fold(builder, |builder, root| {
-            builder.add_root_certificate(reqwest::Certificate::from_der(root).expect("test root"))
-        });
         builder
+            .tls_backend_preconfigured(tls)
             // A DoH server has no reason to redirect, and following one could send
             // the query elsewhere, plain HTTP included; a 3xx fails like any other
             // non-success status
@@ -636,7 +640,7 @@ impl DohClient {
                     deadline,
                     state
                         .h2
-                        .sender(url, &self.tls_h2, &self.resolver.bootstrap, deadline),
+                        .sender(url, &self.tls, &self.resolver.bootstrap, deadline),
                 )
                 .await
                 .unwrap_or_else(|_| {
@@ -902,10 +906,9 @@ fn is_transport_error(err: &anyhow::Error) -> bool {
             .is_some_and(reqwest::Error::is_connect)
 }
 
-/// 直连 DoH 上游用的 TLS 设置：`base` 再加上握手时报 h2 和 http/1.1，和 reqwest 一样
-/// The TLS settings for a direct DoH connection: `base` with h2 and http/1.1 offered in the
-/// handshake, as reqwest offers them
-fn direct_tls_config(mut base: ClientConfig) -> Arc<ClientConfig> {
+/// DoH 用的 TLS 设置：`base` 再加上握手时报 h2 和 http/1.1
+/// The TLS settings of DoH: `base` with h2 and http/1.1 offered in the handshake
+fn doh_tls_config(mut base: ClientConfig) -> Arc<ClientConfig> {
     base.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Arc::new(base)
 }

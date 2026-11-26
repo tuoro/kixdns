@@ -39,7 +39,10 @@ maxminddb = "0.27"
 maxminddb-writer = "0.1"
 futures = "0.3"
 parking_lot = "0.12"
-reqwest = { version = "0.12", default-features = false, features = ["http2", "rustls-tls"] }
+# DoH 客户端把自己的 TLS 设置交给 reqwest（见 src/engine/transport/doh.rs），加密实现是 main 装的进程默认（ring）
+# The DoH client hands reqwest its own TLS settings (see src/engine/transport/doh.rs), the crypto
+# provider being the process default main installs (ring)
+reqwest = { version = "0.13", default-features = false, features = ["http2", "rustls-no-provider"] }
 tokio-rustls = "0.26"
 rustls = { version = "0.23", features = ["ring"] }
 webpki-roots = "0.26"
@@ -90,7 +93,6 @@ ctor = "0.2"
 tokio = { version = "1", features = ["test-util"] }
 rcgen = "0.13"
 tempfile = "3"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 # DoH 的 HTTP/2 测试要自己控制一条连接上发什么、什么时候发 / The DoH HTTP/2 tests drive one connection themselves
 hyper = { version = "1", features = ["client", "http2"] }
 
