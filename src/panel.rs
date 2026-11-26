@@ -1900,20 +1900,34 @@ impl EngineObserver for PanelMetrics {
                 );
             }
         }
+        // 回了的写响应码和耗时：用上的是 succeeded，一组上游里放到一边、等别的回答的是 rejected（SERVFAIL 这类，或者被截断）。
+        // 没等它回的是 aborted（同组别的先回了，或者整个转发被放下）：它没出错，也没有回答可写。这两种以前都记成不带原因的
+        // failed，诊断页上就成了红色的「出错」
+        // A reply names its code and time: succeeded when it was used, rejected when a concurrent
+        // set put it aside for the others' answers (SERVFAIL and the like, or truncated). One not
+        // waited for is aborted (another of its set answered first, or the whole forward was
+        // dropped): nothing went wrong and there is no reply to name. Both used to be a failed
+        // step without a reason, which diagnostics showed as a red 「出错」
+        let reply = || {
+            Some(format!(
+                "响应码：{}；耗时：{} ms；截断：{}",
+                event
+                    .rcode
+                    .map_or(Cow::Borrowed("unknown"), |rcode| rcode_name(rcode.into())),
+                event.latency.as_millis(),
+                event.truncated.unwrap_or(false)
+            ))
+        };
         match event.outcome {
-            UpstreamOutcome::Success => panel_trace::trace_step!(
-                "upstream",
-                "succeeded",
-                event.upstream,
-                Some(format!(
-                    "响应码：{}；耗时：{} ms；截断：{}",
-                    event
-                        .rcode
-                        .map_or(Cow::Borrowed("unknown"), |rcode| rcode_name(rcode.into())),
-                    event.latency.as_millis(),
-                    event.truncated.unwrap_or(false)
-                )),
-            ),
+            UpstreamOutcome::Success => {
+                panel_trace::trace_step!("upstream", "succeeded", event.upstream, reply())
+            }
+            UpstreamOutcome::Rejected => {
+                panel_trace::trace_step!("upstream", "rejected", event.upstream, reply())
+            }
+            UpstreamOutcome::Aborted => {
+                panel_trace::trace_step!("upstream", "aborted", event.upstream, None)
+            }
             UpstreamOutcome::Throttled => panel_trace::trace_step!(
                 "upstream",
                 "throttled",
@@ -1926,7 +1940,7 @@ impl EngineObserver for PanelMetrics {
                     }
                 ),
             ),
-            _ => panel_trace::trace_step!(
+            UpstreamOutcome::Error => panel_trace::trace_step!(
                 "upstream",
                 "failed",
                 event.upstream,
@@ -6641,6 +6655,97 @@ mod diagnostic_tests {
                     doh.address,
                     "正在限速，这次没问它"
                 ])],
+            ]
+        );
+    }
+
+    /// 诊断里一组上游各自的结果分开写：回了 SERVFAIL、放到一边的是 `rejected`，带着响应码；同组别的先回了、没等它回的
+    /// 是 `aborted`。两种都不是 `failed`：以前它们是不带原因的 failed，诊断页上成了红色的「出错」
+    /// In diagnostics each upstream of a concurrent set says how it ended: one answering SERVFAIL
+    /// and put aside is `rejected`, with its response code; one not waited for because another
+    /// of its set answered first is `aborted`. Neither is `failed`: both used to be failed steps
+    /// without a reason, which the diagnostics page showed as a red 「出错」
+    #[tokio::test]
+    async fn diagnostics_tell_set_aside_and_unawaited_upstreams_from_failures() {
+        let failing = || {
+            crate::engine::test_support::upstream(|query| {
+                let mut reply = hickory_proto::op::Message::new(
+                    query.metadata.id,
+                    hickory_proto::op::MessageType::Response,
+                    hickory_proto::op::OpCode::Query,
+                );
+                reply.metadata.recursion_desired = query.metadata.recursion_desired;
+                reply.metadata.response_code = hickory_proto::op::ResponseCode::ServFail;
+                reply.add_queries(query.queries.iter().cloned());
+                vec![(std::time::Duration::ZERO, reply.to_vec().unwrap())]
+            })
+        };
+        let (first, second) = (failing().await, failing().await);
+        let answering =
+            crate::engine::test_support::answering_upstream(Ipv4Addr::new(192, 0, 2, 53), 300)
+                .await;
+        let silent = crate::engine::test_support::upstream(|_| Vec::new()).await;
+        let metrics = Arc::new(PanelMetrics::new(false));
+        let engine = engine_for(
+            json!({
+                "settings": { "default_upstream": "127.0.0.1:9", "upstream_timeout_ms": 3000 },
+                "pipelines": [{ "id": "main", "rules": [
+                    {
+                        "name": "broken",
+                        "matchers": [{ "type": "domain_suffix", "value": "broken.example" }],
+                        "actions": [{ "type": "forward", "upstream": [first.address.clone(), second.address.clone()] }]
+                    },
+                    {
+                        "name": "race",
+                        "matchers": [{ "type": "any" }],
+                        "actions": [{ "type": "forward", "upstream": [answering.address.clone(), silent.address.clone()] }]
+                    }
+                ] }]
+            }),
+            Arc::clone(&metrics),
+        );
+        let mut ends = Vec::new();
+        for name in ["broken.example", "race.example"] {
+            let (packet, record_type) = diagnostic_packet(name, "A").expect("packet");
+            let (status, body) = run_diagnostic(&engine, &packet, None, name, &record_type).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            // 耗时每次不一样，只留响应码和截断 / The time differs every run, so only the code and
+            // truncation are kept
+            let mut steps: Vec<serde_json::Value> = body["trace"]
+                .as_array()
+                .expect("trace")
+                .iter()
+                .filter(|step| step["stage"] == "upstream" && step["status"] != "started")
+                .map(|step| {
+                    let detail = step["detail"].as_str().map(|detail| {
+                        detail
+                            .split('；')
+                            .filter(|part| !part.starts_with("耗时："))
+                            .collect::<Vec<_>>()
+                            .join("；")
+                    });
+                    json!([step["status"], step["label"], detail])
+                })
+                .collect();
+            steps.sort_by_key(|step| step.to_string());
+            ends.push(steps);
+        }
+        let mut both = [first.address.clone(), second.address.clone()];
+        both.sort();
+        assert_eq!(
+            ends,
+            vec![
+                both.iter()
+                    .map(|address| json!(["rejected", address, "响应码：SERVFAIL；截断：false"]))
+                    .collect::<Vec<_>>(),
+                vec![
+                    json!(["aborted", silent.address, null]),
+                    json!([
+                        "succeeded",
+                        answering.address,
+                        "响应码：NOERROR；截断：false"
+                    ]),
+                ],
             ]
         );
     }
