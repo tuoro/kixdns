@@ -1236,6 +1236,7 @@ impl PanelMetrics {
                 "config_bootstrap_v1",
                 "config_qtype_names_v1",
                 "config_serve_stale_ttl_reset_v2",
+                "config_client_mac_v1",
                 "metrics_upstream_precision_v1",
                 "metrics_upstream_response_latency_v1",
                 "querylog_v1",
@@ -6085,15 +6086,16 @@ mod diagnostic_tests {
     /// 内核，同一个内核两边说的得一样。其中有顶层留给面板的块（`config_panel_block_v1`，见 `config::PANEL_BLOCK`），
     /// `settings.bootstrap`（`config_bootstrap_v1`），`qtype` 和 `response_type` 写 hickory 认得的任一类型名或
     /// `TYPEnnn`（`config_qtype_names_v1`），默认关、后台刷新失败以后才重新计时的 `serve_stale_ttl_reset`
-    /// （`config_serve_stale_ttl_reset_v2`）
+    /// （`config_serve_stale_ttl_reset_v2`），以及按本机邻居表认客户端的 `client_mac` 匹配器（`config_client_mac_v1`）
     /// Health declares every config capability `panel/capabilities.json` declares in the package:
     /// the panel judges a package not yet running by the former and a running kernel by the
     /// latter, and the two have to say the same of one kernel. Among them are the top-level block
     /// kept for the panel (`config_panel_block_v1`, see `config::PANEL_BLOCK`),
     /// `settings.bootstrap` (`config_bootstrap_v1`), `qtype` and `response_type` writing any type
-    /// name hickory knows or `TYPEnnn` (`config_qtype_names_v1`), and `serve_stale_ttl_reset`,
-    /// off by default and restarting the clock only once a background refresh fails
-    /// (`config_serve_stale_ttl_reset_v2`)
+    /// name hickory knows or `TYPEnnn` (`config_qtype_names_v1`), `serve_stale_ttl_reset`, off
+    /// by default and restarting the clock only once a background refresh fails
+    /// (`config_serve_stale_ttl_reset_v2`), and the `client_mac` matcher, knowing a client by the
+    /// host's neighbor table (`config_client_mac_v1`)
     #[test]
     fn health_declares_the_config_capabilities_of_the_package() {
         let package: serde_json::Value =
@@ -6109,6 +6111,7 @@ mod diagnostic_tests {
             "config_bootstrap_v1",
             "config_qtype_names_v1",
             "config_serve_stale_ttl_reset_v2",
+            "config_client_mac_v1",
         ] {
             assert!(declared.contains(&capability), "{capability}");
         }

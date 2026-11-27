@@ -279,6 +279,8 @@ sayings! {
         => "listener_label works in pipeline_select only";
     NetworkInvalid "network_invalid" { value: String, error: String }
         => "\"{value}\" is not an IP network: {error}";
+    MacInvalid "mac_invalid" { value: String }
+        => "\"{value}\" is not a MAC address; write six two-digit hexadecimal numbers separated by \":\" or \"-\", such as aa:bb:cc:dd:ee:ff";
     RegexTooLong "regex_too_long" { bytes: usize, most: usize }
         => "regex pattern too long: {bytes} bytes (max {most})";
     RegexInvalid "regex_invalid" { error: String } => "{error}";

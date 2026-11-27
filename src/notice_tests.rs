@@ -132,6 +132,7 @@ fn everything_wrong() -> Value {
                         { "type": "domain_exact", "value": "" },
                         { "type": "listener_label", "value": "udp" },
                         { "type": "client_ip", "cidr": "nope" },
+                        { "type": "client_mac", "mac": "nope" },
                         { "type": "domain_regex", "value": "(" },
                         { "type": "domain_regex", "value": "a".repeat(16 * 1024 + 1) },
                         { "type": "qclass", "value": "XX" }

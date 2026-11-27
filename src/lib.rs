@@ -7,6 +7,7 @@ pub mod ecs_scope;
 pub mod engine;
 pub mod listeners;
 pub mod matcher;
+pub mod neighbor;
 pub mod notice;
 pub mod observe;
 // 面板只经控制通道读统计、跑诊断，控制通道是 Unix socket：别的系统上没有谁读它们，这三个模块不编进去 / The panel reads

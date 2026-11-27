@@ -9,6 +9,8 @@ mod bootstrap_tests;
 mod cache_class_tests;
 #[cfg(test)]
 mod client_address_tests;
+#[cfg(test)]
+mod client_mac_tests;
 pub mod concurrency;
 #[cfg(test)]
 mod cookie_tests;

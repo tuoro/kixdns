@@ -91,6 +91,7 @@
 | `regex_capitals` | `matcher`, `pattern`, `capitals` | 告警：域名正则不在 `(?i)` 下写了大写字母，照写命不中 |
 | `listener_label_outside_select` | — | 问题：`listener_label` 写在规则里，它只在 pipeline_select 里用得上 |
 | `network_invalid` | `value`, `error` | 问题：网段写错了 |
+| `mac_invalid` | `value` | 问题：`client_mac` 的 MAC 地址写错了 |
 | `regex_too_long` | `bytes`, `most` | 问题：正则写得太长 |
 | `regex_invalid` | `error` | 问题：域名正则写错了或者编译后太大；原话就是正则库的错误 |
 | `txt_regex_invalid` | `error` | 问题：`response_txt_content` 的正则写错了或者编译后太大 |

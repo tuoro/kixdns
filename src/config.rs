@@ -397,6 +397,16 @@ pub enum Matcher {
     ClientIp {
         cidr: String,
     },
+    /// 客户端的 MAC 地址：本机邻居表里客户端地址对应的 MAC 是它时命中（见 `neighbor`），写成 `aa:bb:cc:dd:ee:ff` 或
+    /// `aa-bb-cc-dd-ee-ff`，大小写不论。只认得出和 KixDNS 在同一个局域网上的客户端，别的（不在同一个网段上、经 NAT 进来的、
+    /// Linux 以外的系统上）都不命中
+    /// The client's MAC address: matches when the MAC the host's neighbor table gives for the
+    /// client address is this one (see `neighbor`), written `aa:bb:cc:dd:ee:ff` or
+    /// `aa-bb-cc-dd-ee-ff`, in any case. It knows only clients on the LAN KixDNS is on, and
+    /// matches no other (off the LAN, come in through NAT, on systems other than Linux)
+    ClientMac {
+        mac: String,
+    },
     /// 匹配客户端 IP 的 GeoIP 国家代码或命名标签（大小写不敏感）。 / Match client IP GeoIP country code or named tag (case insensitive)
     GeoipCountry {
         #[serde(deserialize_with = "deserialize_string_or_vec")]
@@ -2371,7 +2381,7 @@ impl AnyMatcher<'_> {
     /// 值写成空的这个匹配器做成了什么，按它的意思分：它看的每一样都匹配的（每个名字，或者每份带 TXT 记录的回答）
     /// 和只匹配根名字的空 domain_exact 算 [`problems`]，永远不匹配的算 [`warnings`]。域名按读进来的样子看，单独一个点
     /// 是根（见 `matcher::domain_value`），所以 domain_suffix 写成 `.` 和写成空的一样，domain_exact 写成 `.` 正是要根；
-    /// 逗号分隔的列表一项也没写算空。值写成空的编译不过（网段、qclass、qtype）、另有检查（rcode）或者根本没有值的，为
+    /// 逗号分隔的列表一项也没写算空。值写成空的编译不过（网段、MAC、qclass、qtype）、另有检查（rcode）或者根本没有值的，为
     /// None。逐个列出每一种，新加的匹配器编译时就得决定
     /// What this matcher comes to with its value written empty, by what it means: one matching
     /// everything it looks at (every name, or every answer carrying a TXT record) and an empty
@@ -2379,9 +2389,9 @@ impl AnyMatcher<'_> {
     /// among [`warnings`]. A domain is looked at as read, a lone dot being the root (see
     /// `matcher::domain_value`), so domain_suffix written `.` is as written empty, and
     /// domain_exact written `.` means the root indeed; a comma-separated list naming nothing
-    /// counts as empty. None for one that written empty does not compile (a network, a qclass, a
-    /// qtype), is checked otherwise (an rcode) or has no value at all. Every kind is listed, so a
-    /// new matcher has to be decided on to compile
+    /// counts as empty. None for one that written empty does not compile (a network, a MAC, a
+    /// qclass, a qtype), is checked otherwise (an rcode) or has no value at all. Every kind is
+    /// listed, so a new matcher has to be decided on to compile
     fn written_empty(self) -> Option<(Weight, Said)> {
         use crate::matcher::domain_value;
         let every_name = |matcher, value: &str| {
@@ -2420,6 +2430,7 @@ impl AnyMatcher<'_> {
                 | Matcher::DomainExact { .. }
                 | Matcher::DomainRegex { .. }
                 | Matcher::ClientIp { .. }
+                | Matcher::ClientMac { .. }
                 | Matcher::GeoipCountry { .. }
                 | Matcher::GeoipPrivate { .. }
                 | Matcher::Qclass { .. }
@@ -4547,6 +4558,65 @@ mod validation_tests {
                 error.contains(&format!("{place}: \"{written}\" is not an IP network")),
                 "{error}"
             );
+        }
+    }
+
+    /// client_mac 认 `:` 和 `-` 两种写法，大小写不论，规则和 pipeline_select 里都一样；别的写法拒掉，报出写的是什么、在哪
+    /// client_mac reads both the `:` and the `-` form in any case, in rules and pipeline_select
+    /// alike; any other way of writing it is refused, naming what was written and where
+    #[test]
+    fn a_client_mac_is_read_in_either_form_and_a_mistyped_one_refused() {
+        let any = serde_json::json!([{ "type": "any" }]);
+        let except = |mac: &str| {
+            serde_json::json!([
+                { "type": "any" },
+                { "type": "client_mac", "mac": mac, "operator": "and_not" }
+            ])
+        };
+        let config = |select: serde_json::Value, matchers: serde_json::Value| {
+            serde_json::json!({
+                "settings": { "default_upstream": "1.1.1.1:53" },
+                "pipeline_select": [{ "pipeline": "main", "matchers": select }],
+                "pipelines": [{ "id": "main", "rules": [
+                    rule("r", matchers, serde_json::json!([{ "type": "allow" }]))
+                ] }]
+            })
+            .to_string()
+        };
+        for written in [
+            "aa:bb:cc:dd:ee:ff",
+            "AA-BB-CC-DD-EE-FF",
+            "Aa:bB:cc:DD:ee:Ff",
+        ] {
+            validate(&config(any.clone(), except(written))).expect(written);
+            validate(&config(except(written), any.clone())).expect(written);
+        }
+        for written in [
+            "",
+            "aa:bb:cc:dd:ee",
+            "aa:bb:cc:dd:ee:ff:00",
+            "aa:bb-cc:dd:ee:ff",
+            "aabb.ccdd.eeff",
+            "aabbccddeeff",
+            "zz:bb:cc:dd:ee:ff",
+            " aa:bb:cc:dd:ee:ff",
+        ] {
+            for (config, place) in [
+                (
+                    config(any.clone(), except(written)),
+                    "pipelines[0].rules[0].matchers[1]",
+                ),
+                (
+                    config(except(written), any.clone()),
+                    "pipeline_select[0].matchers[1]",
+                ),
+            ] {
+                let error = format!("{:#}", validate(&config).expect_err("refused"));
+                assert!(
+                    error.contains(&format!("{place}: \"{written}\" is not a MAC address")),
+                    "{error}"
+                );
+            }
         }
     }
 

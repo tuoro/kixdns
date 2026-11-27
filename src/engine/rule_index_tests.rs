@@ -154,6 +154,7 @@ async fn the_compiled_index_misses_no_rule_that_matches() {
                     DNSClass::IN
                 },
                 client_ip: IpAddr::from_str(rng.pick(&CLIENTS)).unwrap(),
+                client_mac: None,
                 edns_present: rng.flag(),
             };
             let geo = engine.geo();

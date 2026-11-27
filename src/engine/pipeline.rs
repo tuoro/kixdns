@@ -96,6 +96,7 @@ impl Engine {
     ) -> RuleQuestion<'a> {
         let requester = Requester {
             address: facts.client_ip,
+            mac: facts.client_mac,
             edns: facts.edns_present,
             ecs: None,
         };

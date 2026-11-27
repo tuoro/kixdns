@@ -91,6 +91,7 @@ The codes and arguments are written once each in the kernel source, `src/notice.
 | `regex_capitals` | `matcher`, `pattern`, `capitals` | Warning: a name regex writes capitals outside `(?i)`, which never match as written |
 | `listener_label_outside_select` | — | Problem: `listener_label` written in a rule, while it works in pipeline_select only |
 | `network_invalid` | `value`, `error` | Problem: a network is mistyped |
+| `mac_invalid` | `value` | Problem: the MAC address of a `client_mac` is mistyped |
 | `regex_too_long` | `bytes`, `most` | Problem: a regex is written too long |
 | `regex_invalid` | `error` | Problem: a name regex is written wrong or too large compiled; the words are the regex library's error |
 | `txt_regex_invalid` | `error` | Problem: the regex of a `response_txt_content` is written wrong or too large compiled |
