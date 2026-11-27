@@ -424,6 +424,7 @@ mod geosite_tests {
                         qtype: RecordType::A,
                         qclass: DNSClass::IN,
                         client_ip: IpAddr::from([192, 0, 2, 1]),
+                        client_mac: None,
                         edns_present: false,
                     },
                     GeoManagers::empty(),

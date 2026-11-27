@@ -1,10 +1,10 @@
-//! 谁在问：规则能分辨的请求方（地址、带不带 EDNS、客户端自己的 ECS），规则区分它们的依据（`RequesterTest`），
+//! 谁在问：规则能分辨的请求方（地址、MAC、带不带 EDNS、客户端自己的 ECS），规则区分它们的依据（`RequesterTest`），
 //! 一个 pipeline 连同它跳得到的 pipeline 合起来的依据（`RequesterScope`），以及缓存和 inflight 键里请求方那一部分
 //! (`RequesterKey`)
-//! Who is asking: the requester as far as rules can tell (address, EDNS or not, the client's own
-//! ECS), what rules tell requesters apart by (`RequesterTest`), what a pipeline with those it can
-//! jump to tells them apart by (`RequesterScope`), and the requester's part of the cache and
-//! inflight keys (`RequesterKey`)
+//! Who is asking: the requester as far as rules can tell (address, MAC, EDNS or not, the
+//! client's own ECS), what rules tell requesters apart by (`RequesterTest`), what a pipeline
+//! with those it can jump to tells them apart by (`RequesterScope`), and the requester's part of
+//! the cache and inflight keys (`RequesterKey`)
 
 use super::*;
 /// Who is asking, as far as rules can tell.
@@ -13,6 +13,12 @@ use super::*;
 pub struct Requester {
     /// The client's address / 客户端地址
     pub address: IpAddr,
+    /// The MAC the host's neighbor table gave for the address as the request came in, looked
+    /// up only when the configuration writes client_mac (see `Engine::client_mac`): choosing
+    /// the pipeline, the keys and the rules of one request all go by this one lookup
+    /// 请求进来时本机邻居表给这个地址的 MAC，配置写了 client_mac 才查（见 `Engine::client_mac`）：一个请求选
+    /// pipeline、算键、求值规则都按这一次查到的
+    pub mac: Option<crate::neighbor::Mac>,
     /// Whether the query carries EDNS / 查询是否带 EDNS
     pub edns: bool,
     /// The ECS option the client carries itself / 客户端自己带的 ECS 选项
@@ -36,6 +42,9 @@ impl Requester {
 pub enum RequesterTest {
     /// `client_ip`: whether the address is in the network / 地址是否在该网段内
     InNet(IpNet),
+    /// `client_mac`: whether the neighbor table maps the address to this MAC
+    /// 邻居表里这个地址对应的是不是这个 MAC
+    Mac(crate::neighbor::Mac),
     /// `geoip_private`: whether the address is private / 地址是否私有
     Private,
     /// `geoip_country`: whether the address's GeoIP country or tag is one of these
@@ -60,6 +69,7 @@ impl RequesterTest {
     ) {
         match self {
             Self::InNet(net) => net.contains(&requester.address).hash(hasher),
+            Self::Mac(mac) => (requester.mac == Some(*mac)).hash(hasher),
             Self::Private => geoip::is_private_ip(requester.address).hash(hasher),
             Self::Country(codes) => geoip.matches_any_tag(requester.address, codes).hash(hasher),
             Self::Edns => requester.edns.hash(hasher),
@@ -271,6 +281,7 @@ impl RuleReads {
             for m in rule.matchers.iter() {
                 let test = match &m.matcher {
                     RuntimeMatcher::ClientIp { net } => RequesterTest::InNet(*net),
+                    RuntimeMatcher::ClientMac { mac } => RequesterTest::Mac(*mac),
                     RuntimeMatcher::GeoipPrivate { .. } => RequesterTest::Private,
                     RuntimeMatcher::GeoipCountry { country_codes } => {
                         RequesterTest::Country(country_codes.clone())

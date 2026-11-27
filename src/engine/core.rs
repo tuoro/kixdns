@@ -1,3 +1,4 @@
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,6 +15,7 @@ use crate::cache_store::{CacheStore, Op};
 use crate::ecs_scope::EcsView;
 use crate::engine::refresh::RefreshTarget;
 use crate::matcher::RuntimePipelineConfig;
+use crate::neighbor::{Mac, NeighborTable};
 use crate::observe::{ClientTransport, ConfigLoaded, ConfigReloadFailed, EngineObserver};
 
 use super::bootstrap::Bootstrap;
@@ -82,6 +84,10 @@ pub struct Engine {
     pub permit_manager: Arc<PermitManager>,
     // Adaptive flow control state (None when flow control is disabled) / 自适应流控状态（禁用流控时为None）
     pub flow_control_state: Option<Arc<FlowControlState>>,
+    /// 本机的邻居表，client_mac 按它认出客户端（见 [`Engine::client_mac`]）；配置换了也还是这一个
+    /// The host's neighbor table, by which client_mac knows a client (see
+    /// [`Engine::client_mac`]); the same one whatever the configuration
+    pub(crate) neighbors: Arc<NeighborTable>,
 }
 
 /// Configures and constructs an [`Engine`]. Obtain one via [`Engine::builder`].
@@ -283,7 +289,32 @@ impl Engine {
             refresh_failures: Arc::default(),
             permit_manager,
             flow_control_state,
+            neighbors: Arc::new(NeighborTable::host()),
         })
+    }
+
+    /// 换上另一张邻居表：测试用它照假的表认客户端 / With another neighbor table in place: tests
+    /// know clients by a fake table this way
+    #[cfg(test)]
+    pub(crate) fn with_neighbors(mut self, neighbors: NeighborTable) -> Self {
+        self.neighbors = Arc::new(neighbors);
+        self
+    }
+
+    /// 客户端地址 `address` 在本机邻居表里的 MAC（见 [`NeighborTable::mac_of`]）。配置 `state` 写了 client_mac 才查，
+    /// 不然一次也不读表、为 None。每个请求在开头查这一次，选 pipeline、算键、求值规则都按查到的这一个（见
+    /// `Requester::mac`）：中途表换了样子，一个请求的键和它的规则也不会各说各的
+    /// The MAC of client address `address` in the host's neighbor table (see
+    /// [`NeighborTable::mac_of`]). Looked up only when the configuration `state` writes
+    /// client_mac, the table otherwise never read and None given. Each request looks it up once,
+    /// at its start, and choosing the pipeline, the keys and the rules all go by it (see
+    /// `Requester::mac`): the table changing on the way, a request's keys and its rules still
+    /// agree
+    pub(crate) fn client_mac(&self, state: &EngineInner, address: IpAddr) -> Option<Mac> {
+        if !state.pipeline.reads_client_mac {
+            return None;
+        }
+        self.neighbors.mac_of(address)
     }
 
     /// 槽位 `slot` 里 `question` 的、适用于 `view` 的那份应答（见 `CacheSlot::select`）

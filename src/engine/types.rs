@@ -733,6 +733,7 @@ fn hash_runtime_matcher(matcher: &RuntimeMatcher, hasher: &mut impl Hasher) {
             value.hash(hasher)
         }
         RuntimeMatcher::ClientIp { net } => net.hash(hasher),
+        RuntimeMatcher::ClientMac { mac } => mac.hash(hasher),
         RuntimeMatcher::DomainRegex { regex } => regex.as_str().hash(hasher),
         RuntimeMatcher::GeoipCountry { country_codes } => country_codes.hash(hasher),
         RuntimeMatcher::GeoipPrivate { expect } | RuntimeMatcher::EdnsPresent { expect } => {

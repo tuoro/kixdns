@@ -25,6 +25,7 @@ use regex::{Regex, RegexBuilder};
 use rustc_hash::FxHashMap;
 
 use crate::config::{self, Action, MatchOperator, PipelineConfig};
+use crate::neighbor::Mac;
 use crate::notice::{Notice, Said};
 
 // ============================================================================
@@ -237,6 +238,12 @@ pub struct RuntimePipelineConfig {
     /// [`config::warnings`]), found as it compiles: the validation answer, the log as it takes
     /// effect and `ConfigLoaded` all take them from here
     pub warnings: Vec<Notice>,
+    /// 有没有哪个规则或 pipeline_select 写了 client_mac：有才在每个请求开头查客户端的 MAC（见
+    /// `Engine::client_mac`），没有的配置一次邻居表也不读
+    /// Whether any rule or pipeline_select writes client_mac: only then does each request look
+    /// up its client's MAC at its start (see `Engine::client_mac`), and a configuration without
+    /// one never reads the neighbor table
+    pub reads_client_mac: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -459,6 +466,7 @@ pub enum RuntimeMatcher {
     DomainExact { value: Arc<str> },
     DomainSuffix { value: Arc<str> },
     ClientIp { net: IpNet },
+    ClientMac { mac: Mac },
     DomainRegex { regex: Regex },
     GeoipCountry { country_codes: Vec<Arc<str>> },
     GeoipPrivate { expect: bool },
@@ -651,12 +659,27 @@ impl RuntimePipelineConfig {
 
         fill_requester_scopes(&mut pipelines, &reads, &pipeline_id_index);
 
+        // pipeline_select 和规则的请求匹配器里有没有 client_mac / Whether pipeline_select's and the
+        // rules' request matchers hold a client_mac
+        let select = (pipeline_select.iter().flat_map(|rule| &rule.matchers)).filter_map(|m| {
+            match &m.matcher {
+                RuntimePipelineSelectorMatcher::Request(matcher) => Some(matcher),
+                RuntimePipelineSelectorMatcher::ListenerLabel { .. } => None,
+            }
+        });
+        let rules = (pipelines.iter().flat_map(|p| &p.rules))
+            .flat_map(|rule| &rule.matchers)
+            .map(|m| &m.matcher);
+        let reads_client_mac = select
+            .chain(rules)
+            .any(|m| matches!(m, RuntimeMatcher::ClientMac { .. }));
         let mut runtime = Self {
             settings: cfg.settings,
             pipeline_select,
             pipelines,
             pipeline_id_index,
             warnings,
+            reads_client_mac,
         };
         let geo = config::geo_tags_without_data(
             &runtime.settings,
@@ -822,6 +845,9 @@ impl RuntimeMatcher {
             config::Matcher::ClientIp { cidr } => RuntimeMatcher::ClientIp {
                 net: canonical_net(&cidr)?,
             },
+            config::Matcher::ClientMac { mac } => RuntimeMatcher::ClientMac {
+                mac: Mac::parse(&mac).ok_or(Said::MacInvalid { value: mac })?,
+            },
             config::Matcher::DomainRegex { value } => RuntimeMatcher::DomainRegex {
                 regex: domain_regex(&value)?,
             },
@@ -851,13 +877,15 @@ impl RuntimeMatcher {
     /// Whether request `facts` meets this matcher, judged by the Geo data `geo` (see
     /// [`GeoManagers`]). Rules, pipeline_select and the fast path all come here: without data for
     /// the GeoSite tag geo_site does not match and geo_site_not does, and without GeoIP data
-    /// geoip_country does not match
+    /// geoip_country does not match; client_mac goes by the MAC the request looked up at its
+    /// start (see [`RequestFacts::client_mac`]), and does not match without one
     pub fn matches(&self, facts: &RequestFacts<'_>, geo: &GeoManagers) -> bool {
         let RequestFacts {
             qname,
             qtype,
             qclass,
             client_ip,
+            client_mac,
             edns_present,
         } = *facts;
         match self {
@@ -868,6 +896,7 @@ impl RuntimeMatcher {
             }
             RuntimeMatcher::DomainSuffix { value } => domain_suffix_matches(qname, value),
             RuntimeMatcher::ClientIp { net } => net.contains(&client_ip),
+            RuntimeMatcher::ClientMac { mac } => client_mac == Some(*mac),
             RuntimeMatcher::DomainRegex { regex } => regex.is_match(qname),
             RuntimeMatcher::GeoipCountry { country_codes } => {
                 geo.geoip.matches_any_tag(client_ip, country_codes)
@@ -896,17 +925,21 @@ impl RuntimeMatcher {
     }
 }
 
-/// 请求匹配器和回答检查看的请求：名字（名字文本，见 `proto_utils::name_text`）、类型、类别、客户端地址、带不带 EDNS。
-/// 每个请求只建一份：选 pipeline、求值规则、检查回答都拿它
+/// 请求匹配器和回答检查看的请求：名字（名字文本，见 `proto_utils::name_text`）、类型、类别、客户端地址和 MAC、带不带
+/// EDNS。每个请求只建一份：选 pipeline、求值规则、检查回答都拿它
 /// The request as request matchers and answer checks see it: the name (as name text, see
-/// `proto_utils::name_text`), type, class, client address, and whether it carries EDNS. Each
-/// request builds one: choosing the pipeline, evaluating rules and checking answers all take it
+/// `proto_utils::name_text`), type, class, client address and MAC, and whether it carries
+/// EDNS. Each request builds one: choosing the pipeline, evaluating rules and checking answers
+/// all take it
 #[derive(Debug, Clone, Copy)]
 pub struct RequestFacts<'a> {
     pub qname: &'a str,
     pub qtype: RecordType,
     pub qclass: DNSClass,
     pub client_ip: IpAddr,
+    /// 请求开头在本机邻居表里查到的客户端 MAC（见 [`Requester::mac`]）/ The client's MAC the
+    /// request found in the host's neighbor table at its start (see [`Requester::mac`])
+    pub client_mac: Option<Mac>,
     pub edns_present: bool,
 }
 
@@ -920,6 +953,7 @@ impl<'a> RequestFacts<'a> {
             qtype: RecordType::A,
             qclass: DNSClass::IN,
             client_ip: IpAddr::from([127, 0, 0, 1]),
+            client_mac: None,
             edns_present: false,
         }
     }
@@ -1313,6 +1347,7 @@ mod tests {
                                 qtype: RecordType::A,
                                 qclass: DNSClass::IN,
                                 client_ip: IpAddr::from([192, 0, 2, 1]),
+                                client_mac: None,
                                 edns_present: false,
                             },
                             GeoManagers::empty(),
@@ -1592,6 +1627,7 @@ mod tests {
                 qtype: RecordType::A,
                 qclass: DNSClass::IN,
                 client_ip: IpAddr::from([192, 0, 2, 1]),
+                client_mac: None,
                 edns_present: false,
             };
             let geo = GeoManagers::empty();
@@ -2180,6 +2216,7 @@ mod tests {
             qtype: RecordType::A,
             qclass: DNSClass::IN,
             client_ip: ip,
+            client_mac: None,
             edns_present: false,
         };
         let geo = &GeoManagers {

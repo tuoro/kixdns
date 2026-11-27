@@ -867,6 +867,7 @@ impl Asked {
             peer: self.peer,
             requester: crate::matcher::Requester {
                 address: self.peer.ip(),
+                mac: None,
                 edns: false,
                 ecs: None,
             },

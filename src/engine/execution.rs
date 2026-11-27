@@ -602,6 +602,10 @@ impl Engine {
         let qclass = DNSClass::from(q.qclass);
         let qtype = hickory_proto::rr::RecordType::from(q.qtype);
         let qname_str = q.qname;
+        // 客户端的 MAC 也只在这里查一次，交给完整路径的也是它（见 `Engine::client_mac`）/ The client's
+        // MAC is looked up here once too, and goes on to the full path as it is (see
+        // `Engine::client_mac`)
+        let client_mac = self.client_mac(&state, peer.ip());
         // 选 pipeline、算键、求值规则都看这一份，GeoIP、GeoSite 数据也是它带着的那份（见 `EngineInner::geo`），交给完整
         // 路径的也是它
         // Choosing the pipeline, working out the keys and evaluating the rules all look at this
@@ -612,6 +616,7 @@ impl Engine {
             qtype,
             qclass,
             client_ip: peer.ip(),
+            client_mac,
             edns_present: q.edns_present,
         };
         let pipeline_opt = self.pick_pipeline(&state, &facts);
@@ -662,6 +667,7 @@ impl Engine {
 
         let requester = Requester {
             address: peer.ip(),
+            mac: client_mac,
             edns: q.edns_present,
             ecs: q.client_subnet,
         };
@@ -704,7 +710,7 @@ impl Engine {
                 {
                     // 和完整路径一样照读出的请求查（见 `Request::lookup`）/ Looked up by the request as
                     // read, as on the full path (see `Request::lookup`)
-                    let head = RequestHead::quick(&q, name_of(pipeline));
+                    let head = RequestHead::quick(&q, name_of(pipeline), client_mac);
                     let request = head.request(&state, packet, peer, q.client_subnet, start);
                     let mut log = response_log(pipeline);
                     let reply = crate::proto_utils::reply_as_asked(
@@ -921,7 +927,7 @@ impl Engine {
         // async path with the query as read, the pipeline picked and the configuration that
         // picked it, parsed no second time (see `Engine::handle_packet_full`)
         Some(FastPathResponse::AsyncNeeded(PreParsedData {
-            head: RequestHead::quick(&q, name_of(pipeline_opt)),
+            head: RequestHead::quick(&q, name_of(pipeline_opt), client_mac),
             state: arc_swap::Guard::into_inner(state),
         }))
     }
@@ -1241,6 +1247,9 @@ impl Engine {
         client: IpAddr,
         state: &EngineInner,
     ) -> Result<RequestHead, UnreadableQuery> {
+        // 请求从这里开始：客户端的 MAC 只查这一次（见 `Engine::client_mac`）/ The request starts
+        // here: the client's MAC is looked up this once (see `Engine::client_mac`)
+        let client_mac = self.client_mac(state, client);
         let pipeline_of = |head: (&str, RecordType, DNSClass, bool)| {
             let (qname, qtype, qclass, edns_present) = head;
             let facts = crate::matcher::RequestFacts {
@@ -1248,6 +1257,7 @@ impl Engine {
                 qtype,
                 qclass,
                 client_ip: client,
+                client_mac,
                 edns_present,
             };
             self.pick_pipeline(state, &facts)
@@ -1261,7 +1271,7 @@ impl Engine {
                 DNSClass::from(q.qclass),
                 q.edns_present,
             ));
-            return Ok(RequestHead::quick(&q, pipeline_id));
+            return Ok(RequestHead::quick(&q, pipeline_id, client_mac));
         }
         let name_end = crate::proto_utils::question_name_end(packet).ok_or(UnreadableQuery)?;
         let req = Message::from_bytes(packet).map_err(|_| UnreadableQuery)?;
@@ -1284,6 +1294,7 @@ impl Engine {
             // read, with the type and the class after it
             question_end: name_end + 4,
             client_ecs: crate::proto_utils::client_subnet(packet),
+            client_mac,
         })
     }
 
@@ -1685,12 +1696,20 @@ struct RequestHead {
     /// 问题段在哪里结束 / Where the question section ends
     question_end: usize,
     client_ecs: Option<crate::ecs::EcsKey>,
+    /// 请求开头查到的客户端 MAC（见 `Engine::client_mac`）/ The client's MAC looked up as the
+    /// request started (see `Engine::client_mac`)
+    client_mac: Option<crate::neighbor::Mac>,
     pipeline_id: Arc<str>,
 }
 
 impl RequestHead {
-    /// 快速解析读出的 `q`，选中的是 `pipeline_id` / `q` as the quick parse read it, `pipeline_id` picked
-    fn quick(q: &crate::proto_utils::QuickQuery<'_>, pipeline_id: Arc<str>) -> Self {
+    /// 快速解析读出的 `q`，选中的是 `pipeline_id`，客户端的 MAC 是 `client_mac` / `q` as the
+    /// quick parse read it, `pipeline_id` picked, `client_mac` the client's MAC
+    fn quick(
+        q: &crate::proto_utils::QuickQuery<'_>,
+        pipeline_id: Arc<str>,
+        client_mac: Option<crate::neighbor::Mac>,
+    ) -> Self {
         Self {
             qname: Arc::from(q.qname),
             qtype: RecordType::from(q.qtype),
@@ -1701,6 +1720,7 @@ impl RequestHead {
             edns_version: q.edns_version,
             question_end: q.question_end,
             client_ecs: q.client_subnet,
+            client_mac,
             pipeline_id,
         }
     }
@@ -1732,6 +1752,7 @@ impl RequestHead {
             // Who is asking, as far as rules and ECS can tell / 规则和 ECS 能分辨的请求方
             requester: Requester {
                 address: peer.ip(),
+                mac: self.client_mac,
                 edns: self.edns_present,
                 ecs,
             },
@@ -1780,6 +1801,7 @@ impl Request<'_> {
             qtype: self.qtype,
             qclass: self.qclass,
             client_ip: self.requester.address,
+            client_mac: self.requester.mac,
             edns_present: self.requester.edns,
         }
     }
@@ -4551,6 +4573,7 @@ mod tests {
             pipelines: Vec::new(),
             pipeline_id_index: FxHashMap::default(),
             warnings: Vec::new(),
+            reads_client_mac: false,
         }
     }
 
@@ -6207,6 +6230,7 @@ mod tests {
         let mark = RefreshTarget::mark_of(slot, &renewed.reach);
         let requester = Requester {
             address: "127.0.0.1".parse().unwrap(),
+            mac: None,
             edns: false,
             ecs: None,
         };
@@ -6259,6 +6283,7 @@ mod tests {
             dedupe_hash,
             Requester {
                 address: "127.0.0.1".parse().unwrap(),
+                mac: None,
                 edns: false,
                 ecs: None,
             },
@@ -7944,6 +7969,7 @@ mod requester_scope_tests {
             .iter()
             .map(|test| match test {
                 RequesterTest::InNet(net) => format!("net {net}"),
+                RequesterTest::Mac(mac) => format!("mac {mac}"),
                 RequesterTest::Private => "private".to_string(),
                 RequesterTest::Country(codes) => format!("country {}", codes.join(",")),
                 RequesterTest::Edns => "edns".to_string(),
@@ -7986,6 +8012,7 @@ mod requester_scope_tests {
             serde_json::json!([
                 { "id": "plain", "rules": [rule("r", any(), forward(UP))] },
                 { "id": "client", "rules": [rule("r", device(), forward(UP))] },
+                { "id": "mac", "rules": [rule("r", serde_json::json!([{ "type": "client_mac", "mac": "AA-BB-CC-DD-EE-FF" }]), forward(UP))] },
                 { "id": "private", "rules": [rule("r", serde_json::json!([{ "type": "geoip_private", "expect": true }]), forward(UP))] },
                 { "id": "country", "rules": [rule("r", serde_json::json!([{ "type": "geoip_country", "country_codes": ["cn"] }]), forward(UP))] },
                 { "id": "edns", "rules": [rule("r", serde_json::json!([{ "type": "edns_present", "expect": true }]), forward(UP))] },
@@ -8003,6 +8030,7 @@ mod requester_scope_tests {
         for (pipeline, expected) in [
             ("plain", vec![]),
             ("client", vec!["net 10.0.0.1/32"]),
+            ("mac", vec!["mac aa:bb:cc:dd:ee:ff"]),
             ("private", vec!["private"]),
             ("country", vec!["country CN"]),
             ("edns", vec!["edns"]),
